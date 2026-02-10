@@ -9,16 +9,12 @@
 # It will default to the target platform.
 ARG TARGET_BASE_IMAGE=alpine:3.20
 
-# The ubuntu target base image is used for the op-challenger build with kona and asterisc.
+# The ubuntu target base image is used for the op-challenger build with kona.
 ARG UBUNTU_TARGET_BASE_IMAGE=ubuntu:22.04
 
 # The version of kona to use.
 # The only build that uses this is `op-challenger-target`.
 ARG KONA_VERSION=none
-
-# The version of asterisc to use.
-# The only build that uses this is `op-challenger-target`.
-ARG ASTERISC_VERSION=none
 
 # builder_foundry does not need to be built on $BUILDPLATFORM, as foundry produces static binaries.
 FROM alpine:3.21 AS builder_foundry
@@ -174,6 +170,11 @@ ARG OP_SUPERNODE_VERSION=v0.0.0
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build cd op-supernode && make op-supernode  \
   GOOS=$TARGETOS GOARCH=$TARGETARCH GITCOMMIT=$GIT_COMMIT GITDATE=$GIT_DATE  VERSION="$OP_SUPERNODE_VERSION"
 
+FROM --platform=$BUILDPLATFORM builder AS op-interop-filter-builder
+ARG OP_INTEROP_FILTER_VERSION=v0.0.0
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build cd op-interop-filter && make op-interop-filter  \
+  GOOS=$TARGETOS GOARCH=$TARGETARCH GITCOMMIT=$GIT_COMMIT GITDATE=$GIT_DATE  VERSION="$OP_INTEROP_FILTER_VERSION"
+
 FROM --platform=$BUILDPLATFORM builder AS op-test-sequencer-builder
 ARG OP_TEST_SEQUENCER_VERSION=v0.0.0
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build cd op-test-sequencer && make op-test-sequencer  \
@@ -222,25 +223,20 @@ CMD ["op-node"]
 
 # Make the kona docker image published by upstream available as a source to copy kona from.
 FROM ghcr.io/op-rs/kona/kona-host:$KONA_VERSION AS kona
-# Make the asterisc docker image published by upstream available as a source to copy asterisc from.
-FROM us-docker.pkg.dev/oplabs-tools-artifacts/images/asterisc:$ASTERISC_VERSION AS asterisc
 
-# Also produce an op-challenger loaded with kona and asterisc using ubuntu
+# Also produce an op-challenger loaded with kona using ubuntu
 FROM $UBUNTU_TARGET_BASE_IMAGE AS op-challenger-target
 RUN apt-get update && apt-get install -y --no-install-recommends musl openssl ca-certificates
 COPY --from=op-challenger-builder /app/op-challenger/bin/op-challenger /usr/local/bin/
 # Copy in op-program and cannon
 COPY --from=op-program-builder /app/op-program/bin/op-program /usr/local/bin/
-ENV OP_CHALLENGER_ASTERISC_SERVER=/usr/local/bin/op-program
 ENV OP_CHALLENGER_CANNON_SERVER=/usr/local/bin/op-program
 COPY --from=cannon-builder /app/cannon/bin/cannon /usr/local/bin/
 ENV OP_CHALLENGER_CANNON_BIN=/usr/local/bin/cannon
-# Copy in kona and asterisc
+# Copy in kona
 COPY --from=kona /usr/local/bin/kona-host /usr/local/bin/
 ENV OP_CHALLENGER_ASTERISC_KONA_SERVER=/usr/local/bin/kona-host
 ENV OP_CHALLENGER_CANNON_KONA_SERVER=/usr/local/bin/kona-host
-COPY --from=asterisc /usr/local/bin/asterisc /usr/local/bin/
-ENV OP_CHALLENGER_ASTERISC_BIN=/usr/local/bin/asterisc
 CMD ["op-challenger"]
 
 FROM $TARGET_BASE_IMAGE AS op-dispute-mon-target
@@ -270,6 +266,10 @@ CMD ["op-supervisor"]
 FROM $TARGET_BASE_IMAGE AS op-supernode-target
 COPY --from=op-supernode-builder /app/op-supernode/bin/op-supernode /usr/local/bin/
 CMD ["op-supernode"]
+
+FROM $TARGET_BASE_IMAGE AS op-interop-filter-target
+COPY --from=op-interop-filter-builder /app/op-interop-filter/bin/op-interop-filter /usr/local/bin/
+CMD ["op-interop-filter"]
 
 FROM $TARGET_BASE_IMAGE AS op-test-sequencer-target
 COPY --from=op-test-sequencer-builder /app/op-test-sequencer/bin/op-test-sequencer /usr/local/bin/

@@ -117,6 +117,9 @@ type Host struct {
 	// useCreate2Deployer uses the Create2Deployer for broadcasted
 	// create2 calls.
 	useCreate2Deployer bool
+
+	// noMaxCodeSize disables the maximum contract bytecode size check.
+	noMaxCodeSize bool
 }
 
 type HostOption func(h *Host)
@@ -158,6 +161,15 @@ func WithIsolatedBroadcasts() HostOption {
 func WithCreate2Deployer() HostOption {
 	return func(h *Host) {
 		h.useCreate2Deployer = true
+	}
+}
+
+// WithNoMaxCodeSize disables the maximum contract bytecode size check.
+// This is useful for development environments where contracts may be compiled
+// without optimizations and exceed the standard 24KB limit.
+func WithNoMaxCodeSize() HostOption {
+	return func(h *Host) {
+		h.noMaxCodeSize = true
 	}
 }
 
@@ -298,6 +310,11 @@ func NewHost(
 	h.env = WrapEVM(vm.NewEVM(blockContext, h.state, h.chainCfg, vmCfg))
 	h.env.SetTxContext(txContext)
 
+	// Apply noMaxCodeSize after EVM is initialized
+	if h.noMaxCodeSize {
+		h.EnforceMaxCodeSize(false)
+	}
+
 	return h
 }
 
@@ -354,9 +371,17 @@ func (h *Host) Call(from common.Address, to common.Address, input []byte, gas ui
 
 	defer func() {
 		if r := recover(); r != nil {
-			// Cast to a string to check the error message. If it's not a string it's
-			// an unexpected panic and we should re-raise it.
-			rStr, ok := r.(string)
+			// Try to get the panic message as a string. It could be a plain string
+			// or an error type (e.g., from errors.New or fmt.Errorf).
+			var rStr string
+			var ok bool
+			if rStr, ok = r.(string); !ok {
+				// Not a string, try error interface
+				if rErr, errOk := r.(error); errOk {
+					rStr = rErr.Error()
+					ok = true
+				}
+			}
 			if !ok || !strings.Contains(strings.ToLower(rStr), "revision id 1") {
 				fmt.Println("panic", rStr)
 				panic(r)

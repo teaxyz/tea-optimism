@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.15;
 
+// Contracts
+import { OPContractsManagerUtilsCaller } from "src/L1/opcm/OPContractsManagerUtilsCaller.sol";
+import { IOPContractsManagerMigrator } from "interfaces/L1/opcm/IOPContractsManagerMigrator.sol";
+
 // Libraries
-import { LibString } from "@solady/utils/LibString.sol";
 import { Blueprint } from "src/libraries/Blueprint.sol";
-import { Claim, GameType, GameTypes, Proposal } from "src/dispute/lib/Types.sol";
+import { GameType, GameTypes, Proposal } from "src/dispute/lib/Types.sol";
 import { SemverComp } from "src/libraries/SemverComp.sol";
 import { Features } from "src/libraries/Features.sol";
 import { DevFeatures } from "src/libraries/DevFeatures.sol";
+import { Constants } from "src/libraries/Constants.sol";
 
 // Interfaces
 import { ISemver } from "interfaces/universal/ISemver.sol";
@@ -27,9 +31,9 @@ import { IL1ERC721Bridge } from "interfaces/L1/IL1ERC721Bridge.sol";
 import { IL1StandardBridge } from "interfaces/L1/IL1StandardBridge.sol";
 import { IOptimismMintableERC20Factory } from "interfaces/universal/IOptimismMintableERC20Factory.sol";
 import { IETHLockbox } from "interfaces/L1/IETHLockbox.sol";
-import { IStorageSetter } from "interfaces/universal/IStorageSetter.sol";
 import { IOPContractsManagerContainer } from "interfaces/L1/opcm/IOPContractsManagerContainer.sol";
 import { IOPContractsManagerStandardValidator } from "interfaces/L1/IOPContractsManagerStandardValidator.sol";
+import { IOPContractsManagerUtils } from "interfaces/L1/opcm/IOPContractsManagerUtils.sol";
 
 /// @title OPContractsManagerV2
 /// @notice OPContractsManagerV2 is an enhanced version of OPContractsManager. OPContractsManagerV2
@@ -50,27 +54,7 @@ import { IOPContractsManagerStandardValidator } from "interfaces/L1/IOPContracts
 ///      doesn't quite get there yet in an attempt to be a more incremental improvement over the V1
 ///      design. Look at _apply, squint, and imagine that it can output an upgrade plan rather than
 ///      actually executing the upgrade, and then you'll see how it can be improved.
-contract OPContractsManagerV2 is ISemver {
-    /// @notice Configuration struct for the FaultDisputeGame.
-    struct FaultDisputeGameConfig {
-        Claim absolutePrestate;
-    }
-
-    /// @notice Configuration struct for the PermissionedDisputeGame.
-    struct PermissionedDisputeGameConfig {
-        Claim absolutePrestate;
-        address proposer;
-        address challenger;
-    }
-
-    /// @notice Generic dispute game configuration data.
-    struct DisputeGameConfig {
-        bool enabled;
-        uint256 initBond;
-        GameType gameType;
-        bytes gameArgs;
-    }
-
+contract OPContractsManagerV2 is ISemver, OPContractsManagerUtilsCaller {
     /// @notice Contracts that represent the Superchain system.
     struct SuperchainContracts {
         ISuperchainConfig superchainConfig;
@@ -90,14 +74,6 @@ contract OPContractsManagerV2 is ISemver {
         IDisputeGameFactory disputeGameFactory;
         IAnchorStateRegistry anchorStateRegistry;
         IDelayedWETH delayedWETH;
-    }
-
-    /// @notice Struct that represents an additional instruction for an upgrade. Each upgrade has
-    ///         its own set of extra upgrade instructions that may or may not be required. We use
-    ///         this struct to keep the upgrade interface the same each time.
-    struct ExtraInstruction {
-        string key;
-        bytes data;
     }
 
     /// @notice Full chain management configuration.
@@ -120,40 +96,26 @@ contract OPContractsManagerV2 is ISemver {
         uint256 l2ChainId;
         IResourceMetering.ResourceConfig resourceConfig;
         // Dispute game configuration.
-        DisputeGameConfig[] disputeGameConfigs;
+        IOPContractsManagerUtils.DisputeGameConfig[] disputeGameConfigs;
+        // CGT
+        bool useCustomGasToken;
     }
 
     /// @notice Partial input required for an upgrade.
     struct UpgradeInput {
         ISystemConfig systemConfig;
-        DisputeGameConfig[] disputeGameConfigs;
-        ExtraInstruction[] extraInstructions;
+        IOPContractsManagerUtils.DisputeGameConfig[] disputeGameConfigs;
+        IOPContractsManagerUtils.ExtraInstruction[] extraInstructions;
     }
 
     /// @notice Input for upgrading Superchain contracts.
     struct SuperchainUpgradeInput {
         ISuperchainConfig superchainConfig;
-        ExtraInstruction[] extraInstructions;
+        IOPContractsManagerUtils.ExtraInstruction[] extraInstructions;
     }
-
-    /// @notice Helper struct for deploying proxies, keeps code cleaner.
-    struct ProxyDeployArgs {
-        IProxyAdmin proxyAdmin;
-        IAddressManager addressManager;
-        uint256 l2ChainId;
-        string saltMixer;
-    }
-
-    /// @notice Emitted when a proxy is created by this contract.
-    /// @param name  The name of the proxy.
-    /// @param proxy The address of the proxy.
-    event ProxyCreation(string name, address proxy);
 
     /// @notice Thrown when the SuperchainConfig needs to be upgraded.
     error OPContractsManagerV2_SuperchainConfigNeedsUpgrade();
-
-    /// @notice Thrown when an unsupported game type is provided.
-    error OPContractsManagerV2_UnsupportedGameType();
 
     /// @notice Thrown when an invalid game config is provided.
     error OPContractsManagerV2_InvalidGameConfigs();
@@ -161,43 +123,48 @@ contract OPContractsManagerV2 is ISemver {
     /// @notice Thrown when an invalid upgrade input is provided.
     error OPContractsManagerV2_InvalidUpgradeInput();
 
-    /// @notice Thrown when a proxy must be loaded but couldn't be.
-    error OPContractsManagerV2_ProxyMustLoad(string _name);
-
-    /// @notice Thrown when user attempts to downgrade a contract.
-    error OPContractsManagerV2_DowngradeNotAllowed(address _contract);
-
     /// @notice Thrown when an invalid upgrade instruction is provided.
-    error OPContractsManagerV2_InvalidUpgradeInstruction();
+    error OPContractsManagerV2_InvalidUpgradeInstruction(string _key);
 
-    /// @notice Thrown when a config load fails.
-    error OPContractsManagerV2_ConfigLoadFailed(string _name);
+    /// @notice Thrown when a chain attempts to upgrade to custom gas token after initial deployment.
+    error OPContractsManagerV2_CannotUpgradeToCustomGasToken();
 
-    /// @notice Container of blueprint and implementation contract addresses.
-    IOPContractsManagerContainer public immutable contractsContainer;
+    /// @notice Thrown when an invalid upgrade sequence is provided.
+    error OPContractsManagerV2_InvalidUpgradeSequence(string _lastVersion, string _thisVersion);
 
     /// @notice Address of the Standard Validator for this OPCM release.
-    IOPContractsManagerStandardValidator public immutable standardValidator;
+    IOPContractsManagerStandardValidator public immutable opcmStandardValidator;
+
+    /// @notice Address of the Migrator contract for this OPCM release.
+    IOPContractsManagerMigrator public immutable opcmMigrator;
+
+    /// @notice Immutable reference to this OPCM contract so that the address of this contract can
+    ///         be used when this contract is DELEGATECALLed.
+    OPContractsManagerV2 public immutable opcmV2;
 
     /// @notice The version of the OPCM contract.
-    /// @custom:semver 6.1.0
-    string public constant version = "6.1.0";
+    ///         WARNING: OPCM versioning rules differ from other contracts:
+    ///         - Major bump: New required sequential upgrade
+    ///         - Minor bump: Replacement OPCM for same upgrade
+    ///         - Patch bump: Development changes (expected for normal dev work)
+    /// @custom:semver 7.0.4
+    function version() public pure returns (string memory) {
+        return "7.0.4";
+    }
 
-    /// @notice Special constant key for the PermittedProxyDeployment instruction.
-    string internal constant PERMITTED_PROXY_DEPLOYMENT_KEY = "PermittedProxyDeployment";
-
-    /// @notice Special constant value for the PermittedProxyDeployment instruction to permit all
-    ///         contracts to be deployed. Only to be used for deployments.
-    bytes internal constant PERMIT_ALL_CONTRACTS_INSTRUCTION = bytes("ALL");
-
-    /// @param _contractsContainer The container of blueprint and implementation contract addresses.
     /// @param _standardValidator The standard validator for this OPCM release.
+    /// @param _migrator The migrator contract for this OPCM release.
+    /// @param _utils The utility functions for the OPContractsManager.
     constructor(
-        IOPContractsManagerContainer _contractsContainer,
-        IOPContractsManagerStandardValidator _standardValidator
-    ) {
-        contractsContainer = _contractsContainer;
-        standardValidator = _standardValidator;
+        IOPContractsManagerStandardValidator _standardValidator,
+        IOPContractsManagerMigrator _migrator,
+        IOPContractsManagerUtils _utils
+    )
+        OPContractsManagerUtilsCaller(_utils)
+    {
+        opcmStandardValidator = _standardValidator;
+        opcmMigrator = _migrator;
+        opcmV2 = this;
     }
 
     ///////////////////////////////////////////////////////////////////////////
@@ -231,9 +198,12 @@ contract OPContractsManagerV2 is ISemver {
     /// @return The chain contracts.
     function deploy(FullConfig memory _cfg) external returns (ChainContracts memory) {
         // Deploy is the ONLY place where we allow the "ALL" permission for proxy deployment.
-        ExtraInstruction[] memory instructions = new ExtraInstruction[](1);
-        instructions[0] =
-            ExtraInstruction({ key: PERMITTED_PROXY_DEPLOYMENT_KEY, data: PERMIT_ALL_CONTRACTS_INSTRUCTION });
+        IOPContractsManagerUtils.ExtraInstruction[] memory instructions =
+            new IOPContractsManagerUtils.ExtraInstruction[](1);
+        instructions[0] = IOPContractsManagerUtils.ExtraInstruction({
+            key: Constants.PERMITTED_PROXY_DEPLOYMENT_KEY,
+            data: Constants.PERMIT_ALL_CONTRACTS_INSTRUCTION
+        });
 
         // Load the chain contracts.
         ChainContracts memory cts =
@@ -278,24 +248,76 @@ contract OPContractsManagerV2 is ISemver {
         return _apply(cfg, cts, false);
     }
 
+    /// @notice Migrates one or more OP Stack chains to use the Super Root dispute games and shared
+    ///         dispute game contracts.
+    /// @dev WARNING: This is a one-way operation. You cannot easily undo this operation without a
+    ///      smart contract upgrade. Do not call this function unless you are 100% confident that
+    ///      you know what you're doing and that you are prepared to fully execute this migration.
+    /// @dev NOTE: Unlike other functions in OPCM, this is a one-off function used to serve the
+    ///      temporary need to support the interop migration action. It will likely be removed in
+    ///      the near future once interop support is baked more directly into OPCM. It does NOT
+    ///      look or function like all of the other functions in OPCMv2.
+    /// @param _input The input parameters for the migration.
+    function migrate(IOPContractsManagerMigrator.MigrateInput calldata _input) public {
+        // Delegatecall to the migrator contract.
+        (bool success, bytes memory result) =
+            address(opcmMigrator).delegatecall(abi.encodeCall(IOPContractsManagerMigrator.migrate, (_input)));
+        if (!success) {
+            assembly {
+                revert(add(result, 0x20), mload(result))
+            }
+        }
+    }
+
     ///////////////////////////////////////////////////////////////////////////
     //                  INTERNAL CHAIN MANAGEMENT FUNCTIONS                  //
     ///////////////////////////////////////////////////////////////////////////
 
     /// @notice Asserts that the upgrade instructions array is valid.
+    /// @dev Developers don't need to touch this function, modify _isPermittedInstruction instead.
     /// @param _extraInstructions The extra upgrade instructions for the chain.
-    function _assertValidUpgradeInstructions(ExtraInstruction[] memory _extraInstructions) internal pure {
+    function _assertValidUpgradeInstructions(IOPContractsManagerUtils.ExtraInstruction[] memory _extraInstructions)
+        internal
+        view
+    {
         for (uint256 i = 0; i < _extraInstructions.length; i++) {
-            if (
-                LibString.eq(_extraInstructions[i].key, PERMITTED_PROXY_DEPLOYMENT_KEY)
-                    && LibString.eq(string(_extraInstructions[i].data), "DelayedWETH")
-            ) {
-                // Unified DelayedWETH is being deployed for the first time.
-                // TODO:(#?????): Remove this allowance after unified DelayedWETH is deployed.
-            } else {
-                revert OPContractsManagerV2_InvalidUpgradeInstruction();
+            if (!_isPermittedInstruction(_extraInstructions[i])) {
+                revert OPContractsManagerV2_InvalidUpgradeInstruction(_extraInstructions[i].key);
             }
         }
+    }
+
+    /// @notice Checks if an upgrade instruction is permitted.
+    /// @param _instruction The upgrade instruction to check.
+    /// @return True if the instruction is permitted, false otherwise.
+    function _isPermittedInstruction(IOPContractsManagerUtils.ExtraInstruction memory _instruction)
+        internal
+        view
+        returns (bool)
+    {
+        // NOTE (IMPORTANT FOR DEVELOPERS): You MAY need to allow permitted instructions here for
+        // your specific upgrade. For example, if you are adding a new contract that needs to be
+        // deployed you will need to add an allowance so that the proxy can be deployed.
+        // Allowances MUST always be restricted to one specific upgrade. Here we maintain this
+        // restriction by checking that the version is less than the NEXT release version. Once
+        // developers start working on the next release this will automatically become false so
+        // even if the code is somehow forgotten it will not actually apply to the deployment. Make
+        // sure to REMOVE the allowance once the upgrade is complete.
+        if (SemverComp.lt(_version(), "8.0.0")) {
+            // Unified DelayedWETH is being deployed for the first time.
+            // TODO:(#18382): Remove this allowance after unified DelayedWETH is deployed.
+            if (_isMatchingInstruction(_instruction, Constants.PERMITTED_PROXY_DEPLOYMENT_KEY, "DelayedWETH")) {
+                return true;
+            }
+            // Custom Gas Token is being enabled for the first time.
+            // TODO:(#18502): Remove this allowance after U18 ships.
+            if (_isMatchingInstructionByKey(_instruction, "overrides.cfg.useCustomGasToken")) {
+                return true;
+            }
+        }
+
+        // Always return false by default.
+        return false;
     }
 
     /// @notice Loads (or builds) the chain contracts from whatever exists.
@@ -308,7 +330,7 @@ contract OPContractsManagerV2 is ISemver {
         ISystemConfig _systemConfig,
         uint256 _l2ChainId,
         string memory _saltMixer,
-        ExtraInstruction[] memory _extraInstructions
+        IOPContractsManagerUtils.ExtraInstruction[] memory _extraInstructions
     )
         internal
         returns (ChainContracts memory)
@@ -363,7 +385,7 @@ contract OPContractsManagerV2 is ISemver {
         }
 
         // Set up the deploy args once, keeps the code cleaner.
-        ProxyDeployArgs memory proxyDeployArgs = ProxyDeployArgs({
+        IOPContractsManagerUtils.ProxyDeployArgs memory proxyDeployArgs = IOPContractsManagerUtils.ProxyDeployArgs({
             proxyAdmin: proxyAdmin,
             addressManager: addressManager,
             l2ChainId: _l2ChainId,
@@ -497,6 +519,7 @@ contract OPContractsManagerV2 is ISemver {
     {
         // Load the full config.
         return FullConfig({
+            disputeGameConfigs: _upgradeInput.disputeGameConfigs,
             saltMixer: string(bytes.concat(bytes32(uint256(uint160(address(_chainContracts.systemConfig)))))),
             superchainConfig: abi.decode(
                 _loadBytes(
@@ -591,7 +614,7 @@ contract OPContractsManagerV2 is ISemver {
             startingAnchorRoot: abi.decode(
                 _loadBytes(
                     address(_chainContracts.anchorStateRegistry),
-                    _chainContracts.anchorStateRegistry.getAnchorRoot.selector,
+                    _chainContracts.anchorStateRegistry.getStartingAnchorRoot.selector,
                     "overrides.cfg.startingAnchorRoot",
                     _upgradeInput.extraInstructions
                 ),
@@ -606,7 +629,15 @@ contract OPContractsManagerV2 is ISemver {
                 ),
                 (GameType)
             ),
-            disputeGameConfigs: _upgradeInput.disputeGameConfigs
+            useCustomGasToken: abi.decode(
+                _loadBytes(
+                    address(_chainContracts.systemConfig),
+                    _chainContracts.systemConfig.isCustomGasToken.selector,
+                    "overrides.cfg.useCustomGasToken",
+                    _upgradeInput.extraInstructions
+                ),
+                (bool)
+            )
         });
     }
 
@@ -668,6 +699,15 @@ contract OPContractsManagerV2 is ISemver {
         // Make sure the provided SuperchainConfig is up to date.
         if (SemverComp.lt(_cfg.superchainConfig.version(), ISuperchainConfig(impls.superchainConfigImpl).version())) {
             revert OPContractsManagerV2_SuperchainConfigNeedsUpgrade();
+        }
+
+        // Chains prior to OPCMv2 don't yet have a functional lastUsedOPCMVersion function on the
+        // SystemConfig contract. The first deployment of OPCMv2 will make this function available
+        // and subsequent deployments will then use this function to verify the system is
+        // progressing from one OPCM to the next. We only care about this for upgrades, you can
+        // perform an initial deployment from any OPCM.
+        if (!_isInitialDeployment && !isPermittedUpgradeSequence(_cts.systemConfig)) {
+            revert OPContractsManagerV2_InvalidUpgradeSequence(_cts.systemConfig.lastUsedOPCMVersion(), _version());
         }
 
         // Update the SystemConfig.
@@ -798,7 +838,9 @@ contract OPContractsManagerV2 is ISemver {
             // If the game is enabled, grab the implementation and craft the game arguments.
             if (_cfg.disputeGameConfigs[i].enabled) {
                 gameImpl = _getGameImpl(_cfg.disputeGameConfigs[i].gameType);
-                gameArgs = _makeGameArgs(_cfg, _cts, _cfg.disputeGameConfigs[i]);
+                gameArgs = _makeGameArgs(
+                    _cfg.l2ChainId, _cts.anchorStateRegistry, _cts.delayedWETH, _cfg.disputeGameConfigs[i]
+                );
             }
 
             // Set the game implementation and arguments.
@@ -808,6 +850,19 @@ contract OPContractsManagerV2 is ISemver {
             _cts.disputeGameFactory.setInitBond(
                 _cfg.disputeGameConfigs[i].gameType, _cfg.disputeGameConfigs[i].initBond
             );
+        }
+
+        // If the custom gas token feature was requested, enable it in the SystemConfig.
+        // If the cgt is enabled, we skip this step.
+        if (_cfg.useCustomGasToken && !_cts.systemConfig.isCustomGasToken()) {
+            // NOTE: Enabling the custom gas token feature is only allowed during initial deployment to prevent
+            // chains from enabling it during upgrades. Passing in true for this flag during an upgrade is considered an
+            // error and will revert.
+            // Revert only if trying to upgrade from CGT disabled to CGT enabled.
+            if (!_isInitialDeployment) {
+                revert OPContractsManagerV2_CannotUpgradeToCustomGasToken();
+            }
+            _cts.systemConfig.setFeature(Features.CUSTOM_GAS_TOKEN, true);
         }
 
         // If critical transfer is allowed, tranfer ownership of the DisputeGameFactory and
@@ -839,7 +894,7 @@ contract OPContractsManagerV2 is ISemver {
         ChainContracts memory _cts
     )
         internal
-        pure
+        view
         returns (bytes memory)
     {
         // Generate the SystemConfig addresses input.
@@ -849,7 +904,8 @@ contract OPContractsManagerV2 is ISemver {
             l1StandardBridge: address(_cts.l1StandardBridge),
             optimismPortal: address(_cts.optimismPortal),
             optimismMintableERC20Factory: address(_cts.optimismMintableERC20Factory),
-            delayedWETH: address(_cts.delayedWETH)
+            delayedWETH: address(_cts.delayedWETH),
+            opcm: address(opcmV2)
         });
 
         // Generate the initializer arguments.
@@ -871,325 +927,86 @@ contract OPContractsManagerV2 is ISemver {
         );
     }
 
-    /// @notice Helper for retrieving dispute game implementations.
-    /// @param _gameType The game type to retrieve the implementation for.
-    /// @return The dispute game implementation.
-    function _getGameImpl(GameType _gameType) internal view returns (IDisputeGame) {
-        IOPContractsManagerContainer.Implementations memory impls = implementations();
-        if (_gameType.raw() == GameTypes.CANNON.raw()) {
-            return IDisputeGame(impls.faultDisputeGameV2Impl);
-        } else if (_gameType.raw() == GameTypes.PERMISSIONED_CANNON.raw()) {
-            return IDisputeGame(impls.permissionedDisputeGameV2Impl);
-        } else if (_gameType.raw() == GameTypes.CANNON_KONA.raw()) {
-            return IDisputeGame(impls.faultDisputeGameV2Impl);
-        } else {
-            // Since we assert in _assertValidFullConfig that we only have valid configs, this
-            // should never happen, but we'll be defensive and revert if it does.
-            revert OPContractsManagerV2_UnsupportedGameType();
-        }
-    }
-
-    /// @notice Helper for creating game constructor arguments.
-    /// @param _cfg Full chain config.
-    /// @param _cts Chain contracts.
-    /// @param _gcfg Configuration for the dispute game to create.
-    /// @return The game constructor arguments.
-    function _makeGameArgs(
-        FullConfig memory _cfg,
-        ChainContracts memory _cts,
-        DisputeGameConfig memory _gcfg
-    )
-        internal
-        view
-        returns (bytes memory)
-    {
-        IOPContractsManagerContainer.Implementations memory impls = implementations();
-        if (_gcfg.gameType.raw() == GameTypes.CANNON.raw() || _gcfg.gameType.raw() == GameTypes.CANNON_KONA.raw()) {
-            FaultDisputeGameConfig memory parsedInputArgs = abi.decode(_gcfg.gameArgs, (FaultDisputeGameConfig));
-            return abi.encodePacked(
-                parsedInputArgs.absolutePrestate,
-                impls.mipsImpl,
-                address(_cts.anchorStateRegistry),
-                address(_cts.delayedWETH),
-                _cfg.l2ChainId
-            );
-        } else if (_gcfg.gameType.raw() == GameTypes.PERMISSIONED_CANNON.raw()) {
-            PermissionedDisputeGameConfig memory parsedInputArgs =
-                abi.decode(_gcfg.gameArgs, (PermissionedDisputeGameConfig));
-            return abi.encodePacked(
-                parsedInputArgs.absolutePrestate,
-                impls.mipsImpl,
-                address(_cts.anchorStateRegistry),
-                address(_cts.delayedWETH),
-                _cfg.l2ChainId,
-                parsedInputArgs.proposer,
-                parsedInputArgs.challenger
-            );
-        } else {
-            // Since we assert in _assertValidFullConfig that we only have valid configs, this
-            // should never happen, but we'll be defensive and revert if it does.
-            revert OPContractsManagerV2_UnsupportedGameType();
-        }
-    }
-
     ///////////////////////////////////////////////////////////////////////////
     //                        PUBLIC UTILITY FUNCTIONS                       //
     ///////////////////////////////////////////////////////////////////////////
 
+    /// @notice Checks if the upgrade sequence from the last used OPCM to this OPCM is permitted.
+    ///         This function is public to allow tests to verify upgrade sequence logic directly
+    ///         by mocking the OPCM version and calling this function, rather than running the full
+    ///         upgrade flow. This avoids the need for special testing flags that bypass validation.
+    /// @param _systemConfig The SystemConfig contract to check the upgrade sequence for.
+    /// @return True if the upgrade sequence is permitted, false otherwise.
+    function isPermittedUpgradeSequence(ISystemConfig _systemConfig) public view returns (bool) {
+        // If the SystemConfig is not initialized, this is an initial deployment, which is always
+        // permitted. Initial deployments can use any OPCM version.
+        if (address(_systemConfig) == address(0)) {
+            return true;
+        }
+
+        // Chains prior to OPCMv2 (version 7.0.0) don't have a functional lastUsedOPCM function on
+        // the SystemConfig contract. The first deployment of OPCMv2 which makes this available is
+        // version 7.0.0. We need to skip the check for 7.x.x OPCM versions because they can't
+        // guarantee that the lastUsedOPCM function will be available on the incoming SystemConfig.
+        // 8.0.0 and later will always have this function available.
+        if (SemverComp.lt(_version(), "8.0.0")) {
+            return true;
+        }
+
+        ISemver lastUsedOPCM = ISemver(address(_systemConfig.lastUsedOPCM()));
+        SemverComp.Semver memory lastUsedSemver = SemverComp.parse(lastUsedOPCM.version());
+        SemverComp.Semver memory thisSemver = SemverComp.parse(_version());
+
+        // We have three permitted cases:
+        // 1. Address of the last used OPCM is identical to the address of this OPCM (re-running).
+        // 2. This OPCM version is the same major version but a greater minor version (patch).
+        // 3. This OPCM version is the next major version (sequential upgrade).
+        bool isSameOPCM = address(lastUsedOPCM) == address(opcmV2);
+        bool isNextMajor = thisSemver.major == lastUsedSemver.major + 1;
+        bool isSameMajorHigherMinor =
+            thisSemver.major == lastUsedSemver.major && thisSemver.minor > lastUsedSemver.minor;
+
+        return isSameOPCM || isSameMajorHigherMinor || isNextMajor;
+    }
+
     /// @notice Returns the blueprint contract addresses.
     function blueprints() public view returns (IOPContractsManagerContainer.Blueprints memory) {
-        return contractsContainer.blueprints();
+        return contractsContainer().blueprints();
     }
 
     /// @notice Returns the implementation contract addresses.
     function implementations() public view returns (IOPContractsManagerContainer.Implementations memory) {
-        return contractsContainer.implementations();
+        return contractsContainer().implementations();
     }
 
     /// @notice Returns the status of a development feature.
     /// @param _feature The feature to check.
     /// @return True if the feature is enabled, false otherwise.
     function isDevFeatureEnabled(bytes32 _feature) public view returns (bool) {
-        return contractsContainer.isDevFeatureEnabled(_feature);
+        return contractsContainer().isDevFeatureEnabled(_feature);
     }
 
     ///////////////////////////////////////////////////////////////////////////
     //                       INTERNAL UTILITY FUNCTIONS                      //
     ///////////////////////////////////////////////////////////////////////////
 
-    /// @notice Maps an L2 chain ID to an L1 batch inbox address as defined by the standard
-    ///         configuration's convention. This convention is
-    ///         `versionByte || keccak256(bytes32(chainId))[:19]`, where || denotes concatenation,
-    ///         versionByte is 0x00, and chainId is a uint256.
-    ///         https://specs.optimism.io/protocol/configurability.html#consensus-parameters
-    /// @param _l2ChainId The L2 chain ID to map to an L1 batch inbox address.
-    /// @return Chain ID mapped to an L1 batch inbox address.
-    function _chainIdToBatchInboxAddress(uint256 _l2ChainId) internal pure returns (address) {
-        bytes1 versionByte = 0x00;
-        bytes32 hashedChainId = keccak256(bytes.concat(bytes32(_l2ChainId)));
-        bytes19 first19Bytes = bytes19(hashedChainId);
-        return address(uint160(bytes20(bytes.concat(versionByte, first19Bytes))));
+    /// @notice Helper for retrieving the version of the OPCM contract.
+    /// @dev We use opcmV2.version() because it allows us to properly mock the version function
+    ///      in tests without running into issues because this contract is being DELEGATECALLed.
+    /// @return The version of the OPCM contract.
+    function _version() internal view returns (string memory) {
+        return opcmV2.version();
     }
 
-    /// @notice Computes a unique salt for a contract deployment.
-    /// @param _l2ChainId The L2 chain ID of the chain being deployed to.
-    /// @param _saltMixer The salt mixer to use for the deployment.
-    /// @param _contractName The name of the contract to deploy.
-    /// @return The computed salt.
-    function _computeSalt(
-        uint256 _l2ChainId,
-        string memory _saltMixer,
-        string memory _contractName
-    )
-        internal
-        pure
-        returns (bytes32)
-    {
-        return keccak256(abi.encode(_l2ChainId, _saltMixer, _contractName));
+    /// @notice Returns the contracts container.
+    /// @return The contracts container.
+    function contractsContainer() public view returns (IOPContractsManagerContainer) {
+        return opcmUtils.contractsContainer();
     }
 
-    /// @notice Helper function to check if a given instruction is present in a list of extra
-    ///         upgrade instructions.
-    /// @param _instructions The list of extra upgrade instructions.
-    /// @param _key The key of the instruction to check for.
-    /// @param _data The data of the instruction to check for.
-    /// @return True if the instruction is present, false otherwise.
-    function _hasInstruction(
-        ExtraInstruction[] memory _instructions,
-        string memory _key,
-        bytes memory _data
-    )
-        internal
-        pure
-        returns (bool)
-    {
-        for (uint256 i = 0; i < _instructions.length; i++) {
-            if (LibString.eq(_instructions[i].key, _key) && LibString.eq(string(_instructions[i].data), string(_data)))
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /// @notice Helper function to get an instruction by key.
-    /// @param _instructions The list of extra upgrade instructions.
-    /// @param _key The key of the instruction to get.
-    /// @return The instruction, or an empty instruction if the instruction is not found.
-    function _getInstructionByKey(
-        ExtraInstruction[] memory _instructions,
-        string memory _key
-    )
-        internal
-        pure
-        returns (ExtraInstruction memory)
-    {
-        for (uint256 i = 0; i < _instructions.length; i++) {
-            if (LibString.eq(_instructions[i].key, _key)) {
-                return _instructions[i];
-            }
-        }
-        return ExtraInstruction({ key: "", data: bytes("") });
-    }
-
-    /// @notice Helper function to load data from a source contract as bytes.
-    /// @param _source The source contract to load the data from.
-    /// @param _selector The selector of the function to call on the source contract.
-    /// @param _name The name of the field to load.
-    /// @param _instructions The extra upgrade instructions for the data load.
-    /// @return Data retrieved from the source contract.
-    function _loadBytes(
-        address _source,
-        bytes4 _selector,
-        string memory _name,
-        ExtraInstruction[] memory _instructions
-    )
-        internal
-        view
-        returns (bytes memory)
-    {
-        // If an override exists for this load, return the override data.
-        ExtraInstruction memory overrideInstruction = _getInstructionByKey(_instructions, _name);
-        if (bytes(overrideInstruction.key).length > 0) {
-            return overrideInstruction.data;
-        }
-
-        // Otherwise, load the data from the source contract.
-        (bool success, bytes memory result) = address(_source).staticcall(abi.encodePacked(_selector));
-        if (!success) {
-            revert OPContractsManagerV2_ConfigLoadFailed(_name);
-        }
-
-        // Return the loaded data.
-        return result;
-    }
-
-    /// @notice Attempts to load a proxy from a source function where the proxy should be found. If
-    ///         the proxy isn't found at the source, or the call to the source fails, we build a
-    ///         new proxy instead. Calls to source contracts MUST NOT fail under any circumstances
-    ///         other than the function not existing (which can happen in an upgrade scenario).
-    /// @param _source The source contract to load the proxy from.
-    /// @param _selector The selector of the function to call on the source contract.
-    /// @param _args The basic arguments for the proxy deployment.
-    /// @param _contractName The name of the contract to deploy.
-    /// @param _instructions The extra upgrade instructions for the proxy deployment.
-    /// @return The address of the loaded or built proxy.
-    function _loadOrDeployProxy(
-        address _source,
-        bytes4 _selector,
-        ProxyDeployArgs memory _args,
-        string memory _contractName,
-        ExtraInstruction[] memory _instructions
-    )
-        internal
-        returns (address payable)
-    {
-        // Loads are allowed to fail ONLY if the user explicitly permitted it (or if this is a
-        // deployment and the "ALL" permission is set).
-        bool loadCanFail = _hasInstruction(_instructions, PERMITTED_PROXY_DEPLOYMENT_KEY, bytes(_contractName))
-            || _hasInstruction(_instructions, PERMITTED_PROXY_DEPLOYMENT_KEY, PERMIT_ALL_CONTRACTS_INSTRUCTION);
-
-        // Try to load the proxy from the source.
-        (bool success, bytes memory result) = address(_source).staticcall(abi.encodePacked(_selector));
-
-        // If the load succeeded and the result is not a zero address, return the result.
-        if (success && abi.decode(result, (address)) != address(0)) {
-            return payable(abi.decode(result, (address)));
-        } else if (!loadCanFail) {
-            // Load not permitted to fail but did, revert.
-            revert OPContractsManagerV2_ProxyMustLoad(_contractName);
-        }
-
-        // We've failed to load, but we allowed that failure.
-        // Deploy the right proxy depending on the contract name.
-        address ret;
-        if (LibString.eq(_contractName, "L1StandardBridge")) {
-            // L1StandardBridge is a special case ChugSplashProxy (legacy).
-            ret = Blueprint.deployFrom(
-                blueprints().l1ChugSplashProxy,
-                _computeSalt(_args.l2ChainId, _args.saltMixer, "L1StandardBridge"),
-                abi.encode(_args.proxyAdmin)
-            );
-
-            // ChugSplashProxy requires setting the proxy type on the ProxyAdmin.
-            _args.proxyAdmin.setProxyType(ret, IProxyAdmin.ProxyType.CHUGSPLASH);
-        } else if (LibString.eq(_contractName, "L1CrossDomainMessenger")) {
-            // L1CrossDomainMessenger is a special case ResolvedDelegateProxy (legacy).
-            string memory l1XdmName = "OVM_L1CrossDomainMessenger";
-            ret = Blueprint.deployFrom(
-                blueprints().resolvedDelegateProxy,
-                _computeSalt(_args.l2ChainId, _args.saltMixer, "L1CrossDomainMessenger"),
-                abi.encode(_args.addressManager, l1XdmName)
-            );
-
-            // ResolvedDelegateProxy requires setting the proxy type on the ProxyAdmin.
-            _args.proxyAdmin.setProxyType(ret, IProxyAdmin.ProxyType.RESOLVED);
-            _args.proxyAdmin.setImplementationName(ret, l1XdmName);
-        } else {
-            // Otherwise this is a normal proxy.
-            ret = Blueprint.deployFrom(
-                blueprints().proxy,
-                _computeSalt(_args.l2ChainId, _args.saltMixer, _contractName),
-                abi.encode(_args.proxyAdmin)
-            );
-        }
-
-        // Emit the proxy creation event.
-        emit ProxyCreation(_contractName, ret);
-
-        // Return the final deployment result.
-        return payable(ret);
-    }
-
-    /// @notice Upgrades a contract by resetting the initialized slot and calling the initializer.
-    /// @param _proxyAdmin The proxy admin of the contract.
-    /// @param _target The target of the contract.
-    /// @param _implementation The implementation of the contract.
-    /// @param _data The data to call the initializer with.
-    function _upgrade(IProxyAdmin _proxyAdmin, address _target, address _implementation, bytes memory _data) internal {
-        _upgrade(_proxyAdmin, _target, _implementation, _data, bytes32(0), 0);
-    }
-
-    /// @notice Upgrades a contract by resetting the initialized slot and calling the initializer.
-    /// @param _proxyAdmin The proxy admin of the contract.
-    /// @param _target The target of the contract.
-    /// @param _implementation The implementation of the contract.
-    /// @param _data The data to call the initializer with.
-    /// @param _slot The slot where the initialized value is located.
-    /// @param _offset The offset of the initializer value in the slot.
-    function _upgrade(
-        IProxyAdmin _proxyAdmin,
-        address _target,
-        address _implementation,
-        bytes memory _data,
-        bytes32 _slot,
-        uint8 _offset
-    )
-        internal
-    {
-        // Check to make sure that we're not downgrading. Downgrades aren't inherently dangerous
-        // but we also don't test for them so we don't really know if a specific downgrade will be
-        // dangerous or not. It's easier to just revert instead.
-        // NOTE: We DO allow upgrades to the same version, which makes it possible to use this
-        //       function to both upgrade and then later perform management actions like changing
-        //       the prestate for the fault dispute games.
-        if (
-            _proxyAdmin.getProxyImplementation(payable(_target)) != address(0)
-                && SemverComp.gt(ISemver(_target).version(), ISemver(_implementation).version())
-        ) {
-            revert OPContractsManagerV2_DowngradeNotAllowed(address(_target));
-        }
-
-        // Upgrade to StorageSetter.
-        _proxyAdmin.upgrade(payable(_target), address(implementations().storageSetterImpl));
-
-        // Otherwise, we need to reset the initialized slot and call the initializer.
-        // Reset the initialized slot by zeroing the single byte at `_offset` (from the right).
-        bytes32 current = IStorageSetter(_target).getBytes32(_slot);
-        uint256 mask = ~(uint256(0xff) << (uint256(_offset) * 8));
-        IStorageSetter(_target).setBytes32(_slot, bytes32(uint256(current) & mask));
-
-        // Upgrade to the implementation and call the initializer.
-        _proxyAdmin.upgradeAndCall(payable(address(_target)), _implementation, _data);
+    /// @notice Returns the development feature bitmap.
+    /// @return The development feature bitmap.
+    function devFeatureBitmap() public view returns (bytes32) {
+        return contractsContainer().devFeatureBitmap();
     }
 }

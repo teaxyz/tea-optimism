@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-// Forge
-import { Test } from "forge-std/Test.sol";
-
 // Testing
+import { Test } from "test/setup/Test.sol";
 import { Setup } from "test/setup/Setup.sol";
 import { Events } from "test/setup/Events.sol";
 import { FFIInterface } from "test/setup/FFIInterface.sol";
@@ -14,9 +12,9 @@ import { DeployUtils } from "scripts/libraries/DeployUtils.sol";
 
 // Contracts
 import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import { DevFeatures } from "src/libraries/DevFeatures.sol";
 
 // Libraries
+import { Config } from "scripts/libraries/Config.sol";
 import { console } from "forge-std/console.sol";
 
 // Interfaces
@@ -30,6 +28,9 @@ abstract contract CommonTest is Test, Setup, Events {
     address bob;
 
     bytes32 constant nonZeroHash = keccak256(abi.encode("NON_ZERO"));
+
+    /// @notice The default initial bond value for dispute games.
+    uint256 constant DEFAULT_DISPUTE_GAME_INIT_BOND = 0.08 ether;
 
     FFIInterface constant ffi = FFIInterface(address(uint160(uint256(keccak256(abi.encode("optimism.ffi"))))));
 
@@ -79,6 +80,12 @@ abstract contract CommonTest is Test, Setup, Events {
             deploy.cfg().setUseInterop(true);
         }
         if (useRevenueShareOverride) {
+            // Revenue share is not supported when custom gas token is enabled
+            if (Config.sysFeatureCustomGasToken()) {
+                vm.skip(true);
+            }
+
+            console.log("CommonTest: enabling revenue share");
             deploy.cfg().setUseRevenueShare(true);
             deploy.cfg().setChainFeesRecipient(chainFeesRecipient);
             deploy.cfg().setL1FeesDepositor(l1FeesDepositor);
@@ -86,7 +93,7 @@ abstract contract CommonTest is Test, Setup, Events {
         if (useUpgradedFork) {
             deploy.cfg().setUseUpgradedFork(true);
         }
-        if (isDevFeatureEnabled(DevFeatures.CUSTOM_GAS_TOKEN)) {
+        if (Config.sysFeatureCustomGasToken()) {
             console.log("CommonTest: enabling custom gas token");
             deploy.cfg().setUseCustomGasToken(true);
             deploy.cfg().setGasPayingTokenName("Custom Gas Token");
