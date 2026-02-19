@@ -110,7 +110,7 @@ contract TeaWAPOracle_Test is CommonTest {
 
         (uint96 ts, uint160 price) = gasPriceOracle.getLatestPrice();
         assertEq(ts, block.timestamp);
-        assertEq(price, oracle.quote(myWeth, 1e9, 10));
+        assertEq(price, oracle.quote(myWeth, 1e18, 10));
     }
 
     function testTeaWAP_FallbackIfBadReserves() public {
@@ -135,7 +135,7 @@ contract TeaWAPOracle_Test is CommonTest {
 
         (uint96 ts, uint160 price) = gasPriceOracle.getLatestPrice();
         assertEq(ts, block.timestamp);
-        assertEq(price, 2_000_000e9);
+        assertEq(price, 2_000_000e18);
 
         // now let's break the oracle
         vm.etch(address(oracle), abi.encode(""));
