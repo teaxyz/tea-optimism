@@ -32,6 +32,62 @@ build-supervisor:
 build-op-reth:
   cargo build --release --bin op-reth
 
+# Build tea-reth (vendors op-revm with Tea patches first)
+build-tea-reth: vendor-patch
+  cargo build --release --bin tea-reth
+
+######################### Tea Vendoring ############################
+
+OP_REVM_VERSION := "15.0.0"
+
+# Vendor op-revm from cargo registry and apply Tea's L1 cost multiplier patch.
+# Required before building tea-reth. Idempotent — safe to run repeatedly.
+#
+# Why vendoring? op-revm is an external crate (crates.io) and Tea needs a small
+# patch to L1BlockInfo for custom gas token support. The vendor/ directory is
+# .gitignored — only the patch file in patches/ is committed. This keeps our
+# fork diff minimal while allowing us to modify an upstream struct.
+#
+# MAINTENANCE — when upgrading op-revm:
+#   1. Update OP_REVM_VERSION above
+#   2. Update the version in Cargo.toml [workspace.dependencies] and [patch.crates-io]
+#   3. Run `just vendor-patch`
+#   4. If the patch fails, regenerate it against the new version:
+#      a. Copy new op-revm source to vendor/op-revm
+#      b. Make the Tea changes (add l1_cost_multiplier field + handler preservation)
+#      c. diff -ruN original/ modified/ > patches/op-revm-l1-cost-multiplier.patch
+#   5. Run `cargo test -p tea-reth` to verify
+vendor-patch:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if [ -d vendor/op-revm/src ]; then
+    echo "vendor/op-revm already present, skipping. Run 'just vendor-patch-force' to re-vendor."
+    exit 0
+  fi
+  just vendor-patch-force
+
+# Force re-vendor op-revm (cleans and re-applies patch)
+vendor-patch-force:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  VERSION="{{OP_REVM_VERSION}}"
+  if ! ls ~/.cargo/registry/src/*/op-revm-"$VERSION" >/dev/null 2>&1; then
+    echo "op-revm v$VERSION not in cargo registry cache. Fetching..."
+    cargo fetch
+  fi
+  SRC=$(ls -d ~/.cargo/registry/src/*/op-revm-"$VERSION" 2>/dev/null | head -1)
+  if [ -z "$SRC" ]; then
+    echo "ERROR: Could not find op-revm v$VERSION in cargo registry" >&2
+    exit 1
+  fi
+  echo "Vendoring op-revm v$VERSION from $SRC"
+  rm -rf vendor/op-revm
+  mkdir -p vendor
+  cp -r "$SRC" vendor/op-revm
+  echo "Applying Tea L1 cost multiplier patch..."
+  cd vendor/op-revm && patch -p1 < ../../patches/op-revm-l1-cost-multiplier.patch
+  echo "Done. vendor/op-revm is ready."
+
 ############################### Test ################################
 
 # Run all tests (unit + doc tests)

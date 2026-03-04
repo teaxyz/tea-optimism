@@ -11,6 +11,7 @@ categories = ["cryptography", "cryptography::cryptocurrencies"]
 
 [workspace]
 resolver = "2"
+exclude = ["vendor/op-revm"]
 members = [
   # Kona
   "kona/bin/*",
@@ -43,6 +44,9 @@ members = [
   "op-reth/crates/trie/",
   "op-reth/crates/txpool/",
   "op-reth/examples/*",
+
+  # Tea-Reth
+  "tea-reth/",
 
   # Alloy OP EVM
   "alloy-op-evm/",
@@ -670,3 +674,6 @@ op-alloy-rpc-types = { path = "op-alloy/crates/rpc-types" }
 op-alloy = { path = "op-alloy/crates/op-alloy" }
 # Duplicated by: alloy-evm (crates.io)
 alloy-op-hardforks = { path = "alloy-op-hardforks/" }
+# TEA FORK: Vendored to add L1 cost multiplier for custom gas token support.
+# See vendor/op-revm/TEA-FORK.md for details on the modification.
+op-revm = { path = "vendor/op-revm" }

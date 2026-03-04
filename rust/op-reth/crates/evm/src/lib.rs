@@ -206,8 +206,14 @@ where
     }
 }
 
+// TEA FORK: Added `EvmF` type parameter to match the `ConfigureEvm` impl above.
+// Upstream hardcodes the default `OpEvmFactory` here, which prevents custom EvmFactory
+// implementations (like tea-reth's `TeaEvmFactory`) from launching a real node.
+// The impl body doesn't use the factory — it only reads chain_spec and parses payloads —
+// so the additional generic is purely a trait-bound fix.
 #[cfg(feature = "std")]
-impl<ChainSpec, N, R> ConfigureEngineEvm<OpExecutionData> for OpEvmConfig<ChainSpec, N, R>
+impl<ChainSpec, N, R, EvmF> ConfigureEngineEvm<OpExecutionData>
+    for OpEvmConfig<ChainSpec, N, R, EvmF>
 where
     ChainSpec: EthChainSpec<Header = Header> + OpHardforks,
     N: NodePrimitives<
@@ -219,6 +225,15 @@ where
         >,
     OpTransaction<TxEnv>: FromRecoveredTx<N::SignedTx> + FromTxWithEncoded<N::SignedTx>,
     R: OpReceiptBuilder<Receipt: DepositReceipt, Transaction: SignedTransaction>,
+    EvmF: EvmFactory<
+            Tx: FromRecoveredTx<R::Transaction>
+                    + FromTxWithEncoded<R::Transaction>
+                    + TransactionEnv
+                    + OpTxEnv,
+            Precompiles = PrecompilesMap,
+            Spec = OpSpecId,
+            BlockEnv = BlockEnv,
+        > + Debug,
     Self: Send + Sync + Unpin + Clone + 'static,
 {
     fn evm_env_for_payload(

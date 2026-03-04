@@ -1,0 +1,325 @@
+//! GPG signature verification precompile.
+//!
+//! Verifies ed25519 and RSA GPG signatures. Registered at address `0x0696`.
+//!
+//! Input format: `abi.encode(bytes32 message, bytes8 keyId, bytes publicKey, bytes signature)`
+//! Returns `bytes32(1)` for valid signatures, `bytes32(0)` for invalid.
+
+use alloy_primitives::{Address, Bytes, address};
+use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey};
+use pgp::types::KeyDetails;
+use revm::precompile::{Precompile, PrecompileId, PrecompileOutput, PrecompileResult};
+use std::io::Cursor;
+
+/// GPG verify precompile address.
+pub const GPG_VERIFY_ADDRESS: Address = address!("0x0000000000000000000000000000000000000696");
+
+/// Base gas cost for GPG verification.
+pub const GPG_VERIFY_BASE_GAS: u64 = 23_500;
+
+/// Per-byte gas cost above the kink point.
+pub const GPG_VERIFY_GAS_PER_BYTE: u64 = 16;
+
+/// Input length kink point — below this, only base gas is charged.
+pub const GPG_VERIFY_INPUT_LENGTH_KINK: usize = 3264;
+
+/// Returns the GPG verify precompile for registration.
+pub fn precompile() -> Precompile {
+    Precompile::new(PrecompileId::custom("gpg_verify"), GPG_VERIFY_ADDRESS, gpg_verify_run)
+}
+
+/// Calculates the gas required for GPG verification.
+pub fn required_gas(input: &[u8]) -> u64 {
+    if input.len() <= GPG_VERIFY_INPUT_LENGTH_KINK {
+        return GPG_VERIFY_BASE_GAS;
+    }
+    let additional_bytes = input.len() - GPG_VERIFY_INPUT_LENGTH_KINK;
+    GPG_VERIFY_BASE_GAS + GPG_VERIFY_GAS_PER_BYTE * additional_bytes as u64
+}
+
+/// 32-byte result indicating success (1).
+fn success_result() -> Bytes {
+    let mut result = [0u8; 32];
+    result[31] = 1;
+    Bytes::copy_from_slice(&result)
+}
+
+/// 32-byte result indicating failure (0).
+fn failure_result() -> Bytes {
+    Bytes::copy_from_slice(&[0u8; 32])
+}
+
+/// Extract 8-byte legacy key ID from a fingerprint (last 8 bytes for v4 keys).
+fn fingerprint_to_key_id(fp: &pgp::types::Fingerprint) -> [u8; 8] {
+    let bytes: &[u8] = fp.as_ref();
+    let mut id = [0u8; 8];
+    if bytes.len() >= 8 {
+        id.copy_from_slice(&bytes[bytes.len() - 8..]);
+    }
+    id
+}
+
+/// Decoded GPG verify precompile input.
+struct GpgVerifyInput {
+    message: [u8; 32],
+    key_id: [u8; 8],
+    public_key: Vec<u8>,
+    signature: Vec<u8>,
+}
+
+/// ABI-decode the GPG verify input.
+///
+/// Expected: `abi.encode(bytes32 message, bytes8 keyId, bytes publicKey, bytes signature)`
+fn decode_input(input: &[u8]) -> Result<GpgVerifyInput, &'static str> {
+    // ABI encoding layout:
+    // [0..32]   bytes32 message (static)
+    // [32..64]  bytes8 keyId (right-padded to 32 bytes)
+    // [64..96]  offset to publicKey (dynamic)
+    // [96..128] offset to signature (dynamic)
+    // Then dynamic data for publicKey and signature
+
+    if input.len() < 128 {
+        return Err("input too short");
+    }
+
+    // Extract message (bytes32)
+    let mut message = [0u8; 32];
+    message.copy_from_slice(&input[0..32]);
+
+    // Extract keyId (bytes8, left-aligned in 32-byte slot)
+    let mut key_id = [0u8; 8];
+    key_id.copy_from_slice(&input[32..40]);
+
+    // Read offsets for dynamic data
+    let pub_key_offset = u256_to_usize(&input[64..96])?;
+    let sig_offset = u256_to_usize(&input[96..128])?;
+
+    // Read publicKey
+    let pub_key = read_dynamic_bytes(input, pub_key_offset)?;
+    // Read signature
+    let signature = read_dynamic_bytes(input, sig_offset)?;
+
+    Ok(GpgVerifyInput { message, key_id, public_key: pub_key, signature })
+}
+
+/// Read a uint256 as usize (for ABI offsets).
+fn u256_to_usize(data: &[u8]) -> Result<usize, &'static str> {
+    if data.len() != 32 {
+        return Err("invalid uint256 length");
+    }
+    // Only use the last 8 bytes (offsets shouldn't be > u64)
+    let val = u64::from_be_bytes(data[24..32].try_into().map_err(|_| "conversion error")?);
+    Ok(val as usize)
+}
+
+/// Read ABI-encoded dynamic bytes from a given offset.
+fn read_dynamic_bytes(input: &[u8], offset: usize) -> Result<Vec<u8>, &'static str> {
+    if offset + 32 > input.len() {
+        return Err("offset out of bounds");
+    }
+    let length = u256_to_usize(&input[offset..offset + 32])?;
+    let data_start = offset + 32;
+    if data_start + length > input.len() {
+        return Err("data out of bounds");
+    }
+    Ok(input[data_start..data_start + length].to_vec())
+}
+
+/// GPG verify precompile entry point.
+///
+/// Signature: `fn(&[u8], u64) -> PrecompileResult`
+fn gpg_verify_run(input: &[u8], gas_limit: u64) -> PrecompileResult {
+    let gas_cost = required_gas(input);
+    if gas_limit < gas_cost {
+        return PrecompileResult::Err(revm::precompile::PrecompileError::OutOfGas);
+    }
+
+    let GpgVerifyInput {
+        message,
+        key_id: expected_key_id,
+        public_key: pub_key_bytes,
+        signature: sig_bytes,
+    } = match decode_input(input) {
+        Ok(decoded) => decoded,
+        Err(_) => {
+            return PrecompileResult::Err(revm::precompile::PrecompileError::Other(
+                "failed to decode gpg verify input".into(),
+            ));
+        }
+    };
+
+    // Parse public key
+    let pub_key = match SignedPublicKey::from_bytes(Cursor::new(&pub_key_bytes)) {
+        Ok(key) => key,
+        Err(_) => {
+            return PrecompileResult::Err(revm::precompile::PrecompileError::Other(
+                "invalid public key".into(),
+            ));
+        }
+    };
+
+    // Check key ID — the expected key ID must match the primary key or one of its subkeys.
+    // This mirrors Go's gopenpgp behavior where NewKeyRing creates a ring from the full key.
+    let primary_id = fingerprint_to_key_id(&pub_key.fingerprint());
+    let any_subkey_matches = pub_key
+        .public_subkeys
+        .iter()
+        .any(|sk| fingerprint_to_key_id(&sk.fingerprint()) == expected_key_id);
+
+    if primary_id != expected_key_id && !any_subkey_matches {
+        return PrecompileResult::Err(revm::precompile::PrecompileError::Other(
+            "public key and key id do not match".into(),
+        ));
+    }
+
+    // Parse detached signature
+    let sig = match DetachedSignature::from_bytes(Cursor::new(&sig_bytes)) {
+        Ok(sig) => sig,
+        Err(_) => {
+            return PrecompileResult::Err(revm::precompile::PrecompileError::Other(
+                "invalid signature".into(),
+            ));
+        }
+    };
+
+    // Verify signature — try primary key and all subkeys (mirrors Go's keyring behavior).
+    // The signature's embedded issuer determines which key actually verifies it.
+    let verified = sig.verify(&pub_key, &message).is_ok()
+        || pub_key.public_subkeys.iter().any(|sk| sig.verify(sk, &message).is_ok());
+
+    if verified {
+        PrecompileResult::Ok(PrecompileOutput::new(gas_cost, success_result()))
+    } else {
+        // Invalid signature is not an error — return 0
+        PrecompileResult::Ok(PrecompileOutput::new(gas_cost, failure_result()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests ported from tea-geth commit 46ec0efe:
+    //!   - `core/vm/contracts_test.go` — GPG verify precompile tests
+    //!   - `params/protocol_params.go` — gas constants (base=23500, per_byte=16, kink=3264)
+    //!
+    //! Test data (hex files) extracted verbatim from the Go test vectors.
+    //! Each test below documents the original Go function it was ported from.
+
+    use super::*;
+
+    // Test data loaded from hex files extracted from tea-geth test suite.
+    const ED25519_INPUT: &str = include_str!("testdata_gpg_verify_ed25519.hex");
+    const RSA_INPUT: &str = include_str!("testdata_gpg_verify_rsa.hex");
+    const LONG_INPUT: &str = include_str!("testdata_gpg_verify_long_input.hex");
+
+    const SUCCESS_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+
+    fn hex_decode(s: &str) -> Vec<u8> {
+        alloy_primitives::hex::decode(s).expect("valid hex")
+    }
+
+    fn assert_precompile_ok(result: &PrecompileResult, expected_gas: u64, expected_output: &str) {
+        let output = result.as_ref().expect("expected Ok result");
+        assert_eq!(output.gas_used, expected_gas);
+        assert_eq!(alloy_primitives::hex::encode(&output.bytes), expected_output);
+    }
+
+    fn assert_precompile_oog(result: &PrecompileResult) {
+        assert!(
+            matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::OutOfGas)),
+            "expected OutOfGas, got: {result:?}"
+        );
+    }
+
+    // === Gas calculation tests (from params/protocol_params.go lines 199-201) ===
+
+    #[test]
+    fn test_gas_calculation_base() {
+        assert_eq!(required_gas(&vec![0u8; GPG_VERIFY_INPUT_LENGTH_KINK]), GPG_VERIFY_BASE_GAS);
+        assert_eq!(required_gas(&vec![0u8; 100]), GPG_VERIFY_BASE_GAS);
+    }
+
+    #[test]
+    fn test_gas_calculation_above_kink() {
+        // 9504 bytes: 23500 + (9504 - 3264) * 16 = 123340
+        assert_eq!(required_gas(&vec![0u8; 9504]), 123_340);
+    }
+
+    #[test]
+    fn test_gas_calculation_just_above_kink() {
+        assert_eq!(
+            required_gas(&vec![0u8; GPG_VERIFY_INPUT_LENGTH_KINK + 1]),
+            GPG_VERIFY_BASE_GAS + GPG_VERIFY_GAS_PER_BYTE
+        );
+    }
+
+    // === ABI decoding tests (validates decodegpgVerifyInput from contracts.go:1828) ===
+
+    #[test]
+    fn test_decode_ed25519_input() {
+        let input = hex_decode(ED25519_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+        assert_eq!(decoded.message.len(), 32);
+        assert_eq!(decoded.key_id.len(), 8);
+        assert!(!decoded.public_key.is_empty());
+        assert!(!decoded.signature.is_empty());
+    }
+
+    #[test]
+    fn test_decode_rsa_input() {
+        let input = hex_decode(RSA_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+        assert_eq!(decoded.message.len(), 32);
+        assert_eq!(decoded.key_id.len(), 8);
+        assert!(!decoded.public_key.is_empty());
+        assert!(!decoded.signature.is_empty());
+    }
+
+    // === Full verification tests (ported from contracts_test.go) ===
+
+    /// Ported from: `TestPrecompiledGPGVerify_ED25519` (contracts_test.go:580)
+    /// Input: ed25519 key+sig, gas=23500, expected=0x01 (valid)
+    #[test]
+    fn test_gpg_verify_ed25519() {
+        let input = hex_decode(ED25519_INPUT);
+        let result = gpg_verify_run(&input, 23_500);
+        assert_precompile_ok(&result, 23_500, SUCCESS_HEX);
+    }
+
+    /// Ported from: `TestPrecompiledGPGVerify_RSA` (contracts_test.go:590)
+    /// Input: RSA key+sig, gas=23500, expected=0x01 (valid)
+    #[test]
+    fn test_gpg_verify_rsa() {
+        let input = hex_decode(RSA_INPUT);
+        let result = gpg_verify_run(&input, 23_500);
+        assert_precompile_ok(&result, 23_500, SUCCESS_HEX);
+    }
+
+    /// Ported from: `TestPrecompiledGPGVerify_OOG` (contracts_test.go:600)
+    /// Same ed25519 input but gas=23499 (1 below required) → OutOfGas
+    #[test]
+    fn test_gpg_verify_oog() {
+        let input = hex_decode(ED25519_INPUT);
+        let result = gpg_verify_run(&input, 23_499);
+        assert_precompile_oog(&result);
+    }
+
+    /// Ported from: `TestPrecompiledGPGVerify_LongInput` (contracts_test.go:609)
+    /// 9504-byte input (RSA, large key), gas=123340, expected=0x01 (valid)
+    /// Gas = 23500 + (9504-3264)*16 = 123340
+    #[test]
+    fn test_gpg_verify_long_input() {
+        let input = hex_decode(LONG_INPUT);
+        assert_eq!(input.len(), 9504);
+        let result = gpg_verify_run(&input, 123_340);
+        assert_precompile_ok(&result, 123_340, SUCCESS_HEX);
+    }
+
+    /// Ported from: `TestPrecompiledGPGVerify_LongInputOOG` (contracts_test.go:619)
+    /// Same long input but gas=123339 (1 below required) → OutOfGas
+    #[test]
+    fn test_gpg_verify_long_input_oog() {
+        let input = hex_decode(LONG_INPUT);
+        let result = gpg_verify_run(&input, 123_339);
+        assert_precompile_oog(&result);
+    }
+}

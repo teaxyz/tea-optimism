@@ -1,3 +1,5 @@
+> **Tea fork** — This is Tea's fork of the Optimism monorepo. For the Tea L2 execution client (tea-reth), see [`rust/tea-reth/`](rust/tea-reth/).
+
 <div align="center">
   <br />
   <br />

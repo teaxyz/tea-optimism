@@ -1,0 +1,62 @@
+TEA FORK: Add L1 cost multiplier to L1BlockInfo for custom gas token support.
+
+This patch adds an optional `l1_cost_multiplier` field to `L1BlockInfo` that scales
+the computed L1 transaction cost by a (numerator, denominator) ratio. This mirrors
+tea-geth's `NewL1CostFuncTea` which wraps the Fjord L1 cost function with
+`cost * teaPerWadEth / WAD`.
+
+The multiplier is set externally by tea-reth after reading the TEA/ETH exchange rate
+from the on-chain GasPriceOracle, and is preserved across L1BlockInfo reloads within
+the same block.
+
+Applied against: op-revm v15.0.0
+
+--- a/src/handler.rs
++++ b/src/handler.rs
+@@ -143,8 +143,13 @@
+
+         // L1 block info is stored in the context for later use.
+         // and it will be reloaded from the database if it is not for the current block.
++        let prev_multiplier = chain.l1_cost_multiplier;
+         if chain.l2_block != Some(block.number()) {
+             *chain = L1BlockInfo::try_fetch(journal.db_mut(), block.number(), spec)?;
++            // TEA FORK: Preserve the L1 cost multiplier across reloads.
++            // The multiplier is set externally (e.g., by tea-reth reading an on-chain oracle)
++            // and must survive L1BlockInfo reloads within the same block.
++            chain.l1_cost_multiplier = prev_multiplier;
+         }
+
+         let mut caller_account = journal.load_account_with_code_mut(tx.caller())?.data;
+--- a/src/l1block.rs
++++ b/src/l1block.rs
+@@ -53,6 +53,14 @@
+     pub empty_ecotone_scalars: bool,
+     /// Last calculated l1 fee cost. Uses as a cache between validation and pre execution stages.
+     pub tx_l1_cost: Option<U256>,
++    /// TEA FORK: Optional L1 cost multiplier for custom gas token chains.
++    ///
++    /// When set, the final L1 cost is scaled by `(numerator / denominator)` after the
++    /// standard cost calculation. This mirrors tea-geth's `NewL1CostFuncTea` which wraps
++    /// the Fjord cost function with `cost * teaPerWadEth / WAD`.
++    ///
++    /// Format: `(numerator, denominator)` — e.g., `(999 * 1e18, 1e18)` for 999:1 rate.
++    pub l1_cost_multiplier: Option<(U256, U256)>,
+ }
+
+ impl L1BlockInfo {
+@@ -295,6 +303,15 @@
+             self.calculate_tx_l1_cost_ecotone(input, spec_id)
+         } else {
+             self.calculate_tx_l1_cost_bedrock(input, spec_id)
++        };
++
++        // TEA FORK: Apply custom gas token multiplier if configured.
++        // This mirrors tea-geth's NewL1CostFuncTea: cost * teaPerWadEth / WAD.
++        let tx_l1_cost = match self.l1_cost_multiplier {
++            Some((numerator, denominator)) if !denominator.is_zero() => {
++                tx_l1_cost.saturating_mul(numerator) / denominator
++            }
++            _ => tx_l1_cost,
+         };
+
+         self.tx_l1_cost = Some(tx_l1_cost);
