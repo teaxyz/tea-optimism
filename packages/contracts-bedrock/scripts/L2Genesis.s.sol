@@ -86,6 +86,7 @@ contract L2Genesis is Script {
         string gasPayingTokenSymbol;
         uint256 nativeAssetLiquidityAmount;
         address liquidityControllerOwner;
+        bool useL2CM;
 
         // TEA
         address l1CGTBridge;
@@ -210,7 +211,7 @@ contract L2Genesis is Script {
 
     /// @notice Set up the accounts that correspond to the predeploys.
     ///         The Proxy bytecode should be set. All proxied predeploys should have
-    ///         the 1967 admin slot set to the ProxyAdmin predeploy. All defined predeploys
+    ///         the 1967 admin slot set to the L2ProxyAdmin predeploy. All defined predeploys
     ///         should have their implementations set.
     ///         Warning: the predeploy accounts have contract code, but 0 nonce value, contrary
     ///         to the expected nonce of 1 per EIP-161. This is because the legacy go genesis
@@ -229,8 +230,11 @@ contract L2Genesis is Script {
             vm.etch(addr, code);
             EIP1967Helper.setAdmin(addr, Predeploys.PROXY_ADMIN);
 
-            if (Predeploys.isSupportedPredeploy(addr, _input.fork, _input.deployCrossL2Inbox, _input.useCustomGasToken))
-            {
+            if (
+                Predeploys.isSupportedPredeploy(
+                    addr, _input.fork, _input.deployCrossL2Inbox, _input.useCustomGasToken, _input.useL2CM
+                )
+            ) {
                 address implementation = Predeploys.predeployToCodeNamespace(addr);
                 EIP1967Helper.setImplementation(addr, implementation);
             }
@@ -257,7 +261,7 @@ contract L2Genesis is Script {
         setL1Block(_input.useCustomGasToken); // 15
         setL2ToL1MessagePasser(_input.useCustomGasToken); // 16
         setOptimismMintableERC721Factory(_input); // 17
-        setProxyAdmin(_input); // 18
+        setL2ProxyAdmin(_input); // 18
         setBaseFeeVault(_input); // 19
         setL1FeeVault(_input); // 1A
         setOperatorFeeVault(_input); // 1B
@@ -279,6 +283,9 @@ contract L2Genesis is Script {
             // TEA
             deployCGTBridge(_input);
         }
+        if (_input.useL2CM) {
+            setConditionalDeployer(); // 2C
+        }
     }
 
     function deployCGTBridge(Input memory _input) internal {
@@ -298,12 +305,13 @@ contract L2Genesis is Script {
 
     function setInteropPredeployProxies() internal { }
 
-    function setProxyAdmin(Input memory _input) internal {
-        // Note the ProxyAdmin implementation itself is behind a proxy that owns itself.
+    function setL2ProxyAdmin(Input memory _input) internal {
+        // Note the L2ProxyAdmin implementation itself is behind a proxy that owns itself.
         address impl = _setImplementationCode(Predeploys.PROXY_ADMIN);
 
         bytes32 _ownerSlot = bytes32(0);
 
+        // TODO(#19182): Remove this once the L2ProxyAdmin is initializable.
         // there is no initialize() function, so we just set the storage manually.
         vm.store(Predeploys.PROXY_ADMIN, _ownerSlot, bytes32(uint256(uint160(_input.opChainProxyAdminOwner))));
         // update the proxy to not be uninitialized (although not standard initialize pattern)
@@ -602,6 +610,11 @@ contract L2Genesis is Script {
 
         // Pre-fund the liquidity contract with the specified amount
         vm.deal(Predeploys.NATIVE_ASSET_LIQUIDITY, _input.nativeAssetLiquidityAmount);
+    }
+
+    /// @notice This predeploy is following the safety invariant #1.
+    function setConditionalDeployer() internal {
+        _setImplementationCode(Predeploys.CONDITIONAL_DEPLOYER);
     }
 
     /// @notice Sets all the preinstalls.

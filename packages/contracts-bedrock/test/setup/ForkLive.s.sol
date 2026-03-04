@@ -32,7 +32,6 @@ import { ISystemConfig } from "interfaces/L1/ISystemConfig.sol";
 import { IProxyAdmin } from "interfaces/universal/IProxyAdmin.sol";
 import { IOPContractsManager } from "interfaces/L1/IOPContractsManager.sol";
 import { IAnchorStateRegistry } from "interfaces/dispute/IAnchorStateRegistry.sol";
-import { IFaultDisputeGame } from "interfaces/dispute/IFaultDisputeGame.sol";
 import { IETHLockbox } from "interfaces/L1/IETHLockbox.sol";
 import { IOptimismPortal2 } from "interfaces/L1/IOptimismPortal2.sol";
 import { IOPContractsManagerUpgrader } from "interfaces/L1/IOPContractsManager.sol";
@@ -179,15 +178,22 @@ contract ForkLive is Deployer, StdAssertions, FeatureFlags {
             IDisputeGameFactory(artifacts.mustGetAddress("DisputeGameFactoryProxy"));
 
         // The PermissionedDisputeGame and PermissionedDelayedWETHProxy are not listed in the registry for OP, so we
-        // look it up onchain
-        IFaultDisputeGame permissionedDisputeGame =
-            IFaultDisputeGame(address(disputeGameFactory.gameImpls(GameTypes.PERMISSIONED_CANNON)));
-        artifacts.save("PermissionedDisputeGame", address(permissionedDisputeGame));
-        artifacts.save("PermissionedDelayedWETHProxy", address(permissionedDisputeGame.weth()));
+        // look it up onchain.
+        address permissionedGameImpl = address(disputeGameFactory.gameImpls(GameTypes.PERMISSIONED_CANNON));
+        artifacts.save("PermissionedDisputeGame", permissionedGameImpl);
 
-        // The SR seems out-of-date, so pull the DelayedWETH addresses from the PermissionedDisputeGame.
-        artifacts.save("DelayedWETHProxy", address(permissionedDisputeGame.weth()));
-        artifacts.save("DelayedWETHImpl", EIP1967Helper.getImplementation(address(permissionedDisputeGame.weth())));
+        // Get DelayedWETH for PERMISSIONED games
+        IDelayedWETH permissionedDelayedWeth =
+            DisputeGames.getGameImplDelayedWeth(disputeGameFactory, GameTypes.PERMISSIONED_CANNON);
+        artifacts.save("PermissionedDelayedWETHProxy", address(permissionedDelayedWeth));
+
+        // Get DelayedWETH for PERMISSIONLESS games (CANNON)
+        IDelayedWETH permissionlessDelayedWeth =
+            DisputeGames.getGameImplDelayedWeth(disputeGameFactory, GameTypes.CANNON);
+
+        // The SR seems out-of-date, so pull the DelayedWETH addresses from the games.
+        artifacts.save("DelayedWETHProxy", address(permissionlessDelayedWeth));
+        artifacts.save("DelayedWETHImpl", EIP1967Helper.getImplementation(address(permissionlessDelayedWeth)));
     }
 
     /// @notice Calls to the Deploy.s.sol contract etched by Setup.sol to a deterministic address, sets up the
@@ -308,15 +314,10 @@ contract ForkLive is Deployer, StdAssertions, FeatureFlags {
         });
 
         // Add extra instructions to allow the DelayedWETH proxy to be deployed.
-        // TODO(#18502): Remove the extra instruction for custom gas token after U18 ships.
         IOPContractsManagerUtils.ExtraInstruction[] memory extraInstructions =
-            new IOPContractsManagerUtils.ExtraInstruction[](2);
+            new IOPContractsManagerUtils.ExtraInstruction[](1);
         extraInstructions[0] =
             IOPContractsManagerUtils.ExtraInstruction({ key: "PermittedProxyDeployment", data: bytes("DelayedWETH") });
-        extraInstructions[1] = IOPContractsManagerUtils.ExtraInstruction({
-            key: "overrides.cfg.useCustomGasToken",
-            data: abi.encode(false)
-        });
 
         vm.prank(_delegateCaller, true);
         (bool upgradeSuccess,) = address(_opcm).delegatecall(

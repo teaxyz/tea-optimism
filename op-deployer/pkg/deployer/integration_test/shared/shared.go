@@ -17,15 +17,14 @@ import (
 	"github.com/ethereum-optimism/optimism/op-chain-ops/foundry"
 	"github.com/ethereum-optimism/optimism/op-chain-ops/opcmregistry"
 	"github.com/ethereum-optimism/optimism/op-chain-ops/script"
-	"github.com/ethereum-optimism/optimism/op-deployer/pkg/deployer"
 	"github.com/ethereum-optimism/optimism/op-deployer/pkg/deployer/artifacts"
 	"github.com/ethereum-optimism/optimism/op-deployer/pkg/deployer/broadcaster"
 	"github.com/ethereum-optimism/optimism/op-deployer/pkg/deployer/standard"
 	"github.com/ethereum-optimism/optimism/op-deployer/pkg/deployer/state"
 	"github.com/ethereum-optimism/optimism/op-deployer/pkg/deployer/upgrade/embedded"
 	"github.com/ethereum-optimism/optimism/op-deployer/pkg/env"
+	"github.com/ethereum-optimism/optimism/op-service/bigs"
 	"github.com/ethereum/go-ethereum"
-	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -82,7 +81,7 @@ func NewIntent(
 ) (*state.Intent, *state.State) {
 	intent := &state.Intent{
 		ConfigType: state.IntentTypeCustom,
-		L1ChainID:  l1ChainID.Uint64(),
+		L1ChainID:  bigs.Uint64Strict(l1ChainID),
 		SuperchainRoles: &addresses.SuperchainRoles{
 			SuperchainProxyAdminOwner: AddrFor(t, dk, devkeys.L1ProxyAdminOwnerRole.Key(l1ChainID)),
 			ProtocolVersionsOwner:     AddrFor(t, dk, devkeys.SuperchainDeployerKey.Key(l1ChainID)),
@@ -255,37 +254,32 @@ func buildV2OPCMUpgradeConfig(t *testing.T, prank, opcmAddr, systemConfigProxy c
 
 	// Build dispute game configs with dummy prestates
 	// CANNON and PERMISSIONED_CANNON are the standard game types
-	cannonArgs, err := abi.Arguments{{Type: deployer.Bytes32Type}}.Pack(opcmregistry.DummyCannonPrestate)
-	require.NoError(t, err)
-
-	permissionedArgs, err := abi.Arguments{
-		{Type: deployer.Bytes32Type},
-		{Type: deployer.AddressType},
-		{Type: deployer.AddressType},
-	}.Pack(opcmregistry.DummyCannonPrestate, common.Address{}, common.Address{})
-	require.NoError(t, err)
-
-	cannonKonaArgs, err := abi.Arguments{{Type: deployer.Bytes32Type}}.Pack(opcmregistry.DummyCannonKonaPrestate)
-	require.NoError(t, err)
-
 	disputeGameConfigs := []embedded.DisputeGameConfig{
 		{
 			Enabled:  true,
 			InitBond: big.NewInt(0),
 			GameType: embedded.GameTypeCannon,
-			GameArgs: cannonArgs,
+			FaultDisputeGameConfig: &embedded.FaultDisputeGameConfig{
+				AbsolutePrestate: opcmregistry.DummyCannonPrestate,
+			},
 		},
 		{
 			Enabled:  true,
 			InitBond: big.NewInt(0),
 			GameType: embedded.GameTypePermissionedCannon,
-			GameArgs: permissionedArgs,
+			PermissionedDisputeGameConfig: &embedded.PermissionedDisputeGameConfig{
+				AbsolutePrestate: opcmregistry.DummyCannonPrestate,
+				Proposer:         common.Address{},
+				Challenger:       common.Address{},
+			},
 		},
 		{
 			Enabled:  true,
 			InitBond: big.NewInt(0),
 			GameType: embedded.GameTypeCannonKona,
-			GameArgs: cannonKonaArgs,
+			FaultDisputeGameConfig: &embedded.FaultDisputeGameConfig{
+				AbsolutePrestate: opcmregistry.DummyCannonKonaPrestate,
+			},
 		},
 	}
 
@@ -305,8 +299,8 @@ func buildV2OPCMUpgradeConfig(t *testing.T, prank, opcmAddr, systemConfigProxy c
 	}
 }
 
-// deployDummyCaller deploys DummyCaller at the prank address with the given OPCM address.
-func deployDummyCaller(t *testing.T, rpcClient *rpc.Client, afactsFS foundry.StatDirFs, prank, opcmAddr common.Address) {
+// DeployDummyCaller deploys DummyCaller at the prank address with the given OPCM address.
+func DeployDummyCaller(t *testing.T, rpcClient *rpc.Client, afactsFS foundry.StatDirFs, prank, opcmAddr common.Address) {
 	t.Helper()
 
 	artifacts := &foundry.ArtifactsFS{FS: afactsFS}
@@ -435,7 +429,7 @@ func RunPastUpgradesWithRPC(t *testing.T, l1RPCUrl string, afactsFS foundry.Stat
 	// Process each OPCM upgrade: deploy DummyCaller with correct OPCM, run upgrade, broadcast
 	for _, opcm := range toApply {
 		// Deploy DummyCaller with this OPCM's address
-		deployDummyCaller(t, rpcClient, afactsFS, prank, opcm.Address)
+		DeployDummyCaller(t, rpcClient, afactsFS, prank, opcm.Address)
 
 		// Create fresh broadcaster and host for this upgrade
 		bcaster := NewImpersonationBroadcaster(lgr, ethClient, rpcClient, prank, networkChainID)

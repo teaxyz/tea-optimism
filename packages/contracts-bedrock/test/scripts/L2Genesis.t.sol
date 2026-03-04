@@ -20,7 +20,7 @@ import { IL1FeeVault } from "interfaces/L2/IL1FeeVault.sol";
 import { IOperatorFeeVault } from "interfaces/L2/IOperatorFeeVault.sol";
 import { IOptimismMintableERC20Factory } from "interfaces/universal/IOptimismMintableERC20Factory.sol";
 import { IOptimismMintableERC721Factory } from "interfaces/L2/IOptimismMintableERC721Factory.sol";
-import { IProxyAdmin } from "interfaces/universal/IProxyAdmin.sol";
+import { IL2ProxyAdmin } from "interfaces/L2/IL2ProxyAdmin.sol";
 import { IGovernanceToken } from "interfaces/governance/IGovernanceToken.sol";
 import { IGasPriceOracle } from "interfaces/L2/IGasPriceOracle.sol";
 import { IFeeSplitter } from "interfaces/L2/IFeeSplitter.sol";
@@ -47,14 +47,14 @@ abstract contract L2Genesis_TestInit is Test {
 
     function testProxyAdmin() internal view {
         // Verify owner in the proxy
-        assertEq(input.opChainProxyAdminOwner, IProxyAdmin(Predeploys.PROXY_ADMIN).owner());
+        assertEq(input.opChainProxyAdminOwner, IL2ProxyAdmin(Predeploys.PROXY_ADMIN).owner());
 
         // Verify owner in the implementation to catch storage shifting issues
         // The implementation is stored in the code namespace
         address proxyAdminImpl = Predeploys.predeployToCodeNamespace(Predeploys.PROXY_ADMIN);
         assertEq(
             input.opChainProxyAdminOwner,
-            IProxyAdmin(proxyAdminImpl).owner(),
+            IL2ProxyAdmin(proxyAdminImpl).owner(),
             "ProxyAdmin implementation owner should match expected"
         );
     }
@@ -75,7 +75,11 @@ abstract contract L2Genesis_TestInit is Test {
             assertEq(Predeploys.PROXY_ADMIN, EIP1967Helper.getAdmin(addr));
 
             // If it's not a supported predeploy, skip next checks.
-            if (!Predeploys.isSupportedPredeploy(addr, uint256(LATEST_FORK), true, input.useCustomGasToken)) {
+            if (
+                !Predeploys.isSupportedPredeploy(
+                    addr, uint256(LATEST_FORK), true, input.useCustomGasToken, input.useL2CM
+                )
+            ) {
                 continue;
             }
 
@@ -271,6 +275,7 @@ contract L2Genesis_Run_Test is L2Genesis_TestInit {
             gasPayingTokenSymbol: "",
             nativeAssetLiquidityAmount: type(uint248).max,
             liquidityControllerOwner: address(0x000000000000000000000000000000000000000d),
+            useL2CM: false
 
             // TEA
             l1CGTBridge: address(0x7278C0d99Ba37cE53d6983CfC52a181EF891581F)
@@ -452,5 +457,19 @@ contract L2Genesis_Run_Test is L2Genesis_TestInit {
         input.useRevenueShare = true;
         vm.expectRevert("FeeVault: custom gas token and revenue share cannot be enabled together");
         genesis.run(input);
+    }
+
+    /// @notice Tests that enabling l2cm succeeds.
+    function test_run_l2cm_succeeds() external {
+        input.useL2CM = true;
+        genesis.run(input);
+
+        testProxyAdmin();
+        testPredeploys();
+        testVaultsWithRevenueShare();
+        testGovernance();
+        testFactories();
+        testForks();
+        testFeeSplitter();
     }
 }
