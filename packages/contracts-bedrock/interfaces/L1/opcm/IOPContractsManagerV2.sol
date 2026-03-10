@@ -2,7 +2,7 @@
 pragma solidity ^0.8.0;
 
 // Libraries
-import { Claim, GameType, Proposal } from "src/dispute/lib/Types.sol";
+import { GameType, Proposal } from "src/dispute/lib/Types.sol";
 
 // Interfaces
 import { IProxyAdmin } from "interfaces/universal/IProxyAdmin.sol";
@@ -21,28 +21,10 @@ import { IETHLockbox } from "interfaces/L1/IETHLockbox.sol";
 import { IResourceMetering } from "interfaces/L1/IResourceMetering.sol";
 import { IOPContractsManagerContainer } from "interfaces/L1/opcm/IOPContractsManagerContainer.sol";
 import { IOPContractsManagerStandardValidator } from "interfaces/L1/IOPContractsManagerStandardValidator.sol";
+import { IOPContractsManagerUtils } from "interfaces/L1/opcm/IOPContractsManagerUtils.sol";
+import { IOPContractsManagerMigrator } from "interfaces/L1/opcm/IOPContractsManagerMigrator.sol";
 
 interface IOPContractsManagerV2 {
-    /// @notice Configuration for the FaultDisputeGame.
-    struct FaultDisputeGameConfig {
-        Claim absolutePrestate;
-    }
-
-    /// @notice Configuration for the PermissionedDisputeGame.
-    struct PermissionedDisputeGameConfig {
-        Claim absolutePrestate;
-        address proposer;
-        address challenger;
-    }
-
-    /// @notice Dispute game configuration for a specific game type.
-    struct DisputeGameConfig {
-        bool enabled;
-        uint256 initBond;
-        GameType gameType;
-        bytes gameArgs;
-    }
-
     /// @notice Contracts that represent the Superchain system.
     struct SuperchainContracts {
         ISuperchainConfig superchainConfig;
@@ -79,35 +61,27 @@ interface IOPContractsManagerV2 {
         uint64 gasLimit;
         uint256 l2ChainId;
         IResourceMetering.ResourceConfig resourceConfig;
-        DisputeGameConfig[] disputeGameConfigs;
-    }
-
-    struct ExtraInstruction {
-        string key;
-        bytes data;
+        IOPContractsManagerUtils.DisputeGameConfig[] disputeGameConfigs;
+        bool useCustomGasToken;
     }
 
     struct UpgradeInput {
         ISystemConfig systemConfig;
-        DisputeGameConfig[] disputeGameConfigs;
-        ExtraInstruction[] extraInstructions;
+        IOPContractsManagerUtils.DisputeGameConfig[] disputeGameConfigs;
+        IOPContractsManagerUtils.ExtraInstruction[] extraInstructions;
     }
 
     struct SuperchainUpgradeInput {
         ISuperchainConfig superchainConfig;
-        ExtraInstruction[] extraInstructions;
+        IOPContractsManagerUtils.ExtraInstruction[] extraInstructions;
     }
-
-    event ProxyCreation(string name, address proxy);
 
     error OPContractsManagerV2_InvalidGameConfigs();
     error OPContractsManagerV2_InvalidUpgradeInput();
     error OPContractsManagerV2_SuperchainConfigNeedsUpgrade();
-    error OPContractsManagerV2_UnsupportedGameType();
-    error OPContractsManagerV2_ProxyMustLoad(string _name);
-    error OPContractsManagerV2_DowngradeNotAllowed(address _contract);
-    error OPContractsManagerV2_InvalidUpgradeInstruction();
-    error OPContractsManagerV2_ConfigLoadFailed(string _name);
+    error OPContractsManagerV2_InvalidUpgradeInstruction(string _key);
+    error OPContractsManagerV2_CannotUpgradeToCustomGasToken();
+    error OPContractsManagerV2_InvalidUpgradeSequence(string _lastVersion, string _thisVersion);
     error IdentityPrecompileCallFailed();
     error ReservedBitsSet();
     error BytesArrayTooLong();
@@ -119,8 +93,9 @@ interface IOPContractsManagerV2 {
     error UnexpectedPreambleData(bytes data);
 
     function __constructor__(
-        IOPContractsManagerContainer _contractsContainer,
-        IOPContractsManagerStandardValidator _standardValidator
+        IOPContractsManagerStandardValidator _standardValidator,
+        IOPContractsManagerMigrator _migrator,
+        IOPContractsManagerUtils _utils
     )
         external;
 
@@ -130,14 +105,18 @@ interface IOPContractsManagerV2 {
 
     function contractsContainer() external view returns (IOPContractsManagerContainer);
 
-    function standardValidator() external view returns (IOPContractsManagerStandardValidator);
+    function opcmStandardValidator() external view returns (IOPContractsManagerStandardValidator);
+
+    function opcmV2() external view returns (IOPContractsManagerV2);
+
+    function opcmMigrator() external view returns (IOPContractsManagerMigrator);
+
+    function opcmUtils() external view returns (IOPContractsManagerUtils);
 
     function version() external view returns (string memory);
 
     /// @notice Upgrades Superchain-wide contracts.
-    function upgradeSuperchain(SuperchainUpgradeInput memory _inp)
-        external
-        returns (SuperchainContracts memory);
+    function upgradeSuperchain(SuperchainUpgradeInput memory _inp) external returns (SuperchainContracts memory);
 
     /// @notice Deploys and wires a complete OP Chain per the provided configuration.
     function deploy(FullConfig memory _cfg) external returns (ChainContracts memory);
@@ -145,6 +124,16 @@ interface IOPContractsManagerV2 {
     /// @notice Upgrades contracts on an existing OP Chain per the provided input.
     function upgrade(UpgradeInput memory _inp) external returns (ChainContracts memory);
 
+    /// @notice Migrates one or more OP Stack chains to use the Super Root dispute games and shared
+    ///         dispute game contracts.
+    function migrate(IOPContractsManagerMigrator.MigrateInput calldata _input) external;
+
     /// @notice Returns whether a development feature is enabled.
     function isDevFeatureEnabled(bytes32 _feature) external view returns (bool);
+
+    /// @notice Checks if the upgrade sequence from the last used OPCM to this OPCM is permitted.
+    function isPermittedUpgradeSequence(ISystemConfig _systemConfig) external view returns (bool);
+
+    /// @notice Returns the development feature bitmap.
+    function devFeatureBitmap() external view returns (bytes32);
 }

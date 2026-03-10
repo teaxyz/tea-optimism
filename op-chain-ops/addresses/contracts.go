@@ -34,6 +34,8 @@ type ImplementationsContracts struct {
 	OpcmUpgraderImpl                 common.Address
 	OpcmInteropMigratorImpl          common.Address
 	OpcmStandardValidatorImpl        common.Address
+	OpcmUtilsImpl                    common.Address
+	OpcmMigratorImpl                 common.Address
 	OpcmV2Impl                       common.Address
 	OpcmContainerImpl                common.Address
 	DelayedWethImpl                  common.Address
@@ -49,8 +51,8 @@ type ImplementationsContracts struct {
 	OptimismMintableErc20FactoryImpl common.Address
 	DisputeGameFactoryImpl           common.Address
 	AnchorStateRegistryImpl          common.Address
-	FaultDisputeGameV2Impl           common.Address
-	PermissionedDisputeGameV2Impl    common.Address
+	FaultDisputeGameImpl             common.Address
+	PermissionedDisputeGameImpl      common.Address
 	StorageSetterImpl                common.Address
 }
 
