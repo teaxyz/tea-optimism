@@ -177,4 +177,110 @@ mod tests {
         let tea_cost = apply_tea_exchange_rate(fjord_cost, rate);
         assert_eq!(tea_cost, fjord_cost * U256::from(1_500_000u64));
     }
+
+    // === Additional tests from PR #5 review feedback ===
+
+    /// 1:1 exchange rate: apply_tea_exchange_rate(cost, WAD) == cost.
+    #[test]
+    fn test_exchange_rate_one_to_one() {
+        let fjord_cost = U256::from(FJORD_FEE);
+        assert_eq!(apply_tea_exchange_rate(fjord_cost, WAD), fjord_cost);
+    }
+
+    /// Fractional rate: rate = WAD / 2 → cost should halve.
+    #[test]
+    fn test_exchange_rate_fractional() {
+        let fjord_cost = U256::from(FJORD_FEE);
+        let half_wad = WAD / U256::from(2);
+        let tea_cost = apply_tea_exchange_rate(fjord_cost, half_wad);
+        assert_eq!(tea_cost, fjord_cost / U256::from(2));
+    }
+
+    /// Rounding: values that don't divide evenly by WAD should truncate (floor),
+    /// matching Go's big.Int.Div behavior.
+    #[test]
+    fn test_exchange_rate_rounding() {
+        // fjord_cost * rate = 7 * (WAD / 3) = 7 * 333333333333333333 = 2333333333333333331
+        // 2333333333333333331 / WAD = 2333333333333333331 / 1e18 = 2 (floor division)
+        let fjord_cost = U256::from(7u64);
+        let rate = WAD / U256::from(3); // 333333333333333333
+        let tea_cost = apply_tea_exchange_rate(fjord_cost, rate);
+        // 7 * 333333333333333333 = 2333333333333333331
+        // 2333333333333333331 / 1e18 = 2 (floor)
+        assert_eq!(tea_cost, U256::from(2u64));
+    }
+
+    /// Extract price ignores timestamps correctly — different timestamps, same price.
+    #[test]
+    fn test_extract_price_with_various_timestamps() {
+        // Same price (999 * WAD) with different timestamp prefixes
+        // Timestamp 0x67931924
+        let slot1 = alloy_primitives::hex!(
+            "00000000000000006793192400000000000000000000003627e8f712373c0000"
+        );
+        // Timestamp 0xFFFFFFFF (different)
+        let slot2 = alloy_primitives::hex!(
+            "0000000000000000FFFFFFFF00000000000000000000003627e8f712373c0000"
+        );
+        // Timestamp 0x00000000 (zero)
+        let slot3 = alloy_primitives::hex!(
+            "00000000000000000000000000000000000000000000003627e8f712373c0000"
+        );
+
+        let price1 = extract_price_from_slot(B256::from(slot1));
+        let price2 = extract_price_from_slot(B256::from(slot2));
+        let price3 = extract_price_from_slot(B256::from(slot3));
+
+        let expected = U256::from(999u64) * WAD;
+        assert_eq!(price1, expected, "price should be same regardless of timestamp");
+        assert_eq!(price2, expected, "price should be same regardless of timestamp");
+        assert_eq!(price3, expected, "price should be same regardless of timestamp");
+    }
+
+    /// Zero oracle value triggers backup rate.
+    #[test]
+    fn test_tea_per_wad_eth_or_backup_zero() {
+        let result = tea_per_wad_eth_or_backup(U256::ZERO);
+        assert_eq!(result, U256::from(BACKUP_TEA_PER_ETH) * WAD);
+    }
+
+    /// Non-zero oracle value is returned as-is.
+    #[test]
+    fn test_tea_per_wad_eth_or_backup_nonzero() {
+        let custom_rate = U256::from(42u64) * WAD;
+        assert_eq!(tea_per_wad_eth_or_backup(custom_rate), custom_rate);
+    }
+
+    /// Exchange rate of zero → cost is zero.
+    #[test]
+    fn test_exchange_rate_zero() {
+        let fjord_cost = U256::from(FJORD_FEE);
+        assert_eq!(apply_tea_exchange_rate(fjord_cost, U256::ZERO), U256::ZERO);
+    }
+
+    /// Extract price from U256 and B256 should always agree, even for edge values.
+    #[test]
+    fn test_extract_price_u256_b256_agreement_edge_cases() {
+        // All zeros
+        assert_eq!(
+            extract_price_from_slot(B256::ZERO),
+            extract_price_from_u256(U256::ZERO)
+        );
+
+        // Max 160-bit price (lower 20 bytes all 0xFF)
+        let max_price_slot = alloy_primitives::hex!(
+            "000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+        );
+        let from_b256 = extract_price_from_slot(B256::from(max_price_slot));
+        let from_u256 = extract_price_from_u256(U256::from_be_bytes(max_price_slot));
+        assert_eq!(from_b256, from_u256, "max 160-bit price should match");
+
+        // Price = 1
+        let one_slot = alloy_primitives::hex!(
+            "0000000000000000000000000000000000000000000000000000000000000001"
+        );
+        let from_b256 = extract_price_from_slot(B256::from(one_slot));
+        let from_u256 = extract_price_from_u256(U256::from_be_bytes(one_slot));
+        assert_eq!(from_b256, from_u256, "price = 1 should match");
+    }
 }

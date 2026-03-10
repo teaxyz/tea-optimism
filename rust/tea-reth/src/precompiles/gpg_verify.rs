@@ -322,4 +322,264 @@ mod tests {
         let result = gpg_verify_run(&input, 123_339);
         assert_precompile_oog(&result);
     }
+
+    // === Additional tests from PR #5 review feedback ===
+
+    // --- Gas calculation edge cases ---
+
+    /// Gas for empty input should equal base gas (23,500).
+    #[test]
+    fn test_gas_zero_length_input() {
+        assert_eq!(required_gas(&[]), GPG_VERIFY_BASE_GAS);
+    }
+
+    /// Gas for input exactly at kink-1 (3263 bytes) should equal base gas.
+    #[test]
+    fn test_gas_exactly_at_kink_minus_one() {
+        assert_eq!(required_gas(&vec![0u8; GPG_VERIFY_INPUT_LENGTH_KINK - 1]), GPG_VERIFY_BASE_GAS);
+    }
+
+    // --- Error & edge case tests ---
+
+    /// Empty input should return decode error, not panic.
+    #[test]
+    fn test_gpg_verify_empty_input() {
+        let result = gpg_verify_run(&[], 23_500);
+        assert!(
+            matches!(
+                result,
+                PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))
+            ),
+            "expected decode error for empty input, got: {result:?}"
+        );
+    }
+
+    /// Input shorter than 128 bytes (minimum ABI header) should return decode error.
+    #[test]
+    fn test_gpg_verify_truncated_input() {
+        let input = vec![0u8; 127];
+        let result = gpg_verify_run(&input, 23_500);
+        assert!(
+            matches!(
+                result,
+                PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))
+            ),
+            "expected decode error for truncated input, got: {result:?}"
+        );
+    }
+
+    /// Valid ABI encoding but garbage bytes for the public key.
+    #[test]
+    fn test_gpg_verify_corrupt_public_key() {
+        let input = hex_decode(ED25519_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+
+        // Re-encode with garbage public key bytes
+        let garbage_key = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
+        let corrupt_input =
+            encode_gpg_verify_input(&decoded.message, &decoded.key_id, &garbage_key, &decoded.signature);
+
+        let result = gpg_verify_run(&corrupt_input, 23_500);
+        assert!(
+            matches!(
+                result,
+                PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))
+            ),
+            "expected 'invalid public key' error, got: {result:?}"
+        );
+    }
+
+    /// Valid key + valid message but garbage signature bytes.
+    #[test]
+    fn test_gpg_verify_corrupt_signature() {
+        let input = hex_decode(ED25519_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+
+        // Re-encode with garbage signature
+        let garbage_sig = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
+        let corrupt_input =
+            encode_gpg_verify_input(&decoded.message, &decoded.key_id, &decoded.public_key, &garbage_sig);
+
+        let result = gpg_verify_run(&corrupt_input, 23_500);
+        assert!(
+            matches!(
+                result,
+                PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))
+            ),
+            "expected 'invalid signature' error, got: {result:?}"
+        );
+    }
+
+    /// Valid key + valid sig but different message hash → bytes32(0).
+    /// Direct unit test (complements the EVM integration test).
+    #[test]
+    fn test_gpg_verify_wrong_message() {
+        let mut input = hex_decode(ED25519_INPUT);
+        // Corrupt the first byte of the message hash
+        input[0] ^= 0xFF;
+        let result = gpg_verify_run(&input, 23_500);
+        let output = result.as_ref().expect("expected Ok result");
+        assert_eq!(output.gas_used, 23_500);
+        assert!(output.bytes.iter().all(|&b| b == 0), "should return bytes32(0) for wrong message");
+    }
+
+    /// Gas = 0 should return OutOfGas.
+    #[test]
+    fn test_gpg_verify_zero_gas() {
+        let input = hex_decode(ED25519_INPUT);
+        let result = gpg_verify_run(&input, 0);
+        assert_precompile_oog(&result);
+    }
+
+    /// Key ID that doesn't match primary key or any subkey should error.
+    #[test]
+    fn test_gpg_verify_wrong_key_id() {
+        let input = hex_decode(ED25519_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+
+        // Use a completely wrong key ID
+        let wrong_key_id: [u8; 8] = [0xFF; 8];
+        let bad_input =
+            encode_gpg_verify_input(&decoded.message, &wrong_key_id, &decoded.public_key, &decoded.signature);
+
+        let result = gpg_verify_run(&bad_input, 23_500);
+        assert!(
+            matches!(
+                result,
+                PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))
+            ),
+            "expected 'key id do not match' error, got: {result:?}"
+        );
+    }
+
+    // --- Subkey handling tests ---
+
+    /// Verify that we can extract subkey IDs from existing test keys and that
+    /// subkey matching logic works correctly.
+    #[test]
+    fn test_gpg_verify_subkey_id_matching() {
+        let input = hex_decode(ED25519_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+
+        // Parse the public key
+        let pub_key =
+            SignedPublicKey::from_bytes(Cursor::new(&decoded.public_key)).expect("valid key");
+
+        // Get the primary key ID
+        let primary_id = fingerprint_to_key_id(&pub_key.fingerprint());
+        assert_eq!(primary_id, decoded.key_id, "ed25519 test vector uses primary key ID");
+
+        // If the key has subkeys, verify they DON'T match the primary key ID
+        for sk in &pub_key.public_subkeys {
+            let sk_id = fingerprint_to_key_id(&sk.fingerprint());
+            assert_ne!(sk_id, primary_id, "subkey ID should differ from primary");
+        }
+    }
+
+    /// If the key has subkeys, using a subkey ID should pass the key ID check.
+    #[test]
+    fn test_gpg_verify_with_subkey_id_passes_id_check() {
+        let input = hex_decode(ED25519_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+
+        let pub_key =
+            SignedPublicKey::from_bytes(Cursor::new(&decoded.public_key)).expect("valid key");
+
+        if pub_key.public_subkeys.is_empty() {
+            // Skip if no subkeys — the test is only meaningful with subkeys
+            return;
+        }
+
+        // Use the first subkey's ID
+        let sk_id = fingerprint_to_key_id(&pub_key.public_subkeys[0].fingerprint());
+
+        // Re-encode with the subkey ID. The key ID check should pass because
+        // we check both primary and subkeys. The signature verification may fail
+        // (since the sig was made by the primary key, not the subkey), so we just
+        // verify we get past the key ID check (no "key id do not match" error).
+        let subkey_input =
+            encode_gpg_verify_input(&decoded.message, &sk_id, &decoded.public_key, &decoded.signature);
+
+        let result = gpg_verify_run(&subkey_input, 23_500);
+        // Should NOT be a "key id do not match" error
+        match &result {
+            PrecompileResult::Err(revm::precompile::PrecompileError::Other(msg)) => {
+                assert!(
+                    !msg.contains("key id do not match"),
+                    "subkey ID should pass the key ID check"
+                );
+            }
+            _ => {
+                // Ok or other error — both acceptable as long as it's not key ID mismatch
+            }
+        }
+    }
+
+    /// RSA key subkey check — verify RSA test vector also handles subkeys correctly.
+    #[test]
+    fn test_gpg_verify_rsa_subkey_id_matching() {
+        let input = hex_decode(RSA_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+
+        let pub_key =
+            SignedPublicKey::from_bytes(Cursor::new(&decoded.public_key)).expect("valid key");
+
+        let primary_id = fingerprint_to_key_id(&pub_key.fingerprint());
+        assert_eq!(primary_id, decoded.key_id, "RSA test vector uses primary key ID");
+
+        // Verify subkey IDs are distinct from primary
+        for sk in &pub_key.public_subkeys {
+            let sk_id = fingerprint_to_key_id(&sk.fingerprint());
+            assert_ne!(sk_id, primary_id, "RSA subkey ID should differ from primary");
+        }
+    }
+
+    // --- Helper: ABI-encode GPG verify input ---
+
+    /// Encodes a GPG verify input in the same ABI format the precompile expects.
+    fn encode_gpg_verify_input(
+        message: &[u8; 32],
+        key_id: &[u8; 8],
+        public_key: &[u8],
+        signature: &[u8],
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // [0..32] bytes32 message
+        buf.extend_from_slice(message);
+
+        // [32..64] bytes8 keyId (left-aligned, right-padded to 32 bytes)
+        buf.extend_from_slice(key_id);
+        buf.extend_from_slice(&[0u8; 24]);
+
+        // [64..96] offset to publicKey = 128 (4 * 32 bytes of header)
+        buf.extend_from_slice(&u256_bytes(128));
+
+        // [96..128] offset to signature (128 + 32 + padded_len(publicKey))
+        let pub_key_padded_len = (public_key.len() + 31) / 32 * 32;
+        let sig_offset = 128 + 32 + pub_key_padded_len;
+        buf.extend_from_slice(&u256_bytes(sig_offset));
+
+        // publicKey: length + data (padded to 32 bytes)
+        buf.extend_from_slice(&u256_bytes(public_key.len()));
+        buf.extend_from_slice(public_key);
+        let pub_key_padding = pub_key_padded_len - public_key.len();
+        buf.extend_from_slice(&vec![0u8; pub_key_padding]);
+
+        // signature: length + data (padded to 32 bytes)
+        buf.extend_from_slice(&u256_bytes(signature.len()));
+        buf.extend_from_slice(signature);
+        let sig_padded_len = (signature.len() + 31) / 32 * 32;
+        let sig_padding = sig_padded_len - signature.len();
+        buf.extend_from_slice(&vec![0u8; sig_padding]);
+
+        buf
+    }
+
+    /// Encode a usize as a big-endian 32-byte uint256.
+    fn u256_bytes(val: usize) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[24..32].copy_from_slice(&(val as u64).to_be_bytes());
+        out
+    }
 }
