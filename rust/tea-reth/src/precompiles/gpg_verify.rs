@@ -333,10 +333,16 @@ mod tests {
         assert_eq!(required_gas(&[]), GPG_VERIFY_BASE_GAS);
     }
 
-    /// Gas for input exactly at kink-1 (3263 bytes) should equal base gas.
+    /// Gas across the kink boundary: kink-1 and kink both equal base gas;
+    /// kink+1 (first byte in per-byte tier) equals base gas + GPG_VERIFY_GAS_PER_BYTE.
     #[test]
-    fn test_gas_exactly_at_kink_minus_one() {
+    fn test_gas_kink_boundary() {
         assert_eq!(required_gas(&vec![0u8; GPG_VERIFY_INPUT_LENGTH_KINK - 1]), GPG_VERIFY_BASE_GAS);
+        assert_eq!(required_gas(&vec![0u8; GPG_VERIFY_INPUT_LENGTH_KINK]), GPG_VERIFY_BASE_GAS);
+        assert_eq!(
+            required_gas(&vec![0u8; GPG_VERIFY_INPUT_LENGTH_KINK + 1]),
+            GPG_VERIFY_BASE_GAS + GPG_VERIFY_GAS_PER_BYTE,
+        );
     }
 
     // --- Error & edge case tests ---
