@@ -1,0 +1,176 @@
+//! Heavily influenced by [reth](https://github.com/paradigmxyz/reth/blob/1e965caf5fa176f244a31c0d2662ba1b590938db/crates/optimism/payload/src/builder.rs#L570)
+use alloy_primitives::{Address, U256};
+use core::fmt::Debug;
+use derive_more::Display;
+use op_revm::OpTransactionError;
+use reth_optimism_primitives::{OpReceipt, OpTransactionSigned};
+
+#[derive(Debug, Display)]
+pub enum TxnExecutionResult {
+    TransactionDALimitExceeded,
+    #[display("BlockDALimitExceeded: total_da_used={_0} tx_da_size={_1} block_da_limit={_2}")]
+    BlockDALimitExceeded(u64, u64, u64),
+    #[display("TransactionGasLimitExceeded: total_gas_used={_0} tx_gas_limit={_1}")]
+    TransactionGasLimitExceeded(u64, u64, u64),
+    SequencerTransaction,
+    NonceTooLow,
+    InteropFailed,
+    #[display("InternalError({_0})")]
+    InternalError(OpTransactionError),
+    EvmError,
+    Success,
+    Reverted,
+    RevertedAndExcluded,
+    MaxGasUsageExceeded,
+    #[display(
+        "BlockUncompressedSizeExceeded: total_uncompressed={_0} tx_uncompressed_size={_1} block_limit={_2}"
+    )]
+    BlockUncompressedSizeExceeded(u64, u64, u64),
+    ConditionalCheckFailed,
+    BackrunPriorityFeeInvalid,
+    CoinbaseProfitTooLow,
+}
+
+#[derive(Default, Debug)]
+pub struct ExecutionInfo {
+    /// All executed transactions (unrecovered).
+    pub executed_transactions: Vec<OpTransactionSigned>,
+    /// The recovered senders for the executed transactions.
+    pub executed_senders: Vec<Address>,
+    /// The transaction receipts
+    pub receipts: Vec<OpReceipt>,
+    /// All gas used so far
+    pub cumulative_gas_used: u64,
+    /// Estimated DA size
+    pub cumulative_da_bytes_used: u64,
+    /// Cumulative uncompressed (EIP-2718 encoded) bytes used in the block
+    pub cumulative_uncompressed_bytes: u64,
+    /// Tracks fees from executed mempool transactions
+    pub total_fees: U256,
+    /// DA Footprint Scalar for Jovian
+    pub da_footprint_scalar: Option<u16>,
+    /// Optional blob fields for payload validation
+    pub optional_blob_fields: Option<(Option<u64>, Option<u64>)>,
+}
+
+impl ExecutionInfo {
+    /// Create a new instance with allocated slots.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            executed_transactions: Vec::with_capacity(capacity),
+            executed_senders: Vec::with_capacity(capacity),
+            receipts: Vec::with_capacity(capacity),
+            cumulative_gas_used: 0,
+            cumulative_da_bytes_used: 0,
+            cumulative_uncompressed_bytes: 0,
+            total_fees: U256::ZERO,
+            da_footprint_scalar: None,
+            optional_blob_fields: None,
+        }
+    }
+
+    /// Returns true if the transaction would exceed the block limits:
+    /// - block gas limit: ensures the transaction still fits into the block.
+    /// - tx DA limit: if configured, ensures the tx does not exceed the maximum allowed DA limit
+    ///   per tx.
+    /// - block DA limit: if configured, ensures the transaction's DA size does not exceed the
+    ///   maximum allowed DA limit per block.
+    #[allow(clippy::too_many_arguments)]
+    pub fn is_tx_over_limits(
+        &self,
+        tx_da_size: u64,
+        block_gas_limit: u64,
+        tx_data_limit: Option<u64>,
+        block_data_limit: Option<u64>,
+        tx_gas_limit: u64,
+        da_footprint_gas_scalar: Option<u16>,
+        block_da_footprint_limit: Option<u64>,
+        tx_uncompressed_size: u64,
+        max_uncompressed_block_size: Option<u64>,
+    ) -> Result<(), TxnExecutionResult> {
+        if tx_data_limit.is_some_and(|da_limit| tx_da_size > da_limit) {
+            return Err(TxnExecutionResult::TransactionDALimitExceeded);
+        }
+        let total_da_bytes_used = self.cumulative_da_bytes_used.saturating_add(tx_da_size);
+        if block_data_limit.is_some_and(|da_limit| total_da_bytes_used > da_limit) {
+            return Err(TxnExecutionResult::BlockDALimitExceeded(
+                self.cumulative_da_bytes_used,
+                tx_da_size,
+                block_data_limit.unwrap_or_default(),
+            ));
+        }
+
+        // Post Jovian: the tx DA footprint must be less than the block gas limit
+        if let Some(da_footprint_gas_scalar) = da_footprint_gas_scalar {
+            let tx_da_footprint =
+                total_da_bytes_used.saturating_mul(da_footprint_gas_scalar as u64);
+            if tx_da_footprint > block_da_footprint_limit.unwrap_or(block_gas_limit) {
+                return Err(TxnExecutionResult::BlockDALimitExceeded(
+                    total_da_bytes_used,
+                    tx_da_size,
+                    tx_da_footprint,
+                ));
+            }
+        }
+
+        if self.cumulative_gas_used + tx_gas_limit > block_gas_limit {
+            return Err(TxnExecutionResult::TransactionGasLimitExceeded(
+                self.cumulative_gas_used,
+                tx_gas_limit,
+                block_gas_limit,
+            ));
+        }
+
+        // Check block uncompressed size limit
+        if let Some(limit) = max_uncompressed_block_size {
+            let total = self
+                .cumulative_uncompressed_bytes
+                .saturating_add(tx_uncompressed_size);
+            if total > limit {
+                return Err(TxnExecutionResult::BlockUncompressedSizeExceeded(
+                    self.cumulative_uncompressed_bytes,
+                    tx_uncompressed_size,
+                    limit,
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExecutionInfo, TxnExecutionResult};
+
+    #[test]
+    fn tx_limit_rejects_when_uncompressed_size_exceeds_limit() {
+        let info = ExecutionInfo {
+            cumulative_uncompressed_bytes: 100,
+            ..Default::default()
+        };
+
+        let result =
+            info.is_tx_over_limits(0, 30_000_000, None, None, 21_000, None, None, 50, Some(149));
+
+        assert!(matches!(
+            result,
+            Err(TxnExecutionResult::BlockUncompressedSizeExceeded(
+                100, 50, 149
+            ))
+        ));
+    }
+
+    #[test]
+    fn tx_limit_allows_exact_uncompressed_size_fit() {
+        let info = ExecutionInfo {
+            cumulative_uncompressed_bytes: 100,
+            ..Default::default()
+        };
+
+        let result =
+            info.is_tx_over_limits(0, 30_000_000, None, None, 21_000, None, None, 50, Some(150));
+
+        assert!(result.is_ok());
+    }
+}

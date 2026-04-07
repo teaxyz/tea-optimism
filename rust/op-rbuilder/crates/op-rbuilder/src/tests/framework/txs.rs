@@ -1,0 +1,479 @@
+use crate::{
+    backrun_bundle::BackrunBundleRpcArgs,
+    primitives::bundle::{Bundle, BundleResult},
+    tests::funded_signer,
+    tx::FBPooledTransaction,
+    tx_signer::Signer,
+};
+use alloy_consensus::TxEip1559;
+use alloy_eips::{BlockNumberOrTag, eip2718::Encodable2718};
+use alloy_primitives::{Address, B256, Bytes, TxHash, TxKind, U256, hex};
+use alloy_provider::{PendingTransactionBuilder, Provider, RootProvider};
+use core::cmp::max;
+use dashmap::DashMap;
+use futures::StreamExt;
+use moka::future::Cache;
+use op_alloy_consensus::{OpTxEnvelope, OpTypedTransaction};
+use op_alloy_network::Optimism;
+use reth_primitives::Recovered;
+use reth_transaction_pool::{AllTransactionsEvents, FullTransactionEvent, TransactionEvent};
+use std::{collections::VecDeque, sync::Arc};
+use tokio::sync::watch;
+use tracing::debug;
+use uuid::Uuid;
+
+use alloy_eips::eip1559::MIN_PROTOCOL_BASE_FEE;
+
+#[derive(Clone, Copy, Default)]
+pub struct BundleOpts {
+    min_block_number: Option<u64>,
+    max_block_number: Option<u64>,
+    min_flashblock_number: Option<u64>,
+    max_flashblock_number: Option<u64>,
+    min_timestamp: Option<u64>,
+    max_timestamp: Option<u64>,
+    replacement_uuid: Option<Uuid>,
+    replacement_nonce: Option<u64>,
+    coinbase_profit: Option<U256>,
+}
+
+impl BundleOpts {
+    pub fn with_min_block_number(mut self, min_block_number: u64) -> Self {
+        self.min_block_number = Some(min_block_number);
+        self
+    }
+
+    pub fn with_max_block_number(mut self, max_block_number: u64) -> Self {
+        self.max_block_number = Some(max_block_number);
+        self
+    }
+
+    pub fn with_min_flashblock_number(mut self, min_flashblock_number: u64) -> Self {
+        self.min_flashblock_number = Some(min_flashblock_number);
+        self
+    }
+
+    pub fn with_max_flashblock_number(mut self, max_flashblock_number: u64) -> Self {
+        self.max_flashblock_number = Some(max_flashblock_number);
+        self
+    }
+
+    pub fn with_min_timestamp(mut self, min_timestamp: u64) -> Self {
+        self.min_timestamp = Some(min_timestamp);
+        self
+    }
+
+    pub fn with_max_timestamp(mut self, max_timestamp: u64) -> Self {
+        self.max_timestamp = Some(max_timestamp);
+        self
+    }
+
+    pub fn with_replacement_key(mut self, uuid: Uuid, nonce: u64) -> Self {
+        self.replacement_uuid = Some(uuid);
+        self.replacement_nonce = Some(nonce);
+        self
+    }
+
+    pub fn with_coinbase_profit(mut self, coinbase_profit: U256) -> Self {
+        self.coinbase_profit = Some(coinbase_profit);
+        self
+    }
+}
+
+#[derive(Clone)]
+pub struct TransactionBuilder {
+    provider: RootProvider<Optimism>,
+    signer: Option<Signer>,
+    nonce: Option<u64>,
+    base_fee: Option<u128>,
+    tx: TxEip1559,
+    bundle_opts: Option<BundleOpts>,
+    with_reverted_hash: bool,
+}
+
+impl TransactionBuilder {
+    pub fn new(provider: RootProvider<Optimism>) -> Self {
+        Self {
+            provider,
+            signer: None,
+            nonce: None,
+            base_fee: None,
+            tx: TxEip1559 {
+                chain_id: 901,
+                gas_limit: 210000,
+                ..Default::default()
+            },
+            bundle_opts: None,
+            with_reverted_hash: false,
+        }
+    }
+
+    pub fn with_to(mut self, to: Address) -> Self {
+        self.tx.to = TxKind::Call(to);
+        self
+    }
+
+    pub fn with_create(mut self) -> Self {
+        self.tx.to = TxKind::Create;
+        self
+    }
+
+    pub fn with_value(mut self, value: u128) -> Self {
+        self.tx.value = U256::from(value);
+        self
+    }
+
+    pub fn with_signer(mut self, signer: Signer) -> Self {
+        self.signer = Some(signer);
+        self
+    }
+
+    pub fn with_chain_id(mut self, chain_id: u64) -> Self {
+        self.tx.chain_id = chain_id;
+        self
+    }
+
+    pub fn with_nonce(mut self, nonce: u64) -> Self {
+        self.tx.nonce = nonce;
+        self
+    }
+
+    pub fn with_gas_limit(mut self, gas_limit: u64) -> Self {
+        self.tx.gas_limit = gas_limit;
+        self
+    }
+
+    pub fn with_max_fee_per_gas(mut self, max_fee_per_gas: u128) -> Self {
+        self.tx.max_fee_per_gas = max_fee_per_gas;
+        self
+    }
+
+    pub fn with_max_priority_fee_per_gas(mut self, max_priority_fee_per_gas: u128) -> Self {
+        self.tx.max_priority_fee_per_gas = max_priority_fee_per_gas;
+        self
+    }
+
+    pub fn with_input(mut self, input: Bytes) -> Self {
+        self.tx.input = input;
+        self
+    }
+
+    pub fn with_bundle(mut self, bundle_opts: BundleOpts) -> Self {
+        self.bundle_opts = Some(bundle_opts);
+        self
+    }
+
+    pub fn with_reverted_hash(mut self) -> Self {
+        self.with_reverted_hash = true;
+        self
+    }
+
+    pub fn with_revert(mut self) -> Self {
+        self.tx.input = hex!("60006000fd").into();
+        self
+    }
+
+    pub async fn build(mut self) -> Recovered<OpTxEnvelope> {
+        let signer = self.signer.unwrap_or(funded_signer());
+
+        let nonce = match self.nonce {
+            Some(nonce) => nonce,
+            None => self
+                .provider
+                .get_transaction_count(signer.address)
+                .pending()
+                .await
+                .expect("Failed to get transaction count"),
+        };
+
+        let base_fee = match self.base_fee {
+            Some(base_fee) => base_fee,
+            None => {
+                let previous_base_fee = self
+                    .provider
+                    .get_block_by_number(BlockNumberOrTag::Latest)
+                    .await
+                    .expect("failed to get latest block")
+                    .expect("latest block should exist")
+                    .header
+                    .base_fee_per_gas
+                    .expect("base fee should be present in latest block");
+
+                max(previous_base_fee as u128, MIN_PROTOCOL_BASE_FEE as u128)
+            }
+        };
+
+        self.tx.nonce = nonce;
+
+        if self.tx.max_fee_per_gas == 0 {
+            self.tx.max_fee_per_gas = base_fee + self.tx.max_priority_fee_per_gas;
+        }
+
+        signer
+            .sign_tx(OpTypedTransaction::Eip1559(self.tx))
+            .expect("Failed to sign transaction")
+    }
+
+    pub async fn send(self) -> eyre::Result<PendingTransactionBuilder<Optimism>> {
+        let (pending, _raw_tx) = self.send_and_get_raw_tx().await?;
+        Ok(pending)
+    }
+
+    pub async fn send_and_get_raw_tx(
+        self,
+    ) -> eyre::Result<(PendingTransactionBuilder<Optimism>, Vec<u8>)> {
+        let with_reverted_hash = self.with_reverted_hash;
+        let bundle_opts = self.bundle_opts;
+        let provider = self.provider.clone();
+        let transaction = self.build().await;
+        let txn_hash = transaction.tx_hash();
+        let transaction_encoded = transaction.encoded_2718();
+
+        if let Some(bundle_opts) = bundle_opts {
+            eyre::ensure!(
+                bundle_opts.replacement_uuid.is_none(),
+                "replacement_uuid is not supported for ordinary bundles, use send_backrun_bundle"
+            );
+            eyre::ensure!(
+                bundle_opts.coinbase_profit.is_none(),
+                "coinbase_profit is not supported for ordinary bundles, use send_backrun_bundle"
+            );
+            // Send the transaction as a bundle with the bundle options
+            let raw_tx = transaction_encoded.clone();
+            let bundle = Bundle {
+                txs: vec![transaction_encoded.into()],
+                reverting_tx_hashes: if with_reverted_hash {
+                    Some(vec![txn_hash])
+                } else {
+                    None
+                },
+                min_block_number: bundle_opts.min_block_number,
+                max_block_number: bundle_opts.max_block_number,
+                min_flashblock_number: bundle_opts.min_flashblock_number,
+                max_flashblock_number: bundle_opts.max_flashblock_number,
+                min_timestamp: bundle_opts.min_timestamp,
+                max_timestamp: bundle_opts.max_timestamp,
+            };
+
+            let result: BundleResult = provider
+                .client()
+                .request("eth_sendBundle", (bundle,))
+                .await?;
+
+            return Ok((
+                PendingTransactionBuilder::new(provider.root().clone(), result.bundle_hash),
+                raw_tx,
+            ));
+        }
+
+        let raw_tx = transaction_encoded.clone();
+        let pending = provider
+            .send_raw_transaction(transaction_encoded.as_slice())
+            .await?;
+        Ok((pending, raw_tx))
+    }
+}
+
+type ObservationsMap = DashMap<TxHash, VecDeque<TransactionEvent>>;
+
+pub struct TransactionPoolObserver {
+    /// Stores a mapping of all observed transactions to their history of events.
+    observations: Arc<ObservationsMap>,
+
+    /// Fired when this type is dropped, giving a signal to the listener loop
+    /// to stop listening for events.
+    term: Option<watch::Sender<bool>>,
+}
+
+impl Drop for TransactionPoolObserver {
+    fn drop(&mut self) {
+        // Signal the listener loop to stop listening for events
+        if let Some(term) = self.term.take() {
+            let _ = term.send(true);
+        }
+    }
+}
+
+impl TransactionPoolObserver {
+    pub fn new(
+        stream: AllTransactionsEvents<FBPooledTransaction>,
+        reverts: Cache<B256, ()>,
+    ) -> Self {
+        let mut stream = stream;
+        let observations = Arc::new(ObservationsMap::new());
+        let observations_clone = Arc::clone(&observations);
+        let (term, mut term_rx) = watch::channel(false);
+
+        tokio::spawn(async move {
+            let observations = observations_clone;
+
+            loop {
+                tokio::select! {
+                    _ = term_rx.changed() => {
+                        if *term_rx.borrow() {
+                            debug!("Transaction pool observer terminated.");
+                            return;
+                        }
+                    }
+                    tx_event = stream.next() => {
+                        match tx_event {
+                            Some(FullTransactionEvent::Pending(hash)) => {
+                                tracing::debug!("Transaction pending: {hash}");
+                                observations.entry(hash).or_default().push_back(TransactionEvent::Pending);
+                            },
+                            Some(FullTransactionEvent::Queued(hash, _)) => {
+                                tracing::debug!("Transaction queued: {hash}");
+                                observations.entry(hash).or_default().push_back(TransactionEvent::Queued);
+                            },
+                            Some(FullTransactionEvent::Mined { tx_hash, block_hash }) => {
+                                tracing::debug!("Transaction mined: {tx_hash} in block {block_hash}");
+                                observations.entry(tx_hash).or_default().push_back(TransactionEvent::Mined(block_hash));
+                            },
+                            Some(FullTransactionEvent::Replaced { transaction, replaced_by }) => {
+                                tracing::debug!("Transaction replaced: {transaction:?} by {replaced_by}");
+                                observations.entry(*transaction.hash()).or_default().push_back(TransactionEvent::Replaced(replaced_by));
+                            },
+                            Some(FullTransactionEvent::Discarded(hash)) => {
+                                tracing::debug!("Transaction discarded: {hash}");
+                                observations.entry(hash).or_default().push_back(TransactionEvent::Discarded);
+                                reverts.insert(hash, ()).await;
+                            },
+                            Some(FullTransactionEvent::Invalid(hash)) => {
+                                tracing::debug!("Transaction invalid: {hash}");
+                                observations.entry(hash).or_default().push_back(TransactionEvent::Invalid);
+                            },
+                            Some(FullTransactionEvent::Propagated(_)) => {},
+                            None => {},
+                        }
+                    }
+                }
+            }
+        });
+
+        Self {
+            observations,
+            term: Some(term),
+        }
+    }
+
+    pub fn tx_status(&self, txhash: TxHash) -> Option<TransactionEvent> {
+        self.observations
+            .get(&txhash)
+            .and_then(|history| history.back().cloned())
+    }
+
+    pub fn is_pending(&self, txhash: TxHash) -> bool {
+        matches!(self.tx_status(txhash), Some(TransactionEvent::Pending))
+    }
+
+    pub fn is_queued(&self, txhash: TxHash) -> bool {
+        matches!(self.tx_status(txhash), Some(TransactionEvent::Queued))
+    }
+
+    pub fn is_dropped(&self, txhash: TxHash) -> bool {
+        matches!(self.tx_status(txhash), Some(TransactionEvent::Discarded))
+    }
+
+    pub fn count(&self, status: TransactionEvent) -> usize {
+        self.observations
+            .iter()
+            .filter(|tx| tx.value().back() == Some(&status))
+            .count()
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.count(TransactionEvent::Pending)
+    }
+
+    pub fn queued_count(&self) -> usize {
+        self.count(TransactionEvent::Queued)
+    }
+
+    pub fn dropped_count(&self) -> usize {
+        self.count(TransactionEvent::Discarded)
+    }
+
+    /// Returns the history of pool events for a transaction.
+    pub fn history(&self, txhash: TxHash) -> Option<Vec<TransactionEvent>> {
+        self.observations
+            .get(&txhash)
+            .map(|history| history.iter().cloned().collect())
+    }
+
+    pub fn print_all(&self) {
+        tracing::debug!("TxPool {:#?}", self.observations);
+    }
+
+    pub fn exists(&self, txhash: TxHash) -> bool {
+        matches!(
+            self.tx_status(txhash),
+            Some(TransactionEvent::Pending) | Some(TransactionEvent::Queued)
+        )
+    }
+}
+
+/// Sends a backrun bundle consisting of a raw target transaction and a backrun transaction.
+///
+/// The target transaction is assumed to have already been sent to the mempool.
+/// Both transactions are submitted as a backrun bundle via `eth_sendBackrunBundle`.
+///
+/// Returns the backrun tx hash.
+pub async fn send_backrun_bundle(
+    target_raw_tx: Vec<u8>,
+    backrun_builder: TransactionBuilder,
+    bundle_opts: BundleOpts,
+) -> eyre::Result<B256> {
+    let provider = backrun_builder.provider.clone();
+
+    let backrun_tx = backrun_builder.build().await;
+    let backrun_hash = B256::from(*backrun_tx.tx_hash());
+    let backrun_encoded = backrun_tx.encoded_2718();
+
+    // Submit both as a backrun bundle
+    let block_number = match bundle_opts.min_block_number {
+        Some(n) => n,
+        None => provider.get_block_number().await? + 1,
+    };
+
+    let bundle = BackrunBundleRpcArgs {
+        transactions: vec![target_raw_tx.into(), backrun_encoded.into()],
+        block_number,
+        max_block_number: bundle_opts.max_block_number,
+        min_flashblock_number: bundle_opts.min_flashblock_number,
+        max_flashblock_number: bundle_opts.max_flashblock_number,
+        replacement_uuid: bundle_opts.replacement_uuid,
+        replacement_nonce: bundle_opts.replacement_nonce,
+        coinbase_profit: bundle_opts.coinbase_profit,
+    };
+
+    let _result: BundleResult = provider
+        .client()
+        .request("eth_sendBackrunBundle", (bundle,))
+        .await?;
+
+    Ok(backrun_hash)
+}
+
+pub async fn send_backrun_cancellation(
+    provider: &RootProvider<Optimism>,
+    uuid: Uuid,
+    nonce: u64,
+) -> eyre::Result<()> {
+    let bundle = BackrunBundleRpcArgs {
+        transactions: vec![],
+        block_number: 0,
+        max_block_number: None,
+        min_flashblock_number: None,
+        max_flashblock_number: None,
+        replacement_uuid: Some(uuid),
+        replacement_nonce: Some(nonce),
+        coinbase_profit: None,
+    };
+
+    let _result: BundleResult = provider
+        .client()
+        .request("eth_sendBackrunBundle", (bundle,))
+        .await?;
+
+    Ok(())
+}

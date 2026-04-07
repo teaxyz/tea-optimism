@@ -1,4 +1,5 @@
 [workspace.package]
+version = "0.4.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.88"
@@ -47,6 +48,10 @@ members = [
 
   # Tea-Reth
   "tea-reth/",
+
+  # Op-Rbuilder (Tea fork)
+  "op-rbuilder/crates/op-rbuilder",
+  "op-rbuilder/crates/p2p",
 
   # Alloy OP EVM
   "alloy-op-evm/",
@@ -358,17 +363,20 @@ reth-payload-builder-primitives = { git = "https://github.com/paradigmxyz/reth",
 reth-payload-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-payload-util = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-payload-validator = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
+reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0", default-features = false }
 reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-prune = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-prune-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0", default-features = false }
 reth-revm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0", default-features = false }
 reth-rpc = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
+reth-ipc = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-rpc-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-rpc-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-rpc-engine-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0", default-features = false }
+reth-rpc-layer = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-rpc-server-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-stages = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-stages-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0", default-features = false }
@@ -377,12 +385,18 @@ reth-static-file-types = { git = "https://github.com/paradigmxyz/reth", tag = "v
 reth-storage-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0", default-features = false }
 reth-storage-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0", default-features = false }
 reth-tasks = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
+reth-testing-utils = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0", default-features = false }
+reth-tracing-otlp = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-trie-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0", default-features = false }
 reth-trie-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-zstd-compressors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0", default-features = false }
+
+# ==================== OP-RBUILDER INTERNAL CRATES ====================
+p2p = { path = "op-rbuilder/crates/p2p" }
+tea-reth = { path = "tea-reth/" }
 
 # ==================== REVM (latest: op-reth versions) ====================
 revm = { version = "34.0.0", default-features = false }
@@ -471,6 +485,7 @@ tower-http = "0.6"
 # ==================== TOKIO ====================
 tokio = { version = "1.49.0", default-features = false }
 tokio-stream = "0.1.18"
+tokio-metrics = "0.4.7"
 tokio-tungstenite = "0.28.0"
 tokio-util = { version = "0.7.18", features = ["codec"] }
 
@@ -501,6 +516,7 @@ ethereum_ssz = "0.9.1"
 ethereum_ssz_derive = "0.9.1"
 rkyv = "0.8.15"
 serde_repr = "0.1.20"
+serde_yaml = "0.9"
 serde_with = { version = "3.16", default-features = false, features = [
   "macros",
 ] }
@@ -524,6 +540,7 @@ prometheus = { version = "0.14.0", default-features = false }
 # ==================== TRACING ====================
 tracing = { version = "0.1.44", default-features = false }
 tracing-appender = "0.2.4"
+opentelemetry = { version = "0.31", features = ["trace"] }
 tracing-loki = "0.2.6"
 tracing-subscriber = { version = "0.3.22", default-features = false }
 
@@ -542,6 +559,7 @@ proptest-arbitrary-interop = "0.1.0"
 rstest = "0.26.1"
 similar-asserts = { version = "1.7.0", features = ["serde"] }
 tempfile = "3.24.0"
+testcontainers = "0.27.0"
 serial_test = "3"
 test-case = "3"
 test-fuzz = "7.2.5"
@@ -581,7 +599,9 @@ buddy_system_allocator = "0.12.0"
 bytes = { version = "1.11.1", default-features = false }
 cfg-if = "1.0.4"
 chrono = "0.4.43"
+ctor = "0.4"
 clap = "4.5.58"
+clap_builder = "4.5.19"
 color-eyre = "0.6.5"
 crossterm = "0.29.0"
 dashmap = "6.1"
@@ -596,6 +616,7 @@ eyre = "0.6.12"
 fdlimit = "0.3.0"
 fixed-map = { version = "0.9", default-features = false }
 glob = "0.3.3"
+hex = "0.4"
 http = "1.4.0"
 http-body = "1.0"
 http-body-util = "0.1.3"
@@ -608,6 +629,7 @@ libc = "0.2"
 linked_hash_set = "0.1"
 lru = "0.16.3"
 mini-moka = "0.10"
+multiaddr = "0.18"
 modular-bitfield = "0.13.1"
 moka = "0.12"
 multihash = "0.19.3"
@@ -615,6 +637,7 @@ notify = { version = "8.2", default-features = false, features = [
   "macos_fsevent",
 ] }
 nybbles = { version = "0.4.8", default-features = false }
+nanoid = "0.4"
 once_cell = { version = "1.21", default-features = false, features = [
   "critical-section",
 ] }
@@ -627,6 +650,7 @@ rand_08 = { package = "rand", version = "0.8" }
 ratatui = "0.30.0"
 rayon = "1.11.0"
 reqwest = { version = "0.13.2", default-features = false }
+rlimit = "0.10"
 ringbuffer = "0.16.0"
 rollup-boost = "0.7.13"
 rollup-boost-types = "0.1.0"
@@ -634,6 +658,7 @@ rustc-hash = { version = "2.1", default-features = false }
 rustls = { version = "0.23", default-features = false }
 rustls-pemfile = { version = "2.2", default-features = false }
 schnellru = "0.2"
+sha3 = "0.10"
 shellexpand = "3.1.1"
 shlex = "1.3"
 smallvec = "1"
@@ -646,6 +671,7 @@ tar = "0.4.44"
 thiserror = { version = "2.0.18", default-features = false }
 unsigned-varint = "0.8.0"
 url = { version = "2.5.8", default-features = false }
+uuid = { version = "1.6.1", features = ["serde", "v4", "v5"] }
 vergen = "9.1.0"
 vergen-git2 = "9.1.0"
 byteorder = "1"
