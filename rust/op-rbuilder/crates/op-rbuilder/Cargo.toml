@@ -1,0 +1,212 @@
+[package]
+name = "op-rbuilder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+default-run = "op-rbuilder"
+description = "OP stack block builder"
+
+[lints]
+workspace = true
+
+[dependencies]
+p2p = { path = "../p2p" }
+macros = { path = "../op-rbuilder-test-macros", optional = true }
+
+# reth
+reth.workspace = true
+reth-basic-payload-builder.workspace = true
+reth-chain-state.workspace = true
+reth-chainspec.workspace = true
+reth-cli.workspace = true
+reth-cli-commands.workspace = true
+reth-cli-util.workspace = true
+reth-db.workspace = true
+reth-evm.workspace = true
+reth-execution-types.workspace = true
+reth-ipc = { workspace = true, optional = true }
+reth-metrics.workspace = true
+reth-network-peers.workspace = true
+reth-node-api.workspace = true
+reth-node-builder.workspace = true
+reth-node-core.workspace = true
+reth-payload-builder.workspace = true
+reth-payload-primitives.workspace = true
+reth-payload-util.workspace = true
+reth-primitives.workspace = true
+reth-primitives-traits.workspace = true
+reth-provider.workspace = true
+reth-revm.workspace = true
+reth-rpc-api.workspace = true
+reth-rpc-eth-types.workspace = true
+reth-rpc-layer.workspace = true
+reth-storage-api.workspace = true
+reth-tasks.workspace = true
+reth-testing-utils = { workspace = true, optional = true }
+reth-tracing-otlp = { workspace = true, optional = true }
+reth-transaction-pool.workspace = true
+reth-trie.workspace = true
+
+# op-reth
+reth-optimism-chainspec.workspace = true
+reth-optimism-cli.workspace = true
+reth-optimism-consensus.workspace = true
+reth-optimism-evm.workspace = true
+reth-optimism-forks.workspace = true
+reth-optimism-node.workspace = true
+reth-optimism-payload-builder.workspace = true
+reth-optimism-primitives.workspace = true
+reth-optimism-rpc.workspace = true
+reth-optimism-txpool.workspace = true
+
+# alloy
+alloy-consensus.workspace = true
+alloy-contract.workspace = true
+alloy-eips.workspace = true
+alloy-evm.workspace = true
+alloy-json-rpc.workspace = true
+alloy-network.workspace = true
+alloy-primitives.workspace = true
+alloy-provider.workspace = true
+alloy-rpc-types-engine.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-serde.workspace = true
+alloy-signer-local.workspace = true
+alloy-sol-types.workspace = true
+alloy-transport.workspace = true
+
+# op-alloy
+alloy-op-evm.workspace = true
+op-alloy-consensus.workspace = true
+op-alloy-flz.workspace = true
+op-alloy-network.workspace = true
+op-alloy-rpc-types.workspace = true
+op-alloy-rpc-types-engine.workspace = true
+
+# revm
+revm.workspace = true
+op-revm.workspace = true
+
+anyhow.workspace = true
+async-trait = { workspace = true }
+chrono.workspace = true
+clap.workspace = true
+clap_builder = { workspace = true }
+ctor = { workspace = true, optional = true }
+dashmap.workspace = true
+derive_more.workspace = true
+dirs-next.workspace = true
+either.workspace = true
+eyre.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+http.workspace = true
+http-body-util = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+jsonrpsee = { workspace = true }
+k256.workspace = true
+metrics.workspace = true
+moka.workspace = true
+nanoid = { workspace = true, optional = true }
+parking_lot.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rlimit = { workspace = true, optional = true }
+secp256k1.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_with.workspace = true
+serde_yaml.workspace = true
+sha3.workspace = true
+shellexpand.workspace = true
+testcontainers = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-metrics.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+tower.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+opentelemetry = { workspace = true, optional = true }
+tracing-loki = { workspace = true, optional = true }
+url.workspace = true
+uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+
+[build-dependencies]
+vergen = { workspace = true, features = ["build", "cargo", "emit_and_set"] }
+vergen-git2.workspace = true
+
+[dev-dependencies]
+macros = { path = "../op-rbuilder-test-macros" }
+
+alloy-provider = { workspace = true, default-features = true, features = [
+    "txpool-api",
+] }
+reth-testing-utils.workspace = true
+tempfile.workspace = true
+testcontainers.workspace = true
+nanoid.workspace = true
+reth-ipc.workspace = true
+reth-node-builder = { workspace = true, features = ["test-utils"] }
+ctor.workspace = true
+rlimit.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+
+[features]
+default = ["jemalloc"]
+
+jemalloc = [
+    "dep:tikv-jemallocator",
+    "reth-cli-util/jemalloc",
+    "reth-optimism-cli/jemalloc",
+]
+jemalloc-prof = [
+    "jemalloc",
+    "tikv-jemallocator?/profiling",
+    "reth/jemalloc-prof",
+    "reth-cli-util/jemalloc-prof",
+]
+
+min-error-logs = ["tracing/release_max_level_error"]
+min-warn-logs = ["tracing/release_max_level_warn"]
+min-info-logs = ["tracing/release_max_level_info"]
+min-debug-logs = ["tracing/release_max_level_debug"]
+min-trace-logs = ["tracing/release_max_level_trace"]
+
+testing = [
+    "nanoid",
+    "reth-ipc",
+    "reth-node-builder/test-utils",
+    "reth-testing-utils",
+    "testcontainers",
+    "ctor",
+    "macros",
+    "rlimit",
+    "hyper",
+    "hyper-util",
+    "http-body-util",
+]
+
+interop = []
+
+telemetry = ["reth-tracing-otlp", "opentelemetry"]
+loki = ["tracing-loki", "telemetry"]
+
+[[bin]]
+name = "op-rbuilder"
+path = "src/bin/op-rbuilder/main.rs"
+
+[[bin]]
+name = "tester"
+required-features = ["testing"]
