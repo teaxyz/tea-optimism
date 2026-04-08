@@ -7,56 +7,14 @@
 //! It uses the standard OpNode with a custom executor builder that injects
 //! Tea-specific precompiles via TeaEvmFactory.
 
-use std::marker::PhantomData;
-
 use clap::Parser;
 use reth_node_builder::rpc::BasicEngineValidatorBuilder;
-use reth_node_builder::{BuilderContext, NodeTypes, components::ExecutorBuilder};
-use reth_op::{
-    OpPrimitives,
-    chainspec::OpChainSpec,
-    evm::{OpBlockExecutorFactory, OpRethReceiptBuilder},
-    node::{
-        OpEngineApiBuilder, OpEngineValidatorBuilder, OpEvmConfig, OpExecutorBuilder, OpNode,
-        args::RollupArgs,
-    },
+use reth_op::node::{
+    OpEngineApiBuilder, OpEngineValidatorBuilder, OpNode, args::RollupArgs,
 };
 use reth_optimism_cli::{Cli, chainspec::OpChainSpecParser};
-use tea_reth::evm::TeaEvmFactory;
+use tea_reth::node::TeaExecutorBuilder;
 use tracing::info;
-
-/// Tea executor builder: wraps OpExecutorBuilder but swaps in TeaEvmFactory.
-#[derive(Debug, Clone, Default)]
-struct TeaExecutorBuilder;
-
-impl<Node> ExecutorBuilder<Node> for TeaExecutorBuilder
-where
-    Node: reth_node_builder::FullNodeTypes<
-            Types: NodeTypes<ChainSpec = OpChainSpec, Primitives = OpPrimitives>,
-        >,
-{
-    type EVM = OpEvmConfig<
-        OpChainSpec,
-        <Node::Types as NodeTypes>::Primitives,
-        OpRethReceiptBuilder,
-        TeaEvmFactory,
-    >;
-
-    async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
-        let OpEvmConfig { executor_factory, block_assembler, _pd: _ } =
-            OpExecutorBuilder::default().build_evm(ctx).await?;
-        let tea_executor_factory = OpBlockExecutorFactory::new(
-            *executor_factory.receipt_builder(),
-            ctx.chain_spec(),
-            TeaEvmFactory,
-        );
-        Ok(OpEvmConfig {
-            executor_factory: tea_executor_factory,
-            block_assembler,
-            _pd: PhantomData,
-        })
-    }
-}
 
 fn main() {
     reth_cli_util::sigsegv_handler::install();

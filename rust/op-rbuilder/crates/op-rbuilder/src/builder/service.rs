@@ -19,7 +19,7 @@ use eyre::WrapErr as _;
 use reth_basic_payload_builder::BasicPayloadJobGeneratorConfig;
 use reth_node_api::NodeTypes;
 use reth_node_builder::{BuilderContext, components::PayloadServiceBuilder};
-use reth_optimism_evm::OpEvmConfig;
+use tea_reth::node::{TeaOpEvmConfig, tea_optimism};
 use reth_payload_builder::{PayloadBuilderHandle, PayloadBuilderService};
 use reth_provider::CanonStateSubscriptions;
 use std::{sync::Arc, time::Duration};
@@ -118,7 +118,7 @@ impl FlashblocksServiceBuilder {
         .wrap_err("failed to create ws publisher")?
         .into();
         let payload_builder = OpPayloadBuilder::new(
-            OpEvmConfig::optimism(ctx.chain_spec()),
+            tea_optimism(ctx.chain_spec()),
             pool,
             ctx.provider().clone(),
             self.0.clone(),
@@ -146,7 +146,7 @@ impl FlashblocksServiceBuilder {
         let syncer_ctx = OpPayloadSyncerCtx::new(
             &ctx.provider().clone(),
             self.0,
-            OpEvmConfig::optimism(ctx.chain_spec()),
+            tea_optimism(ctx.chain_spec()),
             metrics.clone(),
         )
         .wrap_err("failed to create flashblocks payload builder context")?;
@@ -190,7 +190,7 @@ impl FlashblocksServiceBuilder {
     }
 }
 
-impl<Node, Pool> PayloadServiceBuilder<Node, Pool, OpEvmConfig> for FlashblocksServiceBuilder
+impl<Node, Pool> PayloadServiceBuilder<Node, Pool, TeaOpEvmConfig> for FlashblocksServiceBuilder
 where
     Node: NodeBounds,
     Pool: PoolBounds,
@@ -199,7 +199,7 @@ where
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
-        _: OpEvmConfig,
+        _: TeaOpEvmConfig,
     ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>> {
         let signer = self.0.builder_signer;
         let flashtestations_builder_tx = if let Some(builder_key) = signer

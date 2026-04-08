@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 p2p = { path = "../p2p" }
 macros = { path = "../op-rbuilder-test-macros", optional = true }
+tea-reth.workspace = true
 
 # reth
 reth.workspace = true

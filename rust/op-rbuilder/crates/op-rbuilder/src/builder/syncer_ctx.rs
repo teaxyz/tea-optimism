@@ -9,7 +9,8 @@ use op_revm::OpSpecId;
 use reth_basic_payload_builder::PayloadConfig;
 use reth_evm::EvmEnv;
 use reth_optimism_chainspec::OpChainSpec;
-use reth_optimism_evm::{OpEvmConfig, OpNextBlockEnvAttributes};
+use reth_optimism_evm::OpNextBlockEnvAttributes;
+use tea_reth::node::TeaOpEvmConfig;
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_payload_builder::{
     OpPayloadBuilderAttributes,
@@ -22,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone)]
 pub(super) struct OpPayloadSyncerCtx {
     /// The type that knows how to perform system calls and configure the evm.
-    evm_config: OpEvmConfig,
+    evm_config: TeaOpEvmConfig,
     /// The DA config for the payload builder
     da_config: OpDAConfig,
     /// The chainspec
@@ -43,7 +44,7 @@ impl OpPayloadSyncerCtx {
     pub(super) fn new<Client>(
         client: &Client,
         builder_config: BuilderConfig,
-        evm_config: OpEvmConfig,
+        evm_config: TeaOpEvmConfig,
         metrics: Arc<OpRBuilderMetrics>,
     ) -> eyre::Result<Self>
     where
@@ -62,7 +63,7 @@ impl OpPayloadSyncerCtx {
         })
     }
 
-    pub(super) fn evm_config(&self) -> &OpEvmConfig {
+    pub(super) fn evm_config(&self) -> &TeaOpEvmConfig {
         &self.evm_config
     }
 

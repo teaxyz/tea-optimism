@@ -33,7 +33,8 @@ use reth_evm::{ConfigureEvm, execute::BlockBuilder};
 use reth_execution_types::BlockExecutionOutput;
 use reth_node_api::{Block, BuiltPayloadExecutedBlock, PayloadBuilderError};
 use reth_optimism_consensus::{calculate_receipt_root_no_memo_optimism, isthmus};
-use reth_optimism_evm::{OpEvmConfig, OpNextBlockEnvAttributes};
+use reth_optimism_evm::OpNextBlockEnvAttributes;
+use tea_reth::node::TeaOpEvmConfig;
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_node::{OpBuiltPayload, OpPayloadBuilderAttributes};
 use reth_optimism_primitives::{OpReceipt, OpTransactionSigned};
@@ -237,7 +238,7 @@ impl FlashblocksState {
 #[derive(Debug, Clone)]
 pub(super) struct OpPayloadBuilder<Pool, Client, BuilderTx> {
     /// The type responsible for creating the evm.
-    pub evm_config: OpEvmConfig,
+    pub evm_config: TeaOpEvmConfig,
     /// The transaction pool
     pub pool: Pool,
     /// Node client
@@ -266,7 +267,7 @@ pub(super) struct OpPayloadBuilder<Pool, Client, BuilderTx> {
 impl<Pool, Client, BuilderTx> OpPayloadBuilder<Pool, Client, BuilderTx> {
     #[expect(clippy::too_many_arguments)]
     pub(super) fn new(
-        evm_config: OpEvmConfig,
+        evm_config: TeaOpEvmConfig,
         pool: Pool,
         client: Client,
         config: BuilderConfig,

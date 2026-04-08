@@ -15,7 +15,8 @@ use reth_evm::{
 };
 use reth_node_api::PayloadBuilderError;
 use reth_optimism_chainspec::OpChainSpec;
-use reth_optimism_evm::{OpEvmConfig, OpNextBlockEnvAttributes};
+use reth_optimism_evm::OpNextBlockEnvAttributes;
+use tea_reth::node::TeaOpEvmConfig;
 use reth_optimism_forks::OpHardforks;
 use reth_optimism_node::OpPayloadBuilderAttributes;
 use reth_optimism_payload_builder::{
@@ -53,7 +54,7 @@ use crate::{
 /// Container type that holds all necessities to build a new payload.
 pub struct OpPayloadBuilderCtx {
     /// The type that knows how to perform system calls and configure the evm.
-    pub evm_config: OpEvmConfig,
+    pub evm_config: TeaOpEvmConfig,
     /// The DA config for the payload builder
     pub da_config: OpDAConfig,
     // Gas limit configuration for the payload builder

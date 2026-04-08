@@ -24,6 +24,7 @@ use reth_optimism_node::{
 };
 use reth_provider::CanonStateSubscriptions;
 use reth_transaction_pool::TransactionPool;
+use tea_reth::node::TeaExecutorBuilder;
 pub fn launch() -> Result<()> {
     let cli = Cli::parsed();
 
@@ -123,6 +124,8 @@ impl Launcher<OpChainSpecParser, OpRbuilderArgs> for BuilderLauncher {
                                 rollup_args.supervisor_safety_level,
                             ),
                     )
+                    // Tea: use TeaExecutorBuilder for sync-time EVM (GPG precompile + L1 cost multiplier)
+                    .executor(TeaExecutorBuilder)
                     .payload(FlashblocksServiceBuilder::new(builder_config)),
             )
             .with_add_ons(addons)
