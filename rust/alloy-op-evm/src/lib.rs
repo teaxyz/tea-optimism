@@ -169,41 +169,69 @@ impl EvmFactory for OpEvmFactory {
 
     fn create_evm<DB: Database>(
         &self,
-        db: DB,
+        mut db: DB,
         input: EvmEnv<OpSpecId>,
     ) -> Self::Evm<DB, NoOpInspector> {
         let spec_id = input.cfg_env.spec;
-        OpEvm {
+
+        // TEA FORK: When `tea-precompiles` is available (std builds), use Tea's
+        // precompile map (OP + GPG) and read the TEA/ETH L1 cost multiplier.
+        #[cfg(feature = "tea-precompiles")]
+        let (precompiles, multiplier) = {
+            let m = tea_precompiles::tea_l1_cost_multiplier(&mut db);
+            (tea_precompiles::tea_precompiles(spec_id), m)
+        };
+        #[cfg(not(feature = "tea-precompiles"))]
+        let precompiles = PrecompilesMap::from_static(
+            OpPrecompiles::new_with_spec(spec_id).precompiles(),
+        );
+
+        let mut op_evm = OpEvm {
             inner: Context::op()
                 .with_db(db)
                 .with_block(input.block_env)
                 .with_cfg(input.cfg_env)
                 .build_op_with_inspector(NoOpInspector {})
-                .with_precompiles(PrecompilesMap::from_static(
-                    OpPrecompiles::new_with_spec(spec_id).precompiles(),
-                )),
+                .with_precompiles(precompiles),
             inspect: false,
-        }
+        };
+        #[cfg(feature = "tea-precompiles")]
+        { op_evm.ctx_mut().chain.l1_cost_multiplier = multiplier; }
+        op_evm
     }
 
     fn create_evm_with_inspector<DB: Database, I: Inspector<Self::Context<DB>>>(
         &self,
-        db: DB,
+        mut db: DB,
         input: EvmEnv<OpSpecId>,
         inspector: I,
     ) -> Self::Evm<DB, I> {
         let spec_id = input.cfg_env.spec;
-        OpEvm {
+
+        // TEA FORK: When `tea-precompiles` is available (std builds), use Tea's
+        // precompile map (OP + GPG) and read the TEA/ETH L1 cost multiplier.
+        #[cfg(feature = "tea-precompiles")]
+        let (precompiles, multiplier) = {
+            let m = tea_precompiles::tea_l1_cost_multiplier(&mut db);
+            (tea_precompiles::tea_precompiles(spec_id), m)
+        };
+        #[cfg(not(feature = "tea-precompiles"))]
+        let precompiles = PrecompilesMap::from_static(
+            OpPrecompiles::new_with_spec(spec_id).precompiles(),
+        );
+
+        let mut op_evm = OpEvm {
             inner: Context::op()
                 .with_db(db)
                 .with_block(input.block_env)
                 .with_cfg(input.cfg_env)
                 .build_op_with_inspector(inspector)
-                .with_precompiles(PrecompilesMap::from_static(
-                    OpPrecompiles::new_with_spec(spec_id).precompiles(),
-                )),
+                .with_precompiles(precompiles),
             inspect: true,
-        }
+        };
+        #[cfg(feature = "tea-precompiles")]
+        { op_evm.ctx_mut().chain.l1_cost_multiplier = multiplier; }
+        op_evm
     }
 }
 

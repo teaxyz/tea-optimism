@@ -1,0 +1,32 @@
+[package]
+name = "tea-precompiles"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+description = "Tea-specific precompiles and L1 cost logic for OP Stack"
+
+[dependencies]
+# revm
+revm.workspace = true
+op-revm.workspace = true
+
+# alloy
+alloy-evm.workspace = true
+alloy-primitives.workspace = true
+
+# pgp
+pgp = "0.19"
+
+[dev-dependencies]
+alloy-primitives = { workspace = true, features = ["std"] }
+hex = "0.4.3"
+
+[features]
+default = ["std"]
+std = [
+  "alloy-primitives/std",
+  "revm/std",
+  "alloy-evm/std",
+  "op-revm/std",
+]

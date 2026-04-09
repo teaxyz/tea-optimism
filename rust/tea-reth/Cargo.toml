@@ -12,24 +12,11 @@ path = "src/main.rs"
 [dependencies]
 # reth
 reth-cli-util.workspace = true
-reth-node-builder.workspace = true
 reth-op = { workspace = true, features = ["node", "rpc"] }
 reth-optimism-cli.workspace = true
-reth-optimism-forks.workspace = true
-reth-optimism-chainspec.workspace = true
 
-# revm
-revm.workspace = true
-op-revm.workspace = true
-
-# alloy
-alloy-evm.workspace = true
-alloy-op-evm.workspace = true
-alloy-primitives.workspace = true
-op-alloy-network.workspace = true
-
-# pgp
-pgp = "0.19"
+# tea
+tea-precompiles.workspace = true
 
 # misc
 clap = { workspace = true, features = ["derive", "env"] }
@@ -37,7 +24,12 @@ eyre.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+tea-precompiles = { workspace = true }
+alloy-evm.workspace = true
+alloy-op-evm.workspace = true
 alloy-primitives = { workspace = true, features = ["std"] }
+op-revm.workspace = true
+revm.workspace = true
 hex = "0.4.3"
 
 [features]

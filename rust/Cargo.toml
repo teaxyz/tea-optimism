@@ -45,6 +45,9 @@ members = [
   "op-reth/crates/txpool/",
   "op-reth/examples/*",
 
+  # Tea-Precompiles
+  "tea-precompiles/",
+
   # Tea-Reth
   "tea-reth/",
 
@@ -305,6 +308,9 @@ op-alloy-provider = { version = "0.23.1", path = "op-alloy/crates/provider", def
 op-alloy-rpc-types = { version = "0.23.1", path = "op-alloy/crates/rpc-types", default-features = false }
 op-alloy-rpc-types-engine = { version = "0.23.1", path = "op-alloy/crates/rpc-types-engine", default-features = false }
 op-alloy-rpc-jsonrpsee = { version = "0.23.1", path = "op-alloy/crates/rpc-jsonrpsee", default-features = false }
+
+# ==================== TEA-PRECOMPILES ====================
+tea-precompiles = { path = "tea-precompiles/" }
 
 # ==================== ALLOY-OP-EVM / ALLOY-OP-HARDFORKS ====================
 alloy-op-evm = { version = "0.26.3", path = "alloy-op-evm/", default-features = false }

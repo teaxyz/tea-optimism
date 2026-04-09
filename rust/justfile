@@ -36,6 +36,10 @@ build-op-reth:
 build-tea-reth: vendor-patch
   cargo build --release --bin tea-reth
 
+# Build op-rbuilder with Tea patches (patches op-rbuilder Cargo.toml + vendors op-revm)
+build-op-rbuilder: vendor-patch patch-op-rbuilder
+  cd ../op-rbuilder && cargo build --release -p op-rbuilder
+
 ######################### Tea Vendoring ############################
 
 OP_REVM_VERSION := "15.0.0"
@@ -87,6 +91,24 @@ vendor-patch-force:
   echo "Applying Tea L1 cost multiplier patch..."
   cd vendor/op-revm && patch -p1 < ../../patches/op-revm-l1-cost-multiplier.patch
   echo "Done. vendor/op-revm is ready."
+
+# Patch op-rbuilder's Cargo.toml to use Tea's local alloy-op-evm and op-revm.
+# Idempotent — checks if already patched before applying.
+patch-op-rbuilder:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  CARGO="../op-rbuilder/Cargo.toml"
+  if grep -q 'path = "../rust/alloy-op-evm"' "$CARGO" 2>/dev/null; then
+    echo "op-rbuilder already patched, skipping."
+    exit 0
+  fi
+  echo "Patching op-rbuilder Cargo.toml for Tea..."
+  sed -i.bak \
+    -e 's|alloy-op-evm = { git = "https://github.com/ethereum-optimism/optimism".*}|# TEA FORK: Use local alloy-op-evm with Tea precompiles (GPG verify + L1 cost multiplier)\n# and vendored op-revm with l1_cost_multiplier field. Zero op-rbuilder source changes.\nalloy-op-evm = { path = "../rust/alloy-op-evm" }|' \
+    -e 's|alloy-op-hardforks = { git = "https://github.com/ethereum-optimism/optimism".*}|alloy-op-hardforks = { path = "../rust/alloy-op-hardforks" }\nop-revm = { path = "../rust/vendor/op-revm" }|' \
+    "$CARGO"
+  rm -f "$CARGO.bak"
+  echo "Done. op-rbuilder Cargo.toml patched."
 
 ############################### Test ################################
 

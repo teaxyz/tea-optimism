@@ -26,6 +26,8 @@ op-alloy = { workspace = true, features = ["consensus"] }
 revm = { workspace = true }
 op-revm = { workspace = true }
 
+tea-precompiles = { path = "../tea-precompiles", optional = true }
+
 thiserror = { workspace = true }
 
 auto_impl = { workspace = true }
@@ -43,7 +45,8 @@ std = [
 	"alloy-consensus/std",
 	"alloy-eips/std",
 	"op-alloy/std",
-	"thiserror/std"
+	"thiserror/std",
+	"tea-precompiles",
 ]
 gmp = ["alloy-evm/gmp"]
 asm-keccak = ["alloy-evm/asm-keccak", "alloy-primitives/asm-keccak", "revm/asm-keccak"]

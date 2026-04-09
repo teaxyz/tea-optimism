@@ -406,6 +406,7 @@ dependencies = [
  "op-alloy",
  "op-revm",
  "revm",
+ "tea-precompiles",
  "thiserror 2.0.18",
 ]
 
@@ -14739,6 +14740,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tea-precompiles"
+version = "0.1.0"
+dependencies = [
+ "alloy-evm",
+ "alloy-primitives",
+ "hex",
+ "op-revm",
+ "pgp",
+ "revm",
+]
+
+[[package]]
 name = "tea-reth"
 version = "0.1.0"
 dependencies = [
@@ -14748,16 +14761,12 @@ dependencies = [
  "clap",
  "eyre",
  "hex",
- "op-alloy-network",
  "op-revm",
- "pgp",
  "reth-cli-util",
- "reth-node-builder",
  "reth-op",
- "reth-optimism-chainspec",
  "reth-optimism-cli",
- "reth-optimism-forks",
  "revm",
+ "tea-precompiles",
  "tracing",
 ]
 

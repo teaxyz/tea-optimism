@@ -7,10 +7,8 @@
 //! 2. A GPG signature verification precompile (at address `0x0696`)
 //! 3. Chain ID detection for Tea networks
 //!
-//! lib.rs is necessary for the implementation tests to access the Tea-specific components
-//! (e.g. TeaEvmFactory) without having to run through the bin wrapper.
+//! All Tea-specific EVM logic lives in the `tea-precompiles` crate and is injected
+//! into `OpEvmFactory` at the `alloy-op-evm` layer. This crate re-exports for convenience.
 
-pub mod chainspec;
-pub mod evm;
-pub mod l1_cost;
-pub mod precompiles;
+pub use tea_precompiles as precompiles;
+pub use tea_precompiles::{chainspec, gpg_verify, l1_cost};
