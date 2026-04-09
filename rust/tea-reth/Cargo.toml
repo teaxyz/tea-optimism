@@ -12,8 +12,15 @@ path = "src/main.rs"
 [dependencies]
 # reth
 reth-cli-util.workspace = true
+reth-node-builder.workspace = true
 reth-op = { workspace = true, features = ["node", "rpc"] }
 reth-optimism-cli.workspace = true
+
+# evm (for TeaEvmFactory in node.rs)
+alloy-evm.workspace = true
+alloy-op-evm.workspace = true
+op-revm.workspace = true
+revm.workspace = true
 
 # tea
 tea-precompiles.workspace = true

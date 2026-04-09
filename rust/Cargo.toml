@@ -1,4 +1,5 @@
 [workspace.package]
+version = "0.4.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.88"
@@ -56,6 +57,12 @@ members = [
 
   # Alloy OP Hardforks
   "alloy-op-hardforks/",
+
+  # Op-Rbuilder (Flashbots v0.4.1)
+  "op-rbuilder/op-rbuilder",
+  "op-rbuilder/op-rbuilder-test-macros",
+  "op-rbuilder/p2p",
+  "op-rbuilder/tdx-quote-provider",
 ]
 default-members = [
   "kona/bin/host",
@@ -389,6 +396,12 @@ reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-trie-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0", default-features = false }
 reth-trie-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-zstd-compressors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0", default-features = false }
+# Op-rbuilder deps (reth)
+reth-ipc = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
+reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
+reth-rpc-layer = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
+reth-testing-utils = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
+reth-tracing-otlp = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 
 # ==================== REVM (latest: op-reth versions) ====================
 revm = { version = "34.0.0", default-features = false }
@@ -414,7 +427,7 @@ alloy-rlp = { version = "0.3.13", default-features = false, features = [
   "core-net",
 ] }
 alloy-sol-macro = "1.5.6"
-alloy-sol-types = { version = "1.5.6", default-features = false }
+alloy-sol-types = { version = "1.5.6", default-features = false, features = ["json"] }
 alloy-trie = { version = "0.9.4", default-features = false }
 
 alloy-hardforks = { version = "0.4.7", default-features = false }
@@ -566,7 +579,7 @@ zstd = "0.13"
 # ==================== NETWORKING ====================
 discv5 = "0.10.2"
 ipnet = "2.11.0"
-libp2p = "0.56.0"
+libp2p = { version = "0.56.0", features = ["identify", "ping", "noise", "tcp", "autonat", "mdns", "tokio", "cbor", "macros", "yamux", "dns"] }
 libp2p-stream = "0.4.0-alpha"
 libp2p-identity = "0.2.13"
 openssl = "0.10.75"
@@ -615,7 +628,7 @@ linked_hash_set = "0.1"
 lru = "0.16.3"
 mini-moka = "0.10"
 modular-bitfield = "0.13.1"
-moka = "0.12"
+moka = { version = "0.12", features = ["future"] }
 multihash = "0.19.3"
 notify = { version = "8.2", default-features = false, features = [
   "macos_fsevent",
@@ -665,6 +678,24 @@ snmalloc-rs = { version = "0.3.8", features = ["build_cc"] }
 
 # K/V database
 rocksdb = { version = "0.24.0", default-features = false }
+
+# ==================== OP-RBUILDER DEPS ====================
+axum = "0.8.1"
+ctor = "0.4.2"
+dotenvy = "0.15.4"
+hex = "0.4"
+multiaddr = "0.18"
+nanoid = "0.4"
+rlimit = "0.10"
+serde_yaml = "0.9"
+sha3 = "0.10"
+tea-reth = { path = "tea-reth/" }
+testcontainers = "0.27.0"
+tokio-metrics = "0.4.7"
+uuid = { version = "1.6.1", features = ["serde", "v4", "v5"] }
+clap_builder = "4.5.19"
+opentelemetry = { version = "0.31", features = ["trace"] }
+tdx = { git = "https://github.com/automata-network/tdx-attestation-sdk.git", features = ["configfs"], branch = "main" }
 
 [patch.crates-io]
 # Duplicated by: reth-payload-primitives, reth-engine-local (reth git), rollup-boost,

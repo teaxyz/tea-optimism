@@ -10,5 +10,7 @@
 //! All Tea-specific EVM logic lives in the `tea-precompiles` crate and is injected
 //! into `OpEvmFactory` at the `alloy-op-evm` layer. This crate re-exports for convenience.
 
+pub mod node;
+
 pub use tea_precompiles as precompiles;
 pub use tea_precompiles::{chainspec, gpg_verify, l1_cost};
