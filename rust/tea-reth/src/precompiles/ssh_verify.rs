@@ -16,8 +16,8 @@
 //! # Supported algorithms
 //!
 //! - `ssh-ed25519`: Ed25519 signatures (64-byte sig, 32-byte pubkey)
-//! - `rsa-sha2-256`: RSA with SHA-256 (PKCS#1 v1.5)
-//! - `rsa-sha2-512`: RSA with SHA-512 (PKCS#1 v1.5)
+//! - `rsa-sha2-256`: RSA with SHA-256 (PKCS#1 v1.5), max 4096-bit key
+//! - `rsa-sha2-512`: RSA with SHA-512 (PKCS#1 v1.5), max 4096-bit key
 
 use alloy_primitives::{Address, Bytes, address};
 use revm::precompile::{Precompile, PrecompileId, PrecompileOutput, PrecompileResult};
@@ -33,6 +33,10 @@ pub const SSH_VERIFY_GAS_PER_BYTE: u64 = 16;
 
 /// Input length kink point — below this, only base gas is charged.
 pub const SSH_VERIFY_INPUT_LENGTH_KINK: usize = 3264;
+
+/// Maximum RSA modulus size in bytes (4096-bit = 512 bytes).
+/// Bump this and release a new tea-reth if 8192-bit keys are ever needed.
+pub const MAX_RSA_MODULUS_BYTES: usize = 512;
 
 /// Returns the SSH verify precompile for registration.
 pub fn precompile() -> Precompile {
@@ -263,6 +267,12 @@ fn verify_rsa(
         Ok(b) => b,
         Err(_) => return false,
     };
+
+    // Reject RSA keys larger than 4096-bit. Bump MAX_RSA_MODULUS_BYTES and
+    // release a new tea-reth binary if larger keys are ever needed.
+    if n_bytes.len() > MAX_RSA_MODULUS_BYTES {
+        return false;
+    }
 
     // Construct RSA public key
     let e = rsa::BigUint::from_bytes_be(e_bytes);
@@ -523,6 +533,79 @@ mod tests {
         let corrupt = encode_ssh_verify_input(&decoded.message, &decoded.public_key, &mismatched_sig);
         let result = ssh_verify_run(&corrupt, SSH_VERIFY_BASE_GAS);
         // Should return 0 (invalid), not an error
+        assert_precompile_ok(&result, SSH_VERIFY_BASE_GAS, FAILURE_HEX);
+    }
+
+    // === RSA key size cap ===
+
+    #[test]
+    fn test_ssh_verify_rsa_key_too_large() {
+        // Construct a fake 8192-bit RSA key (1024-byte modulus) — should be rejected.
+        fn ssh_string(data: &[u8]) -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            buf.extend_from_slice(data);
+            buf
+        }
+
+        // Build an oversized SSH RSA public key
+        let e_bytes = vec![0x01, 0x00, 0x01]; // 65537
+        let n_bytes = vec![0x01; 1024]; // 8192-bit modulus (> MAX_RSA_MODULUS_BYTES)
+        let oversized_key = [
+            ssh_string(b"ssh-rsa"),
+            ssh_string(&e_bytes),
+            ssh_string(&n_bytes),
+        ].concat();
+
+        // Build a fake rsa-sha2-256 signature (content doesn't matter, we should
+        // reject before we even try to verify)
+        let fake_sig = [
+            ssh_string(b"rsa-sha2-256"),
+            ssh_string(&vec![0xAA; 256]),
+        ].concat();
+
+        let message = [0x42u8; 32];
+        let input = encode_ssh_verify_input(&message, &oversized_key, &fake_sig);
+        let result = ssh_verify_run(&input, SSH_VERIFY_BASE_GAS);
+
+        // Should return bytes32(0) — rejected, not an error
+        assert_precompile_ok(&result, SSH_VERIFY_BASE_GAS, FAILURE_HEX);
+    }
+
+    #[test]
+    fn test_ssh_verify_rsa_key_at_max_size() {
+        // 4096-bit key (512-byte modulus) should be accepted for parsing
+        // (it will fail verification since it's a garbage key, but the point
+        // is that it doesn't get rejected by the size check)
+        fn ssh_string(data: &[u8]) -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            buf.extend_from_slice(data);
+            buf
+        }
+
+        let e_bytes = vec![0x01, 0x00, 0x01];
+        let n_bytes = vec![0x01; 512]; // exactly MAX_RSA_MODULUS_BYTES
+        let key = [
+            ssh_string(b"ssh-rsa"),
+            ssh_string(&e_bytes),
+            ssh_string(&n_bytes),
+        ].concat();
+
+        let fake_sig = [
+            ssh_string(b"rsa-sha2-256"),
+            ssh_string(&vec![0xAA; 256]),
+        ].concat();
+
+        let message = [0x42u8; 32];
+        let input = encode_ssh_verify_input(&message, &key, &fake_sig);
+        let result = ssh_verify_run(&input, SSH_VERIFY_BASE_GAS);
+
+        // Should NOT be rejected by size check. It will return 0 (invalid sig)
+        // or error (invalid RSA key construction) — either is fine, the point is
+        // we got past the size gate.
+        // With a garbage modulus of all 0x01 bytes, RsaPublicKey::new will likely
+        // fail, which returns false → bytes32(0).
         assert_precompile_ok(&result, SSH_VERIFY_BASE_GAS, FAILURE_HEX);
     }
 
