@@ -31,6 +31,12 @@ op-alloy-network.workspace = true
 # pgp
 pgp = "0.19"
 
+# ssh
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+rsa = { version = "0.9", default-features = false, features = ["std"] }
+sha2.workspace = true
+signature = { version = "2", default-features = false }
+
 # misc
 clap = { workspace = true, features = ["derive", "env"] }
 eyre.workspace = true
