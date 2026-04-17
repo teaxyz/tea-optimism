@@ -1,9 +1,9 @@
-//! Integration test: verify the GPG precompile is registered and callable through
-//! a real EVM instance created by `TeaEvmFactory`.
+//! Integration test: verify the GPG and SSH precompiles are registered and callable
+//! through a real EVM instance created by `TeaEvmFactory`.
 //!
-//! This bridges the gap between unit tests (which call `gpg_verify_run` directly)
-//! and a live network — it proves that `TeaEvmFactory` correctly injects the
-//! precompile at address `0x0696` into the OP EVM.
+//! This bridges the gap between unit tests (which call precompile functions directly)
+//! and a live network — it proves that `TeaEvmFactory` correctly injects both
+//! precompiles into the OP EVM.
 
 use alloy_evm::{Evm, EvmEnv, EvmFactory};
 use alloy_primitives::{Bytes, U256, address};
@@ -13,6 +13,10 @@ use revm::{context::CfgEnv, database::CacheDB, database_interface::EmptyDBTyped}
 /// The GPG verify precompile address.
 const GPG_VERIFY_ADDR: alloy_primitives::Address =
     address!("0x0000000000000000000000000000000000000696");
+
+/// The SSH verify precompile address.
+const SSH_VERIFY_ADDR: alloy_primitives::Address =
+    address!("0x0000000000000000000000000000000000000697");
 
 /// A dummy caller address for system calls.
 const CALLER: alloy_primitives::Address = address!("0x0000000000000000000000000000000000000001");
@@ -25,6 +29,8 @@ fn make_evm_env() -> EvmEnv<OpSpecId> {
         ..Default::default()
     }
 }
+
+// ========== GPG precompile tests ==========
 
 /// Verify the precompile is registered at 0x0696 by sending our ed25519 test
 /// vector through a real EVM `transact_system_call` and checking for success.
@@ -48,15 +54,15 @@ fn test_gpg_precompile_registered_in_evm() {
 }
 
 /// Verify that calling a non-precompile address doesn't accidentally hit
-/// the GPG precompile — sanity check that registration is address-specific.
+/// a Tea precompile — sanity check that registration is address-specific.
 #[test]
-fn test_wrong_address_is_not_gpg_precompile() {
+fn test_wrong_address_is_not_precompile() {
     let factory = tea_reth::evm::TeaEvmFactory;
     let db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
     let mut evm = factory.create_evm(db, make_evm_env());
 
     // Call a nearby address that is NOT a precompile.
-    let wrong_addr = address!("0x0000000000000000000000000000000000000697");
+    let wrong_addr = address!("0x0000000000000000000000000000000000000698");
     let result = evm.transact_system_call(CALLER, wrong_addr, Bytes::new());
     let result = result.expect("EVM transact should succeed (empty call)");
 
@@ -66,7 +72,7 @@ fn test_wrong_address_is_not_gpg_precompile() {
 }
 
 /// Verify that the standard OP precompiles are still present alongside Tea's
-/// custom precompile (e.g., ecrecover at 0x01).
+/// custom precompiles (e.g., ecrecover at 0x01).
 #[test]
 fn test_standard_precompiles_still_present() {
     let factory = tea_reth::evm::TeaEvmFactory;
@@ -100,7 +106,7 @@ fn test_standard_precompiles_still_present() {
 /// We corrupt the message hash (first 32 bytes) rather than the signature bytes,
 /// so the signature still parses correctly but verification fails.
 #[test]
-fn test_wrong_message_returns_zero_through_evm() {
+fn test_gpg_wrong_message_returns_zero_through_evm() {
     let factory = tea_reth::evm::TeaEvmFactory;
     let db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
     let mut evm = factory.create_evm(db, make_evm_env());
@@ -124,8 +130,98 @@ fn test_wrong_message_returns_zero_through_evm() {
     );
 }
 
-// === Additional tests from PR #5 review feedback ===
-// Factory → L1BlockInfo integration tests
+// ========== SSH precompile tests ==========
+
+/// Verify the SSH precompile is registered at 0x0697 with an ed25519 test vector.
+#[test]
+fn test_ssh_precompile_registered_in_evm() {
+    let factory = tea_reth::evm::TeaEvmFactory;
+    let db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
+    let mut evm = factory.create_evm(db, make_evm_env());
+
+    let input_hex = include_str!("../src/precompiles/testdata_ssh_verify_ed25519.hex");
+    let input = hex::decode(input_hex.trim()).expect("valid hex");
+
+    let result = evm.transact_system_call(CALLER, SSH_VERIFY_ADDR, Bytes::from(input));
+    let result = result.expect("EVM transact should succeed");
+
+    let output = result.result.output().expect("should have output");
+    assert_eq!(output.len(), 32, "output should be 32 bytes");
+    assert_eq!(output[31], 1, "last byte should be 1 (valid signature)");
+}
+
+/// Verify SSH RSA verification works through the EVM.
+#[test]
+fn test_ssh_rsa_precompile_through_evm() {
+    let factory = tea_reth::evm::TeaEvmFactory;
+    let db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
+    let mut evm = factory.create_evm(db, make_evm_env());
+
+    let input_hex = include_str!("../src/precompiles/testdata_ssh_verify_rsa.hex");
+    let input = hex::decode(input_hex.trim()).expect("valid hex");
+
+    let result = evm.transact_system_call(CALLER, SSH_VERIFY_ADDR, Bytes::from(input));
+    let result = result.expect("EVM transact should succeed");
+
+    let output = result.result.output().expect("should have output");
+    assert_eq!(output.len(), 32, "output should be 32 bytes");
+    assert_eq!(output[31], 1, "last byte should be 1 (valid RSA signature)");
+}
+
+/// Verify SSH wrong message returns bytes32(0) through the EVM.
+#[test]
+fn test_ssh_wrong_message_returns_zero_through_evm() {
+    let factory = tea_reth::evm::TeaEvmFactory;
+    let db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
+    let mut evm = factory.create_evm(db, make_evm_env());
+
+    let input_hex = include_str!("../src/precompiles/testdata_ssh_verify_ed25519.hex");
+    let mut input = hex::decode(input_hex.trim()).expect("valid hex");
+    input[0] ^= 0xFF;
+
+    let result = evm.transact_system_call(CALLER, SSH_VERIFY_ADDR, Bytes::from(input));
+    let result = result.expect("EVM transact should succeed even for wrong message");
+
+    let output = result.result.output().expect("should have output");
+    assert_eq!(output.len(), 32);
+    assert!(
+        output.iter().all(|&b| b == 0),
+        "output should be all zeros (signature doesn't match message)"
+    );
+}
+
+/// Verify both precompiles coexist — calling each produces correct results.
+#[test]
+fn test_both_precompiles_coexist() {
+    let factory = tea_reth::evm::TeaEvmFactory;
+    let db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
+    let mut evm = factory.create_evm(db, make_evm_env());
+
+    // Call GPG precompile
+    let gpg_input_hex = include_str!("../src/precompiles/testdata_gpg_verify_ed25519.hex");
+    let gpg_input = hex::decode(gpg_input_hex.trim()).expect("valid hex");
+    let gpg_result = evm.transact_system_call(CALLER, GPG_VERIFY_ADDR, Bytes::from(gpg_input));
+    let gpg_result = gpg_result.expect("GPG transact should succeed");
+    assert_eq!(
+        gpg_result.result.output().expect("gpg output")[31],
+        1,
+        "GPG precompile should return valid"
+    );
+
+    // Call SSH precompile on the same EVM instance
+    let ssh_input_hex = include_str!("../src/precompiles/testdata_ssh_verify_ed25519.hex");
+    let ssh_input = hex::decode(ssh_input_hex.trim()).expect("valid hex");
+    let ssh_result = evm.transact_system_call(CALLER, SSH_VERIFY_ADDR, Bytes::from(ssh_input));
+    let ssh_result = ssh_result.expect("SSH transact should succeed");
+    assert_eq!(
+        ssh_result.result.output().expect("ssh output")[31],
+        1,
+        "SSH precompile should return valid"
+    );
+}
+
+// ========== Factory / L1 cost tests ==========
+// (Additional tests from PR #5 review feedback — Factory → L1BlockInfo integration)
 
 /// Seed a CacheDB with a known price at the oracle slot.
 /// Verify tea_l1_cost_multiplier reads the correct rate.
