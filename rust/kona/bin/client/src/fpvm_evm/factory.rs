@@ -237,4 +237,198 @@ mod tests {
         assert_eq!(kona_scaled, el_scaled);
         assert_eq!(kona_scaled, fjord_cost * U256::from(42u64));
     }
+
+    // ─────────────────────────────────────────── Storage-error path
+
+    /// A `Database` whose `storage()` always returns an error. Used to assert
+    /// that `tea_l1_cost_multiplier` propagates failures as `None` (which
+    /// op-revm then interprets as multiplier=1 — matches the EL's behavior on
+    /// chains where the GasPriceOracle account is missing entirely).
+    #[derive(Debug, Default)]
+    struct FailingStorageDb;
+
+    /// Tiny error type that satisfies revm's `DBErrorMarker` (which requires
+    /// `core::error::Error + Send + Sync + 'static`). Used so we can return
+    /// `Err(...)` from `storage()` — `Infallible` cannot be constructed.
+    #[derive(Debug)]
+    struct FailingStorageErr;
+
+    impl core::fmt::Display for FailingStorageErr {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("storage backend offline")
+        }
+    }
+
+    impl core::error::Error for FailingStorageErr {}
+
+    impl revm::database_interface::DBErrorMarker for FailingStorageErr {}
+
+    impl Database for FailingStorageDb {
+        type Error = FailingStorageErr;
+
+        fn basic(
+            &mut self,
+            _address: Address,
+        ) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
+            Ok(None)
+        }
+
+        fn code_by_hash(
+            &mut self,
+            _code_hash: B256,
+        ) -> Result<revm::state::Bytecode, Self::Error> {
+            Ok(revm::state::Bytecode::default())
+        }
+
+        fn storage(&mut self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
+            Err(FailingStorageErr)
+        }
+
+        fn block_hash(&mut self, _number: u64) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+    }
+
+    /// Storage backend errors → multiplier is `None` (not Some(backup)).
+    /// op-revm patch at op-revm-l1-cost-multiplier.patch:55-60 treats `None`
+    /// as "no scaling," which is the right behavior when the chain has no
+    /// GasPriceOracle.
+    #[test]
+    fn multiplier_is_none_on_storage_error() {
+        let mut db = FailingStorageDb;
+        let multiplier = tea_l1_cost_multiplier(&mut db);
+        assert!(
+            multiplier.is_none(),
+            "storage error must propagate as None, got: {multiplier:?}"
+        );
+    }
+
+    // ─────────────────────────────────────────── End-to-end create_evm
+
+    /// Macro: build an `FpvmOpEvmFactory` with mock hint/oracle channels
+    /// for unit tests. Mirrors `provider.rs` test setup. Uses a macro instead
+    /// of a function so type inference flows correctly through the channel
+    /// types (which aren't named publicly).
+    macro_rules! make_test_factory {
+        () => {{
+            let hint_chan = kona_preimage::BidirectionalChannel::new().unwrap();
+            let preimage_chan = kona_preimage::BidirectionalChannel::new().unwrap();
+            let hint_writer = kona_preimage::HintWriter::new(hint_chan.client);
+            let oracle_reader = kona_preimage::OracleReader::new(preimage_chan.client);
+            FpvmOpEvmFactory::new(hint_writer, oracle_reader)
+        }};
+    }
+
+    fn make_test_env() -> EvmEnv<OpSpecId> {
+        use revm::context::CfgEnv;
+        EvmEnv {
+            cfg_env: CfgEnv::new()
+                .with_chain_id(6122)
+                .with_spec_and_mainnet_gas_params(OpSpecId::FJORD),
+            ..Default::default()
+        }
+    }
+
+    /// Use revm's `CacheDB` (real DB type, not a hand-rolled stub) to seed the
+    /// oracle slot, then run `create_evm` and assert that the multiplier is
+    /// observable on the resulting EVM's chain context. This is the integration
+    /// proof that the wiring in `create_evm` actually executes.
+    #[test]
+    fn create_evm_sets_multiplier_from_oracle() {
+        use revm::{database::CacheDB, database_interface::EmptyDBTyped};
+
+        let mut db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
+        let oracle_rate = U256::from(12345u64) * tea_l1_cost::WAD;
+        db.insert_account_storage(
+            tea_l1_cost::GAS_PRICE_ORACLE_ADDR,
+            tea_l1_cost::LATEST_PRICE_RATIO_SLOT_U256,
+            oracle_rate,
+        )
+        .expect("seed oracle storage");
+
+        let factory = make_test_factory!();
+        let evm = <_ as EvmFactory>::create_evm(&factory, db, make_test_env());
+
+        assert_eq!(
+            evm.ctx().chain.l1_cost_multiplier,
+            Some((oracle_rate, tea_l1_cost::WAD)),
+            "create_evm must populate ctx.chain.l1_cost_multiplier from oracle"
+        );
+    }
+
+    /// Empty CacheDB → storage returns U256::ZERO → backup-rate path engages
+    /// inside the factory, propagated all the way to the EVM chain context.
+    #[test]
+    fn create_evm_uses_backup_when_oracle_missing() {
+        use revm::{database::CacheDB, database_interface::EmptyDBTyped};
+
+        let db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
+        let factory = make_test_factory!();
+        let evm = <_ as EvmFactory>::create_evm(&factory, db, make_test_env());
+
+        let expected = U256::from(tea_l1_cost::BACKUP_TEA_PER_ETH) * tea_l1_cost::WAD;
+        assert_eq!(
+            evm.ctx().chain.l1_cost_multiplier,
+            Some((expected, tea_l1_cost::WAD)),
+            "empty DB must produce backup-rate multiplier"
+        );
+    }
+
+    /// Same as `create_evm_sets_multiplier_from_oracle` but exercises the
+    /// `create_evm_with_inspector` codepath so both factory entry points are
+    /// covered by an integration test. Inspector is a NoOpInspector instance.
+    #[test]
+    fn create_evm_with_inspector_sets_multiplier() {
+        use revm::{database::CacheDB, database_interface::EmptyDBTyped, inspector::NoOpInspector};
+
+        let mut db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
+        let oracle_rate = U256::from(7u64) * tea_l1_cost::WAD;
+        db.insert_account_storage(
+            tea_l1_cost::GAS_PRICE_ORACLE_ADDR,
+            tea_l1_cost::LATEST_PRICE_RATIO_SLOT_U256,
+            oracle_rate,
+        )
+        .expect("seed oracle storage");
+
+        let factory = make_test_factory!();
+        let evm = factory.create_evm_with_inspector(db, make_test_env(), NoOpInspector {});
+
+        assert_eq!(
+            evm.ctx().chain.l1_cost_multiplier,
+            Some((oracle_rate, tea_l1_cost::WAD)),
+            "create_evm_with_inspector must populate ctx.chain.l1_cost_multiplier"
+        );
+    }
+
+    /// Packed slot value (timestamp upper, price lower 160 bits) — the
+    /// extract_price_from_u256 helper must strip the timestamp, and the
+    /// factory must propagate the cleaned price. Mirrors the EL's
+    /// test_evm_factory_packed_slot_with_timestamp at
+    /// tea-reth/tests/evm_integration.rs.
+    #[test]
+    fn create_evm_handles_packed_slot_with_timestamp() {
+        use revm::{database::CacheDB, database_interface::EmptyDBTyped};
+
+        let mut db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
+        // examplePriceRatio: timestamp = 0x67931924, price = 999 * WAD
+        let packed = U256::from_be_bytes(alloy_primitives::hex!(
+            "00000000000000006793192400000000000000000000003627e8f712373c0000"
+        ));
+        db.insert_account_storage(
+            tea_l1_cost::GAS_PRICE_ORACLE_ADDR,
+            tea_l1_cost::LATEST_PRICE_RATIO_SLOT_U256,
+            packed,
+        )
+        .expect("seed oracle storage");
+
+        let factory = make_test_factory!();
+        let evm = <_ as EvmFactory>::create_evm(&factory, db, make_test_env());
+
+        let expected_price = U256::from(999u64) * tea_l1_cost::WAD;
+        assert_eq!(
+            evm.ctx().chain.l1_cost_multiplier,
+            Some((expected_price, tea_l1_cost::WAD)),
+            "factory must strip timestamp from packed slot value"
+        );
+    }
 }

@@ -425,6 +425,139 @@ mod tests {
         assert_precompile_oog(&result);
     }
 
+    // === rsa-sha2-512 round-trip tests (runtime-signed) ===
+    //
+    // The `rsa-sha2-512` arm at verify_rsa() lines 299-310 was only declared
+    // and unit-tested via the rsa-sha2-256 fixture (testdata_ssh_verify_rsa.hex).
+    // These tests sign a fresh message with SHA-512 at test runtime, wire-format
+    // encode the result, and run it through the precompile end-to-end. Proves
+    // that the SHA-512 dispatch arm is actually reachable and produces the
+    // expected accept/reject signal — no Python or external fixture needed.
+
+    /// Encodes a uint32 length followed by the bytes (SSH RFC 4251 `string`).
+    fn ssh_wire_string(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + data.len());
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    /// Encodes an mpint per RFC 4251 §5: prepends 0x00 if the high bit is set
+    /// (positive-number ambiguity guard).
+    fn ssh_wire_mpint(value: &[u8]) -> Vec<u8> {
+        // Trim leading zeros first
+        let mut start = 0;
+        while start < value.len() - 1 && value[start] == 0 {
+            start += 1;
+        }
+        let trimmed = &value[start..];
+        let needs_pad = trimmed.first().is_some_and(|b| *b & 0x80 != 0);
+        let mut buf = Vec::with_capacity(4 + trimmed.len() + needs_pad as usize);
+        let total_len = trimmed.len() + needs_pad as usize;
+        buf.extend_from_slice(&(total_len as u32).to_be_bytes());
+        if needs_pad {
+            buf.push(0u8);
+        }
+        buf.extend_from_slice(trimmed);
+        buf
+    }
+
+    /// Builds an SSH wire-format RSA public key blob:
+    ///   string("ssh-rsa") + mpint(e) + mpint(n)
+    fn build_rsa_public_key_blob(
+        pub_key: &rsa::RsaPublicKey,
+    ) -> Vec<u8> {
+        use rsa::traits::PublicKeyParts;
+        let mut out = Vec::new();
+        out.extend_from_slice(&ssh_wire_string(b"ssh-rsa"));
+        out.extend_from_slice(&ssh_wire_mpint(&pub_key.e().to_bytes_be()));
+        out.extend_from_slice(&ssh_wire_mpint(&pub_key.n().to_bytes_be()));
+        out
+    }
+
+    /// Builds an SSH wire-format signature blob:
+    ///   string(algorithm) + string(sig_bytes)
+    fn build_signature_blob(algorithm: &[u8], sig_bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&ssh_wire_string(algorithm));
+        out.extend_from_slice(&ssh_wire_string(sig_bytes));
+        out
+    }
+
+    /// Signs `message` with a freshly-generated 2048-bit RSA key using
+    /// PKCS#1 v1.5 + SHA-512 and returns `(precompile_input, public_key_blob)`.
+    fn sign_rsa_sha512_at_runtime(
+        message: &[u8; 32],
+    ) -> (Vec<u8>, rsa::RsaPublicKey) {
+        use rand_08::SeedableRng;
+        use rsa::pkcs1v15::SigningKey;
+        use sha2::Sha512;
+        use signature::{SignatureEncoding, Signer};
+
+        // Deterministic key for reproducible CI runs. Test value, not a real key.
+        let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
+        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048)
+            .expect("RSA-2048 keygen succeeds");
+        let public_key = rsa::RsaPublicKey::from(&private_key);
+
+        let signing_key: SigningKey<Sha512> = SigningKey::new(private_key);
+        let signature = signing_key.sign(message);
+        let sig_bytes = signature.to_bytes();
+
+        let pub_key_blob = build_rsa_public_key_blob(&public_key);
+        let sig_blob = build_signature_blob(b"rsa-sha2-512", &sig_bytes);
+        let input = encode_ssh_verify_input(message, &pub_key_blob, &sig_blob);
+        (input, public_key)
+    }
+
+    #[test]
+    fn test_ssh_verify_rsa_sha512_round_trip() {
+        // 32-byte message, signed with rsa-sha2-512, verified by 0x0697.
+        let message = [0xAAu8; 32];
+        let (input, _pubkey) = sign_rsa_sha512_at_runtime(&message);
+        let gas = required_gas(&input);
+        let result = ssh_verify_run(&input, gas);
+        assert_precompile_ok(&result, gas, SUCCESS_HEX);
+    }
+
+    #[test]
+    fn test_ssh_verify_rsa_sha512_wrong_message() {
+        // Sign one message, but flip the first byte before feeding to the
+        // precompile. The SHA-512 hash now differs, so PKCS#1 v1.5 verification
+        // must fail — but the precompile call itself succeeds with bytes32(0).
+        let message = [0xBBu8; 32];
+        let (mut input, _pubkey) = sign_rsa_sha512_at_runtime(&message);
+        input[0] ^= 0xFF; // First byte of the ABI-encoded message field.
+        let gas = required_gas(&input);
+        let result = ssh_verify_run(&input, gas);
+        assert_precompile_ok(&result, gas, FAILURE_HEX);
+    }
+
+    #[test]
+    fn test_ssh_verify_rsa_sha512_distinct_from_sha256() {
+        // Proves the algorithm string actually matters: a SHA-512 signature
+        // labelled as rsa-sha2-256 must NOT verify (the precompile will
+        // hash the message with SHA-256 and compare against a SHA-512 sig
+        // — totally different bytes). Defends against future refactors that
+        // accidentally merge the dispatch arms.
+        let message = [0xCCu8; 32];
+        let (mut input, _pubkey) = sign_rsa_sha512_at_runtime(&message);
+
+        // Locate the signature's algorithm string inside the ABI-encoded
+        // payload and replace b"rsa-sha2-512" with b"rsa-sha2-256" (same length).
+        let needle = b"rsa-sha2-512";
+        let replacement = b"rsa-sha2-256";
+        let pos = input
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("algorithm string must appear in ABI payload");
+        input[pos..pos + needle.len()].copy_from_slice(replacement);
+
+        let gas = required_gas(&input);
+        let result = ssh_verify_run(&input, gas);
+        assert_precompile_ok(&result, gas, FAILURE_HEX);
+    }
+
     // === Wrong message tests ===
 
     #[test]
