@@ -28,6 +28,10 @@ alloy-op-evm.workspace = true
 alloy-primitives.workspace = true
 op-alloy-network.workspace = true
 
+# tea (shared with kona FPVM — keeps L1-cost constants and exchange-rate
+# arithmetic in one place so EL and FPVM cannot drift)
+tea-l1-cost.workspace = true
+
 # pgp
 pgp = "0.19"
 

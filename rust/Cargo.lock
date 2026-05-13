@@ -5779,6 +5779,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "spin 0.10.0",
+ "tea-l1-cost",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -14739,6 +14740,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tea-l1-cost"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+]
+
+[[package]]
 name = "tea-reth"
 version = "0.1.0"
 dependencies = [
@@ -14746,6 +14754,7 @@ dependencies = [
  "alloy-op-evm",
  "alloy-primitives",
  "clap",
+ "ed25519-dalek",
  "eyre",
  "hex",
  "op-alloy-network",
@@ -14758,6 +14767,10 @@ dependencies = [
  "reth-optimism-cli",
  "reth-optimism-forks",
  "revm",
+ "rsa",
+ "sha2",
+ "signature",
+ "tea-l1-cost",
  "tracing",
 ]
 
