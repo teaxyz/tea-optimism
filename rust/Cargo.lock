@@ -5780,6 +5780,7 @@ dependencies = [
  "sha2",
  "spin 0.10.0",
  "tea-l1-cost",
+ "tea-reth",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
