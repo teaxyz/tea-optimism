@@ -1,7 +1,8 @@
 //! Tea EVM factory with custom precompile registration.
 //!
 //! Sets up Tea-specific precompiles (GPG verify at `0x0696`, SSH verify at
-//! `0x0697`) and the TEA/ETH exchange rate multiplier for L1 cost calculation.
+//! `0x0697`, SSHSIG verify at `0x0698`) and the TEA/ETH exchange rate
+//! multiplier for L1 cost calculation.
 
 use alloy_evm::{Database, Evm, EvmEnv, EvmFactory, precompiles::PrecompilesMap};
 use alloy_op_evm::{OpEvm, OpEvmFactory};
@@ -21,14 +22,15 @@ use std::sync::OnceLock;
 
 use crate::l1_cost;
 use crate::precompiles::gpg_verify;
+use crate::precompiles::ssh_sig_verify;
 use crate::precompiles::ssh_verify;
 
 /// Tea precompiles: standard OP precompiles plus Tea-specific ones.
 struct TeaPrecompiles;
 
 impl TeaPrecompiles {
-    /// Returns the complete precompile map for Tea, including the GPG and SSH
-    /// verify precompiles.
+    /// Returns the complete precompile map for Tea, including the GPG, SSH,
+    /// and SSHSIG verify precompiles.
     fn precompiles(spec_id: OpSpecId) -> PrecompilesMap {
         static INSTANCE: OnceLock<Precompiles> = OnceLock::new();
 
@@ -37,6 +39,7 @@ impl TeaPrecompiles {
             precompiles.extend([
                 gpg_verify::precompile(),
                 ssh_verify::precompile(),
+                ssh_sig_verify::precompile(),
             ]);
             precompiles
         }))
