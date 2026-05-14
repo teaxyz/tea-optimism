@@ -11,16 +11,29 @@
 //!
 //! # Output
 //!
-//! Returns `bytes32(1)` for valid signatures, `bytes32(0)` for invalid.
+//! Returns `bytes32(1)` for valid signatures, `bytes32(0)` for invalid. Inputs
+//! that fail to decode return `bytes32(0)` as well — only out-of-gas returns
+//! an `Err`. This matches the `ecrecover` precompile convention so callers
+//! cannot accidentally revert on "the signature didn't verify."
 //!
 //! # Supported algorithms
 //!
-//! - `ssh-ed25519`: Ed25519 signatures (64-byte sig, 32-byte pubkey)
-//! - `rsa-sha2-256`: RSA with SHA-256 (PKCS#1 v1.5), max 4096-bit key
-//! - `rsa-sha2-512`: RSA with SHA-512 (PKCS#1 v1.5), max 4096-bit key
+//! - `ssh-ed25519`: Ed25519 signatures (64-byte sig, 32-byte pubkey).
+//!   Verified with `verify_strict` to reject non-canonical S / small-subgroup R.
+//! - `rsa-sha2-256`: RSA with SHA-256 (PKCS#1 v1.5).
+//! - `rsa-sha2-512`: RSA with SHA-512 (PKCS#1 v1.5).
+//!
+//! RSA modulus must be 2048..=4096 bits. Deprecated `ssh-rsa` (SHA-1) signatures
+//! are rejected explicitly.
+//!
+//! All SSH wire-format parsing and signature verification is delegated to
+//! [`crate::precompiles::ssh_common`] so this precompile and `0x0698` share a
+//! single audited implementation.
 
 use alloy_primitives::{Address, Bytes, address};
 use revm::precompile::{Precompile, PrecompileId, PrecompileOutput, PrecompileResult};
+
+use super::ssh_common::{read_ssh_string, verify_ssh_ed25519, verify_ssh_rsa};
 
 /// SSH verify precompile address.
 pub const SSH_VERIFY_ADDRESS: Address = address!("0x0000000000000000000000000000000000000697");
@@ -33,10 +46,6 @@ pub const SSH_VERIFY_GAS_PER_BYTE: u64 = 16;
 
 /// Input length kink point — below this, only base gas is charged.
 pub const SSH_VERIFY_INPUT_LENGTH_KINK: usize = 3264;
-
-/// Maximum RSA modulus size in bytes (4096-bit = 512 bytes).
-/// Bump this and release a new tea-reth if 8192-bit keys are ever needed.
-pub const MAX_RSA_MODULUS_BYTES: usize = 512;
 
 /// Returns the SSH verify precompile for registration.
 pub fn precompile() -> Precompile {
@@ -62,42 +71,6 @@ fn success_result() -> Bytes {
 /// 32-byte result indicating failure (0).
 fn failure_result() -> Bytes {
     Bytes::copy_from_slice(&[0u8; 32])
-}
-
-// ─────────────────────────────────────────── SSH wire format helpers
-
-/// Strip the leading 0x00 disambiguation byte from an SSH mpint payload.
-///
-/// RFC 4251 §5 prepends 0x00 to positive integers whose high bit is set so they
-/// don't decode as negative. Canonical mpints have at most one leading 0x00.
-fn strip_mpint_pad(bytes: &[u8]) -> &[u8] {
-    if bytes.first() == Some(&0u8) {
-        &bytes[1..]
-    } else {
-        bytes
-    }
-}
-
-/// Read a length-prefixed string from SSH wire format.
-///
-/// SSH wire format uses `uint32` big-endian length prefix followed by raw bytes.
-/// Returns the string data and advances the offset.
-fn read_ssh_string<'a>(data: &'a [u8], offset: &mut usize) -> Result<&'a [u8], &'static str> {
-    if *offset + 4 > data.len() {
-        return Err("truncated string length");
-    }
-    let len = u32::from_be_bytes(
-        data[*offset..*offset + 4]
-            .try_into()
-            .map_err(|_| "length conversion error")?,
-    ) as usize;
-    *offset += 4;
-    if *offset + len > data.len() {
-        return Err("truncated string data");
-    }
-    let result = &data[*offset..*offset + len];
-    *offset += len;
-    Ok(result)
 }
 
 // ─────────────────────────────────────────── ABI decoding
@@ -167,167 +140,42 @@ fn ssh_verify_run(input: &[u8], gas_limit: u64) -> PrecompileResult {
 
     let SshVerifyInput { message, public_key, signature } = match decode_input(input) {
         Ok(decoded) => decoded,
-        Err(_) => {
-            return PrecompileResult::Err(revm::precompile::PrecompileError::Other(
-                "failed to decode ssh verify input".into(),
-            ));
-        }
+        // Decode failure → bytes32(0) (ecrecover convention — never revert on
+        // parsed-but-unverifiable input).
+        Err(_) => return PrecompileResult::Ok(PrecompileOutput::new(gas_cost, failure_result())),
     };
 
-    // Parse SSH public key wire format to get key type
-    let mut key_offset = 0usize;
-    let key_type = match read_ssh_string(&public_key, &mut key_offset) {
-        Ok(t) => t,
-        Err(_) => {
-            return PrecompileResult::Err(revm::precompile::PrecompileError::Other(
-                "invalid ssh public key".into(),
-            ));
-        }
-    };
-
-    // Parse SSH signature wire format to get algorithm and blob
-    let mut sig_parse_offset = 0usize;
-    let sig_algo = match read_ssh_string(&signature, &mut sig_parse_offset) {
-        Ok(a) => a,
-        Err(_) => {
-            return PrecompileResult::Err(revm::precompile::PrecompileError::Other(
-                "invalid ssh signature".into(),
-            ));
-        }
-    };
-    let sig_blob = match read_ssh_string(&signature, &mut sig_parse_offset) {
-        Ok(b) => b,
-        Err(_) => {
-            return PrecompileResult::Err(revm::precompile::PrecompileError::Other(
-                "invalid ssh signature blob".into(),
-            ));
-        }
-    };
-
-    // Dispatch verification based on key type
-    let verified = match key_type {
-        b"ssh-ed25519" => verify_ed25519(&public_key, key_offset, &message, sig_algo, sig_blob),
-        b"ssh-rsa" => verify_rsa(&public_key, key_offset, &message, sig_algo, sig_blob),
-        _ => {
-            return PrecompileResult::Err(revm::precompile::PrecompileError::Other(
-                "unsupported ssh key type".into(),
-            ));
-        }
-    };
+    let verified = run_verification(&public_key, &signature, message.as_slice());
 
     if verified {
         PrecompileResult::Ok(PrecompileOutput::new(gas_cost, success_result()))
     } else {
-        // Invalid signature is not an error — return 0
         PrecompileResult::Ok(PrecompileOutput::new(gas_cost, failure_result()))
     }
 }
 
-/// Verify an ed25519 SSH signature.
-fn verify_ed25519(
-    pub_key_data: &[u8],
-    offset: usize,
-    message: &[u8; 32],
-    sig_algo: &[u8],
-    sig_blob: &[u8],
-) -> bool {
-    // Verify algorithm consistency: key type and sig algo must both be ssh-ed25519
-    if sig_algo != b"ssh-ed25519" {
-        return false;
-    }
-
-    // Extract 32-byte ed25519 public key from SSH wire format
-    let mut key_offset = offset;
-    let key_bytes = match read_ssh_string(pub_key_data, &mut key_offset) {
-        Ok(k) if k.len() == 32 => k,
-        _ => return false,
-    };
-
-    // Verify ed25519 signature (must be exactly 64 bytes)
-    if sig_blob.len() != 64 {
-        return false;
-    }
-
-    let verifying_key = match ed25519_dalek::VerifyingKey::from_bytes(
-        key_bytes.try_into().unwrap_or(&[0u8; 32]),
-    ) {
-        Ok(k) => k,
+/// Parse the SSH wire-format public key + signature and dispatch on key type.
+/// Returns `false` for any parse failure or unsupported algorithm — never panics.
+fn run_verification(public_key: &[u8], signature: &[u8], message: &[u8]) -> bool {
+    let mut key_offset = 0usize;
+    let key_type = match read_ssh_string(public_key, &mut key_offset) {
+        Ok(t) => t,
         Err(_) => return false,
     };
 
-    let signature = ed25519_dalek::Signature::from_bytes(sig_blob.try_into().unwrap_or(&[0u8; 64]));
-
-    use ed25519_dalek::Verifier;
-    verifying_key.verify(message, &signature).is_ok()
-}
-
-/// Verify an RSA SSH signature (rsa-sha2-256 or rsa-sha2-512).
-fn verify_rsa(
-    pub_key_data: &[u8],
-    offset: usize,
-    message: &[u8; 32],
-    sig_algo: &[u8],
-    sig_blob: &[u8],
-) -> bool {
-    // Parse RSA public key: mpint e, mpint n
-    let mut key_offset = offset;
-    let e_bytes = match read_ssh_string(pub_key_data, &mut key_offset) {
-        Ok(b) => b,
+    let mut sig_parse_offset = 0usize;
+    let sig_algo = match read_ssh_string(signature, &mut sig_parse_offset) {
+        Ok(a) => a,
         Err(_) => return false,
     };
-    let n_bytes = match read_ssh_string(pub_key_data, &mut key_offset) {
+    let sig_blob = match read_ssh_string(signature, &mut sig_parse_offset) {
         Ok(b) => b,
         Err(_) => return false,
     };
 
-    // Strip the leading 0x00 that SSH mpint encoding (RFC 4251 §5) prepends to
-    // positive integers whose high bit is set, so MAX_RSA_MODULUS_BYTES applies
-    // to the modulus itself. RSA-N keygen always produces a modulus with
-    // bit_length == N (high bit set), so RSA-4096 always mpint-encodes to 513
-    // bytes — without the strip, every real RSA-4096 key fails the size gate.
-    let n_unpadded = strip_mpint_pad(n_bytes);
-
-    // Reject RSA keys larger than 4096-bit. Bump MAX_RSA_MODULUS_BYTES and
-    // release a new tea-reth binary if larger keys are ever needed.
-    if n_unpadded.len() > MAX_RSA_MODULUS_BYTES {
-        return false;
-    }
-
-    // Construct RSA public key
-    let e = rsa::BigUint::from_bytes_be(e_bytes);
-    let n = rsa::BigUint::from_bytes_be(n_unpadded);
-    let pub_key = match rsa::RsaPublicKey::new(n, e) {
-        Ok(k) => k,
-        Err(_) => return false,
-    };
-
-    // Dispatch based on signature algorithm
-    match sig_algo {
-        b"rsa-sha2-256" => {
-            use rsa::pkcs1v15::{Signature, VerifyingKey};
-            use sha2::Sha256;
-            use signature::Verifier;
-
-            let verifying_key = VerifyingKey::<Sha256>::new(pub_key);
-            let sig = match Signature::try_from(sig_blob) {
-                Ok(s) => s,
-                Err(_) => return false,
-            };
-            verifying_key.verify(message.as_slice(), &sig).is_ok()
-        }
-        b"rsa-sha2-512" => {
-            use rsa::pkcs1v15::{Signature, VerifyingKey};
-            use sha2::Sha512;
-            use signature::Verifier;
-
-            let verifying_key = VerifyingKey::<Sha512>::new(pub_key);
-            let sig = match Signature::try_from(sig_blob) {
-                Ok(s) => s,
-                Err(_) => return false,
-            };
-            verifying_key.verify(message.as_slice(), &sig).is_ok()
-        }
-        // Reject deprecated ssh-rsa (SHA-1) — insecure
+    match key_type {
+        b"ssh-ed25519" => verify_ssh_ed25519(public_key, key_offset, message, sig_algo, sig_blob),
+        b"ssh-rsa" => verify_ssh_rsa(public_key, key_offset, message, sig_algo, sig_blob),
         _ => false,
     }
 }
@@ -463,24 +311,23 @@ mod tests {
     }
 
     // === Error case tests ===
+    //
+    // The precompile follows the `ecrecover` convention: only out-of-gas
+    // returns `Err`. Parsed-but-unverifiable inputs (malformed ABI, corrupt
+    // SSH wire format, unsupported key type) all return `bytes32(0)` so a
+    // caller cannot accidentally revert on "the signature didn't verify."
 
     #[test]
     fn test_ssh_verify_empty_input() {
         let result = ssh_verify_run(&[], SSH_VERIFY_BASE_GAS);
-        assert!(
-            matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))),
-            "expected decode error for empty input, got: {result:?}"
-        );
+        assert_precompile_ok(&result, SSH_VERIFY_BASE_GAS, FAILURE_HEX);
     }
 
     #[test]
     fn test_ssh_verify_truncated_input() {
         let input = vec![0u8; 95];
         let result = ssh_verify_run(&input, SSH_VERIFY_BASE_GAS);
-        assert!(
-            matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))),
-            "expected decode error for truncated input, got: {result:?}"
-        );
+        assert_precompile_ok(&result, SSH_VERIFY_BASE_GAS, FAILURE_HEX);
     }
 
     #[test]
@@ -490,10 +337,7 @@ mod tests {
         let garbage_key = vec![0xDE, 0xAD, 0xBE, 0xEF];
         let corrupt = encode_ssh_verify_input(&decoded.message, &garbage_key, &decoded.signature);
         let result = ssh_verify_run(&corrupt, SSH_VERIFY_BASE_GAS);
-        assert!(
-            matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))),
-            "expected error for corrupt key, got: {result:?}"
-        );
+        assert_precompile_ok(&result, SSH_VERIFY_BASE_GAS, FAILURE_HEX);
     }
 
     #[test]
@@ -503,10 +347,7 @@ mod tests {
         let garbage_sig = vec![0xDE, 0xAD, 0xBE, 0xEF];
         let corrupt = encode_ssh_verify_input(&decoded.message, &decoded.public_key, &garbage_sig);
         let result = ssh_verify_run(&corrupt, SSH_VERIFY_BASE_GAS);
-        assert!(
-            matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))),
-            "expected error for corrupt sig, got: {result:?}"
-        );
+        assert_precompile_ok(&result, SSH_VERIFY_BASE_GAS, FAILURE_HEX);
     }
 
     #[test]
@@ -515,7 +356,6 @@ mod tests {
         let input = hex_decode(ED25519_INPUT);
         let decoded = decode_input(&input).expect("decode ok");
 
-        // Construct a fake DSA key (just the type string + garbage)
         fn ssh_string(data: &[u8]) -> Vec<u8> {
             let mut buf = Vec::new();
             buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
@@ -525,10 +365,7 @@ mod tests {
         let fake_key = [ssh_string(b"ssh-dss"), ssh_string(&[0u8; 32])].concat();
         let corrupt = encode_ssh_verify_input(&decoded.message, &fake_key, &decoded.signature);
         let result = ssh_verify_run(&corrupt, SSH_VERIFY_BASE_GAS);
-        assert!(
-            matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))),
-            "expected unsupported algo error, got: {result:?}"
-        );
+        assert_precompile_ok(&result, SSH_VERIFY_BASE_GAS, FAILURE_HEX);
     }
 
     #[test]
@@ -655,32 +492,10 @@ mod tests {
         assert_precompile_ok(&result, gas, SUCCESS_HEX);
     }
 
-    // === SSH wire format parsing tests ===
-
-    #[test]
-    fn test_read_ssh_string_valid() {
-        let data = [0, 0, 0, 5, b'h', b'e', b'l', b'l', b'o'];
-        let mut offset = 0;
-        let result = read_ssh_string(&data, &mut offset).unwrap();
-        assert_eq!(result, b"hello");
-        assert_eq!(offset, 9);
-    }
-
-    #[test]
-    fn test_read_ssh_string_truncated_length() {
-        let data = [0, 0, 0];
-        let mut offset = 0;
-        assert!(read_ssh_string(&data, &mut offset).is_err());
-    }
-
-    #[test]
-    fn test_read_ssh_string_truncated_data() {
-        let data = [0, 0, 0, 10, b'h', b'i'];
-        let mut offset = 0;
-        assert!(read_ssh_string(&data, &mut offset).is_err());
-    }
-
     // === Helper: ABI-encode SSH verify input ===
+    //
+    // (SSH wire-format parser tests live in ssh_common.rs alongside the
+    // shared implementation.)
 
     fn encode_ssh_verify_input(
         message: &[u8; 32],
