@@ -66,6 +66,18 @@ fn failure_result() -> Bytes {
 
 // ─────────────────────────────────────────── SSH wire format helpers
 
+/// Strip the leading 0x00 disambiguation byte from an SSH mpint payload.
+///
+/// RFC 4251 §5 prepends 0x00 to positive integers whose high bit is set so they
+/// don't decode as negative. Canonical mpints have at most one leading 0x00.
+fn strip_mpint_pad(bytes: &[u8]) -> &[u8] {
+    if bytes.first() == Some(&0u8) {
+        &bytes[1..]
+    } else {
+        bytes
+    }
+}
+
 /// Read a length-prefixed string from SSH wire format.
 ///
 /// SSH wire format uses `uint32` big-endian length prefix followed by raw bytes.
@@ -268,15 +280,22 @@ fn verify_rsa(
         Err(_) => return false,
     };
 
+    // Strip the leading 0x00 that SSH mpint encoding (RFC 4251 §5) prepends to
+    // positive integers whose high bit is set, so MAX_RSA_MODULUS_BYTES applies
+    // to the modulus itself. RSA-N keygen always produces a modulus with
+    // bit_length == N (high bit set), so RSA-4096 always mpint-encodes to 513
+    // bytes — without the strip, every real RSA-4096 key fails the size gate.
+    let n_unpadded = strip_mpint_pad(n_bytes);
+
     // Reject RSA keys larger than 4096-bit. Bump MAX_RSA_MODULUS_BYTES and
     // release a new tea-reth binary if larger keys are ever needed.
-    if n_bytes.len() > MAX_RSA_MODULUS_BYTES {
+    if n_unpadded.len() > MAX_RSA_MODULUS_BYTES {
         return false;
     }
 
     // Construct RSA public key
     let e = rsa::BigUint::from_bytes_be(e_bytes);
-    let n = rsa::BigUint::from_bytes_be(n_bytes);
+    let n = rsa::BigUint::from_bytes_be(n_unpadded);
     let pub_key = match rsa::RsaPublicKey::new(n, e) {
         Ok(k) => k,
         Err(_) => return false,
@@ -574,39 +593,66 @@ mod tests {
 
     #[test]
     fn test_ssh_verify_rsa_key_at_max_size() {
-        // 4096-bit key (512-byte modulus) should be accepted for parsing
-        // (it will fail verification since it's a garbage key, but the point
-        // is that it doesn't get rejected by the size check)
+        // Real RSA-4096 keypair signing a real message, verified end-to-end.
+        // RSA-N keygen always produces a modulus with bit_length == N, so the
+        // high bit is always set and the SSH mpint encoding always prepends a
+        // 0x00 — RSA-4096 mpint payload is therefore 513 bytes. Before the
+        // strip_mpint_pad fix at verify_rsa(), this hit the size gate and was
+        // wrongly rejected. This test asserts SUCCESS_HEX, so it locks in the
+        // strip behavior.
+        use rand_08::SeedableRng;
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::traits::PublicKeyParts;
+        use sha2::Sha256;
+        use signature::{SignatureEncoding, Signer};
+
         fn ssh_string(data: &[u8]) -> Vec<u8> {
-            let mut buf = Vec::new();
+            let mut buf = Vec::with_capacity(4 + data.len());
             buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
             buf.extend_from_slice(data);
             buf
         }
 
-        let e_bytes = vec![0x01, 0x00, 0x01];
-        let n_bytes = vec![0x01; 512]; // exactly MAX_RSA_MODULUS_BYTES
-        let key = [
-            ssh_string(b"ssh-rsa"),
-            ssh_string(&e_bytes),
-            ssh_string(&n_bytes),
-        ].concat();
+        /// SSH mpint encoding per RFC 4251 §5: strip extraneous leading zeros,
+        /// then prepend 0x00 if the high bit is set so positive numbers don't
+        /// decode as negative.
+        fn ssh_mpint(value: &[u8]) -> Vec<u8> {
+            let mut start = 0;
+            while start < value.len() - 1 && value[start] == 0 {
+                start += 1;
+            }
+            let trimmed = &value[start..];
+            let needs_pad = trimmed.first().is_some_and(|b| *b & 0x80 != 0);
+            let mut payload = Vec::with_capacity(trimmed.len() + needs_pad as usize);
+            if needs_pad {
+                payload.push(0u8);
+            }
+            payload.extend_from_slice(trimmed);
+            ssh_string(&payload)
+        }
 
-        let fake_sig = [
-            ssh_string(b"rsa-sha2-256"),
-            ssh_string(&vec![0xAA; 256]),
-        ].concat();
+        // Deterministic key for reproducible CI runs.
+        let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
+        let private_key =
+            rsa::RsaPrivateKey::new(&mut rng, 4096).expect("RSA-4096 keygen succeeds");
+        let public_key = rsa::RsaPublicKey::from(&private_key);
+
+        let mut pub_blob = ssh_string(b"ssh-rsa");
+        pub_blob.extend_from_slice(&ssh_mpint(&public_key.e().to_bytes_be()));
+        pub_blob.extend_from_slice(&ssh_mpint(&public_key.n().to_bytes_be()));
 
         let message = [0x42u8; 32];
-        let input = encode_ssh_verify_input(&message, &key, &fake_sig);
-        let result = ssh_verify_run(&input, SSH_VERIFY_BASE_GAS);
+        let signing_key: SigningKey<Sha256> = SigningKey::new(private_key);
+        let signature = signing_key.sign(&message);
+        let sig_bytes = signature.to_bytes();
 
-        // Should NOT be rejected by size check. It will return 0 (invalid sig)
-        // or error (invalid RSA key construction) — either is fine, the point is
-        // we got past the size gate.
-        // With a garbage modulus of all 0x01 bytes, RsaPublicKey::new will likely
-        // fail, which returns false → bytes32(0).
-        assert_precompile_ok(&result, SSH_VERIFY_BASE_GAS, FAILURE_HEX);
+        let mut sig_blob = ssh_string(b"rsa-sha2-256");
+        sig_blob.extend_from_slice(&ssh_string(&sig_bytes));
+
+        let input = encode_ssh_verify_input(&message, &pub_blob, &sig_blob);
+        let gas = required_gas(&input);
+        let result = ssh_verify_run(&input, gas);
+        assert_precompile_ok(&result, gas, SUCCESS_HEX);
     }
 
     // === SSH wire format parsing tests ===
