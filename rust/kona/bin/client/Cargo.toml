@@ -61,6 +61,17 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }
 kona-preimage = { workspace = true, features = ["std"] }
 sha2.workspace = true
+# Cross-executor parity tests: prove that an EVM produced by tea-reth's
+# TeaEvmFactory (EL) and one produced by FpvmOpEvmFactory (FPVM) compute
+# byte-identical L1 cost from the same input + state. Path dep because
+# tea-reth is publish=false within this workspace.
+tea-reth = { path = "../../../tea-reth" }
+tea-l1-cost.workspace = true
+alloy-primitives = { workspace = true, features = ["std"] }
+revm = { workspace = true, features = ["std"] }
+op-revm = { workspace = true, features = ["std"] }
+alloy-evm = { workspace = true, features = ["op"] }
+alloy-op-evm.workspace = true
 
 [features]
 default = [ "client-tracing" ]
