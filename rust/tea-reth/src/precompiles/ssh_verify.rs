@@ -108,25 +108,39 @@ fn decode_input(input: &[u8]) -> Result<SshVerifyInput, &'static str> {
 }
 
 /// Read a uint256 as usize (for ABI offsets).
+///
+/// Rejects offsets whose upper 24 bytes are non-zero (those are definitionally
+/// beyond any practical input length) and uses `usize::try_from` so a u64
+/// value larger than `usize::MAX` on a 32-bit target is an error rather than
+/// a silent truncation.
 fn u256_to_usize(data: &[u8]) -> Result<usize, &'static str> {
     if data.len() != 32 {
         return Err("invalid uint256 length");
     }
+    if data[0..24].iter().any(|&b| b != 0) {
+        return Err("offset too large");
+    }
     let val = u64::from_be_bytes(data[24..32].try_into().map_err(|_| "conversion error")?);
-    Ok(val as usize)
+    usize::try_from(val).map_err(|_| "offset exceeds usize::MAX")
 }
 
 /// Read ABI-encoded dynamic bytes from a given offset.
+///
+/// Uses `checked_add` throughout so an adversarial `offset` or `length` near
+/// `usize::MAX` cannot wrap into a valid slice index — without this, a crafted
+/// ABI input could pass the bounds check and then panic at `&input[a..b]`
+/// when `a > b`, which inside a precompile means a consensus halt.
 fn read_dynamic_bytes(input: &[u8], offset: usize) -> Result<Vec<u8>, &'static str> {
-    if offset + 32 > input.len() {
+    let header_end = offset.checked_add(32).ok_or("offset overflow")?;
+    if header_end > input.len() {
         return Err("offset out of bounds");
     }
-    let length = u256_to_usize(&input[offset..offset + 32])?;
-    let data_start = offset + 32;
-    if data_start + length > input.len() {
+    let length = u256_to_usize(&input[offset..header_end])?;
+    let data_end = header_end.checked_add(length).ok_or("length overflow")?;
+    if data_end > input.len() {
         return Err("data out of bounds");
     }
-    Ok(input[data_start..data_start + length].to_vec())
+    Ok(input[header_end..data_end].to_vec())
 }
 
 // ─────────────────────────────────────────── Verification dispatch
@@ -326,6 +340,34 @@ mod tests {
     #[test]
     fn test_ssh_verify_truncated_input() {
         let input = vec![0u8; 95];
+        let result = ssh_verify_run(&input, SSH_VERIFY_BASE_GAS);
+        assert_precompile_ok(&result, SSH_VERIFY_BASE_GAS, FAILURE_HEX);
+    }
+
+    #[test]
+    fn test_ssh_verify_crafted_offset_no_panic() {
+        // Regression: pre-hardening, `u256_to_usize` returned an attacker-
+        // chosen usize and `read_dynamic_bytes` ran `offset + 32` unchecked.
+        // With offset = usize::MAX - 10, the addition wrapped past
+        // input.len(), the bounds check trivially passed, and slicing
+        // `&input[(usize::MAX - 10)..22]` panicked. A panic inside a
+        // precompile is a consensus halt, so this test must return cleanly
+        // (any non-panicking outcome is acceptable; we just don't want crash).
+        let mut input = vec![0u8; 96];
+        // Set pub_key_offset = usize::MAX - 10 (lower 8 bytes), upper 24 = 0.
+        let huge = (usize::MAX - 10) as u64;
+        input[32..56].fill(0);
+        input[56..64].copy_from_slice(&huge.to_be_bytes());
+        let result = ssh_verify_run(&input, SSH_VERIFY_BASE_GAS);
+        assert_precompile_ok(&result, SSH_VERIFY_BASE_GAS, FAILURE_HEX);
+    }
+
+    #[test]
+    fn test_ssh_verify_offset_upper_bytes_rejected() {
+        // u256 with non-zero upper bytes (any of bytes [0..24] non-zero) is
+        // definitionally beyond input length — reject at decode.
+        let mut input = vec![0u8; 96];
+        input[32] = 0x01; // first byte of pub_key_offset → non-zero in upper 24
         let result = ssh_verify_run(&input, SSH_VERIFY_BASE_GAS);
         assert_precompile_ok(&result, SSH_VERIFY_BASE_GAS, FAILURE_HEX);
     }

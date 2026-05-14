@@ -24,21 +24,25 @@ pub const MIN_RSA_MODULUS_BYTES: usize = 256;
 
 // ─────────────────────────────────────────── SSH wire-format helpers
 
-/// Strip the leading 0x00 disambiguation byte from an SSH mpint payload.
+/// Strip the leading 0x00 disambiguation byte from an SSH mpint payload,
+/// rejecting non-canonical encodings.
 ///
-/// RFC 4251 §5 prepends `0x00` to positive integers whose high bit is set so
-/// they don't decode as negative. Canonical mpints have at most one leading
-/// `0x00`. This strip is lenient — it removes one if present and leaves the
-/// rest to `BigUint::from_bytes_be` (which ignores leading zeros). Multiple-
-/// leading-zero non-canonical encodings of the same number get a slightly
-/// larger post-strip length and may trip the [`MAX_RSA_MODULUS_BYTES`] gate;
-/// that's safe (never tighter than canonical), just not byte-canonicalised.
-pub fn strip_mpint_pad(bytes: &[u8]) -> &[u8] {
-    if bytes.first() == Some(&0u8) {
-        &bytes[1..]
-    } else {
-        bytes
+/// RFC 4251 §5: a positive-integer mpint has at most one leading `0x00`, and
+/// only when the next byte's high bit is set. Any other leading-zero pattern
+/// is non-canonical and rejected. This matters for the lower-bound check on
+/// the RSA modulus: a lenient single-strip would let an attacker encode a
+/// 1024-bit modulus as `[0x00] + [0x00; 128] + [128 bytes of actual modulus]`
+/// (257 bytes), strip to 256, pass `MIN_RSA_MODULUS_BYTES`, and have
+/// `BigUint::from_bytes_be` silently absorb the remaining zeros — defeating
+/// the 2048-bit floor entirely.
+pub fn strip_mpint_pad(bytes: &[u8]) -> Result<&[u8], &'static str> {
+    if bytes.len() >= 2 && bytes[0] == 0x00 {
+        if bytes[1] & 0x80 == 0 {
+            return Err("non-canonical mpint pad");
+        }
+        return Ok(&bytes[1..]);
     }
+    Ok(bytes)
 }
 
 /// Read a length-prefixed string from SSH wire format.
@@ -151,15 +155,17 @@ pub fn verify_ssh_rsa(
         Err(_) => return false,
     };
 
-    // Strip the RFC 4251 §5 high-bit pad. RSA-N keygen always produces a
-    // modulus with bit_length == N, so real RSA-4096 keys mpint-encode to
-    // 513 bytes — the gate must run against the stripped 512.
-    let n_unpadded = strip_mpint_pad(n_bytes);
+    // Strict canonical mpint strip — rejects non-canonical encodings that
+    // could be used to bypass the modulus bounds check.
+    let n_unpadded = match strip_mpint_pad(n_bytes) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
 
-    if n_unpadded.len() > MAX_RSA_MODULUS_BYTES {
-        return false;
-    }
-    if n_unpadded.len() < MIN_RSA_MODULUS_BYTES {
+    // Fast pre-filter on the byte length of the canonical encoding.
+    if n_unpadded.len() > MAX_RSA_MODULUS_BYTES
+        || n_unpadded.len() < MIN_RSA_MODULUS_BYTES
+    {
         return false;
     }
 
@@ -169,6 +175,15 @@ pub fn verify_ssh_rsa(
         Ok(k) => k,
         Err(_) => return false,
     };
+
+    // Precise post-construction bit-length check. Byte length is in
+    // [bits/8, (bits+7)/8] so the fast filter can admit a 2041-bit modulus
+    // through the 256-byte floor; this clamps to the exact constants.
+    use rsa::traits::PublicKeyParts;
+    let n_bits = pub_key.n().bits();
+    if n_bits < MIN_RSA_MODULUS_BYTES * 8 || n_bits > MAX_RSA_MODULUS_BYTES * 8 {
+        return false;
+    }
 
     match sig_algo {
         b"rsa-sha2-256" => {
@@ -201,32 +216,44 @@ mod tests {
     // ─────────────────────────────────────────── strip_mpint_pad
 
     #[test]
-    fn strip_mpint_pad_removes_single_leading_zero() {
-        assert_eq!(strip_mpint_pad(&[0x00, 0x80, 0x01]), &[0x80, 0x01]);
+    fn strip_mpint_pad_removes_canonical_high_bit_pad() {
+        assert_eq!(strip_mpint_pad(&[0x00, 0x80, 0x01]).unwrap(), &[0x80, 0x01]);
+        assert_eq!(strip_mpint_pad(&[0x00, 0xFF]).unwrap(), &[0xFF]);
     }
 
     #[test]
     fn strip_mpint_pad_noop_when_no_leading_zero() {
-        assert_eq!(strip_mpint_pad(&[0x7F, 0xFF, 0x01]), &[0x7F, 0xFF, 0x01]);
-        assert_eq!(strip_mpint_pad(&[0x80, 0xFF]), &[0x80, 0xFF]);
+        assert_eq!(
+            strip_mpint_pad(&[0x7F, 0xFF, 0x01]).unwrap(),
+            &[0x7F, 0xFF, 0x01]
+        );
+        assert_eq!(strip_mpint_pad(&[0x80, 0xFF]).unwrap(), &[0x80, 0xFF]);
     }
 
     #[test]
-    fn strip_mpint_pad_strips_only_one_zero() {
-        // Non-canonical multi-zero input: we leave the rest to BigUint, which
-        // ignores leading zeros. The post-strip length is still trustworthy
-        // for the size gate (never tighter than canonical).
-        assert_eq!(strip_mpint_pad(&[0x00, 0x00, 0x80]), &[0x00, 0x80]);
+    fn strip_mpint_pad_rejects_non_canonical_multi_zero() {
+        // Two leading 0x00s is never canonical — the inner 0x00 has high bit
+        // unset, so the pad isn't needed. Must reject.
+        assert!(strip_mpint_pad(&[0x00, 0x00, 0x80]).is_err());
+        assert!(strip_mpint_pad(&[0x00, 0x00, 0x00, 0xFF]).is_err());
+    }
+
+    #[test]
+    fn strip_mpint_pad_rejects_unneeded_pad() {
+        // Leading 0x00 followed by a byte with high bit unset → the pad
+        // isn't needed → non-canonical → reject.
+        assert!(strip_mpint_pad(&[0x00, 0x7F, 0xFF]).is_err());
     }
 
     #[test]
     fn strip_mpint_pad_empty_input() {
-        assert_eq!(strip_mpint_pad(&[]), &[] as &[u8]);
+        assert_eq!(strip_mpint_pad(&[]).unwrap(), &[] as &[u8]);
     }
 
     #[test]
     fn strip_mpint_pad_lone_zero() {
-        assert_eq!(strip_mpint_pad(&[0x00]), &[] as &[u8]);
+        // Single 0x00 is the RFC 4251 §5 encoding of zero — valid, not stripped.
+        assert_eq!(strip_mpint_pad(&[0x00]).unwrap(), &[0x00]);
     }
 
     // ─────────────────────────────────────────── read_ssh_string
@@ -416,6 +443,36 @@ mod tests {
             b"rsa-sha2-256",
             &vec![0xAAu8; 128],
         ));
+    }
+
+    #[test]
+    fn verify_ssh_rsa_rejects_padded_modulus_min_bypass() {
+        // The bypass that motivated strict mpint canonicalisation. A 1024-bit
+        // modulus is encoded as:
+        //   [0x00]             ← single canonical-looking pad
+        //   [0x00 × 128]       ← 128 extraneous zeros (non-canonical)
+        //   [128 actual bytes] ← underlying 1024-bit modulus
+        // Total mpint payload = 257 bytes. A lenient single-strip would leave
+        // 256 bytes, sneak past `MIN_RSA_MODULUS_BYTES`, and then
+        // `BigUint::from_bytes_be` would silently swallow the 128 leading
+        // zeros — yielding a 1024-bit modulus that "passes" the 2048-bit floor.
+        // Strict strip rejects the non-canonical multi-zero prefix.
+        let mut mpint_payload: Vec<u8> = vec![0x00; 129]; // 1 pad + 128 extra
+        mpint_payload.push(0x80);
+        mpint_payload.extend(std::iter::repeat(0xFFu8).take(127));
+        // Wrap in SSH string framing (4-byte length prefix).
+        let mut pub_blob = Vec::new();
+        write_ssh_string(&mut pub_blob, b"ssh-rsa");
+        write_ssh_string(&mut pub_blob, &[0x01, 0x00, 0x01]);
+        pub_blob.extend_from_slice(&(mpint_payload.len() as u32).to_be_bytes());
+        pub_blob.extend_from_slice(&mpint_payload);
+
+        let mut o = 0usize;
+        let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
+        assert!(
+            !verify_ssh_rsa(&pub_blob, o, &[0u8; 32], b"rsa-sha2-256", &vec![0xAAu8; 128]),
+            "padded 1024-bit modulus must NOT pass — would bypass 2048-bit floor"
+        );
     }
 
     // ─────────────────────────────────────────── verify_ssh_ed25519

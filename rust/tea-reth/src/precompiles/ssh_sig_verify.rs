@@ -183,17 +183,19 @@ fn decode_input(input: &[u8]) -> Result<SshSigVerifyInput, &'static str> {
 }
 
 /// Read a uint256 as usize (for ABI offsets).
+///
+/// Rejects offsets whose upper 24 bytes are non-zero and uses `usize::try_from`
+/// so a u64 value larger than `usize::MAX` on a 32-bit target is an error
+/// rather than a silent truncation.
 fn u256_to_usize(data: &[u8]) -> Result<usize, &'static str> {
     if data.len() != 32 {
         return Err("invalid uint256 length");
     }
-    // Reject offsets that don't fit in usize — anything in the upper 24 bytes
-    // is definitionally beyond our input length.
     if data[0..24].iter().any(|&b| b != 0) {
         return Err("offset too large");
     }
     let val = u64::from_be_bytes(data[24..32].try_into().map_err(|_| "conversion error")?);
-    Ok(val as usize)
+    usize::try_from(val).map_err(|_| "offset exceeds usize::MAX")
 }
 
 /// Read ABI-encoded dynamic bytes from a given offset, enforcing a max length.
