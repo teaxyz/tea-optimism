@@ -47,6 +47,21 @@ pub const SSH_VERIFY_GAS_PER_BYTE: u64 = 16;
 /// Input length kink point — below this, only base gas is charged.
 pub const SSH_VERIFY_INPUT_LENGTH_KINK: usize = 3264;
 
+/// Maximum SSH wire-format public key blob size in bytes.
+///
+/// Mirrors `0x0698`'s `MAX_PUBKEY_BYTES`. Covers an `ssh-rsa` 4096-bit key
+/// (~540 bytes with full framing) with comfortable headroom. Larger inputs
+/// are rejected at decode rather than allowed to allocate an attacker-sized
+/// `Vec<u8>` and then drive an attacker-sized `BigUint` through
+/// `RsaPublicKey::new` — gas-per-byte plus EVM quadratic memory expansion
+/// already make this expensive, but an explicit cap removes the surface.
+pub const MAX_PUBKEY_BYTES: usize = 1024;
+
+/// Maximum SSH wire-format signature blob size in bytes.
+///
+/// Covers an `ssh-rsa` 4096-bit signature (~530 bytes with framing).
+pub const MAX_SIGNATURE_BYTES: usize = 1024;
+
 /// Returns the SSH verify precompile for registration.
 pub fn precompile() -> Precompile {
     Precompile::new(PrecompileId::custom("ssh_verify"), SSH_VERIFY_ADDRESS, ssh_verify_run)
@@ -107,8 +122,8 @@ fn decode_input(input: &[u8]) -> Result<SshVerifyInput, &'static str> {
     let pub_key_offset = u256_to_usize(&input[32..64])?;
     let sig_offset = u256_to_usize(&input[64..96])?;
 
-    let public_key = read_dynamic_bytes(input, pub_key_offset)?;
-    let signature = read_dynamic_bytes(input, sig_offset)?;
+    let public_key = read_dynamic_bytes(input, pub_key_offset, MAX_PUBKEY_BYTES)?;
+    let signature = read_dynamic_bytes(input, sig_offset, MAX_SIGNATURE_BYTES)?;
 
     Ok(SshVerifyInput { message, public_key, signature })
 }
@@ -130,18 +145,25 @@ fn u256_to_usize(data: &[u8]) -> Result<usize, &'static str> {
     usize::try_from(val).map_err(|_| "offset exceeds usize::MAX")
 }
 
-/// Read ABI-encoded dynamic bytes from a given offset.
+/// Read ABI-encoded dynamic bytes from a given offset, enforcing a max length.
 ///
 /// Uses `checked_add` throughout so an adversarial `offset` or `length` near
 /// `usize::MAX` cannot wrap into a valid slice index — without this, a crafted
 /// ABI input could pass the bounds check and then panic at `&input[a..b]`
 /// when `a > b`, which inside a precompile means a consensus halt.
-fn read_dynamic_bytes(input: &[u8], offset: usize) -> Result<Vec<u8>, &'static str> {
+fn read_dynamic_bytes(
+    input: &[u8],
+    offset: usize,
+    max_len: usize,
+) -> Result<Vec<u8>, &'static str> {
     let header_end = offset.checked_add(32).ok_or("offset overflow")?;
     if header_end > input.len() {
         return Err("offset out of bounds");
     }
     let length = u256_to_usize(&input[offset..header_end])?;
+    if length > max_len {
+        return Err("dynamic field exceeds max length");
+    }
     let data_end = header_end.checked_add(length).ok_or("length overflow")?;
     if data_end > input.len() {
         return Err("data out of bounds");
@@ -383,6 +405,27 @@ mod tests {
         input[32] = 0x01; // first byte of pub_key_offset → non-zero in upper 24
         let result = ssh_verify_run(&input, SSH_VERIFY_BASE_GAS);
         assert_precompile_ok(&result, SSH_VERIFY_BASE_GAS, FAILURE_HEX);
+    }
+
+    #[test]
+    fn test_ssh_verify_pubkey_over_max_rejected() {
+        // Declare a `publicKey` ABI field longer than MAX_PUBKEY_BYTES.
+        // Must be rejected at the decode step, not while attempting to
+        // construct an attacker-sized BigUint.
+        let oversized = vec![0u8; MAX_PUBKEY_BYTES + 1];
+        let sig = vec![0u8; 64];
+        let input = encode_ssh_verify_input(&[0u8; 32], &oversized, &sig);
+        let result = ssh_verify_run(&input, required_gas(&input));
+        assert_precompile_ok(&result, required_gas(&input), FAILURE_HEX);
+    }
+
+    #[test]
+    fn test_ssh_verify_signature_over_max_rejected() {
+        let pk = vec![0u8; 64];
+        let oversized = vec![0u8; MAX_SIGNATURE_BYTES + 1];
+        let input = encode_ssh_verify_input(&[0u8; 32], &pk, &oversized);
+        let result = ssh_verify_run(&input, required_gas(&input));
+        assert_precompile_ok(&result, required_gas(&input), FAILURE_HEX);
     }
 
     #[test]
