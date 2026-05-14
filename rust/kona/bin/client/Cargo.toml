@@ -43,6 +43,10 @@ op-revm.workspace = true
 alloy-op-evm.workspace = true
 alloy-evm = { workspace = true, features = ["op"] }
 
+# Tea (shared with tea-reth EL — keeps GasPriceOracle slot, exchange-rate
+# arithmetic, and backup-rate fallback in one place so FPVM cannot drift)
+tea-l1-cost.workspace = true
+
 # General
 lru.workspace = true
 spin.workspace = true

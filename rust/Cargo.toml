@@ -48,6 +48,9 @@ members = [
   # Tea-Reth
   "tea-reth/",
 
+  # Tea L1 cost (no_std; shared between tea-reth and kona FPVM)
+  "tea-l1-cost/",
+
   # Alloy OP EVM
   "alloy-op-evm/",
 
@@ -279,6 +282,9 @@ kona-proof-interop = { path = "kona/crates/proof/proof-interop", version = "0.2.
 kona-cli = { path = "kona/crates/utilities/cli", version = "0.3.2", default-features = false }
 kona-serde = { path = "kona/crates/utilities/serde", version = "0.2.2", default-features = false }
 kona-macros = { path = "kona/crates/utilities/macros", version = "0.1.2", default-features = false }
+
+# ==================== TEA INTERNAL CRATES ====================
+tea-l1-cost = { path = "tea-l1-cost", version = "0.1.0", default-features = false }
 
 # ==================== OP-RETH INTERNAL CRATES ====================
 op-reth = { path = "op-reth/bin/" }

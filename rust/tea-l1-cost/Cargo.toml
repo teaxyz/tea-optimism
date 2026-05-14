@@ -1,0 +1,10 @@
+[package]
+name = "tea-l1-cost"
+description = "Shared L1 cost helpers for Tea L2: TEA/ETH oracle slot, exchange-rate arithmetic. Consumed by tea-reth (EL) and kona (FPVM)."
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alloy-primitives = { workspace = true, default-features = false }

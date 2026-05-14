@@ -162,6 +162,10 @@ check-no-std:
     op-alloy-consensus
     op-alloy-rpc-types
     op-alloy-rpc-types-engine
+
+    # tea (shared between tea-reth EL and kona FPVM — must stay no_std-clean
+    # or the FPVM build will silently fail when this crate is bumped)
+    tea-l1-cost
   )
 
   # We need to install the riscv32imac-unknown-none-elf target before starting to build the no-std crates.
