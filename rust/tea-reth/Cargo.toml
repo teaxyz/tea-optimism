@@ -50,8 +50,8 @@ tracing.workspace = true
 alloy-primitives = { workspace = true, features = ["std"] }
 hex = "0.4.3"
 # rand 0.8 (matches rand_core 0.6 — what rsa 0.9 accepts as the CryptoRng
-# parameter for RsaPrivateKey::new). Used in tests to sign at runtime and
-# prove end-to-end behavior of the algorithm-dispatch arms.
+# parameter for RsaPrivateKey::new). Used in tests to keygen + sign at runtime
+# so we can exercise verify_rsa with realistic RSA-4096 keys end-to-end.
 rand_08 = { workspace = true }
 
 [features]

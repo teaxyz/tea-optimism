@@ -1,7 +1,8 @@
 //! Tea EVM factory with custom precompile registration.
 //!
 //! Sets up Tea-specific precompiles (GPG verify at `0x0696`, SSH verify at
-//! `0x0697`) and the TEA/ETH exchange rate multiplier for L1 cost calculation.
+//! `0x0697`, SSHSIG verify at `0x0698`) and the TEA/ETH exchange rate
+//! multiplier for L1 cost calculation.
 
 use alloy_evm::{Database, Evm, EvmEnv, EvmFactory, precompiles::PrecompilesMap};
 use alloy_op_evm::{OpEvm, OpEvmFactory};
@@ -21,14 +22,15 @@ use std::sync::OnceLock;
 
 use crate::l1_cost;
 use crate::precompiles::gpg_verify;
+use crate::precompiles::ssh_sig_verify;
 use crate::precompiles::ssh_verify;
 
 /// Tea precompiles: standard OP precompiles plus Tea-specific ones.
 struct TeaPrecompiles;
 
 impl TeaPrecompiles {
-    /// Returns the complete precompile map for Tea, including the GPG and SSH
-    /// verify precompiles.
+    /// Returns the complete precompile map for Tea, including the GPG, SSH,
+    /// and SSHSIG verify precompiles.
     fn precompiles(spec_id: OpSpecId) -> PrecompilesMap {
         static INSTANCE: OnceLock<Precompiles> = OnceLock::new();
 
@@ -37,6 +39,7 @@ impl TeaPrecompiles {
             precompiles.extend([
                 gpg_verify::precompile(),
                 ssh_verify::precompile(),
+                ssh_sig_verify::precompile(),
             ]);
             precompiles
         }))
@@ -49,13 +52,15 @@ impl TeaPrecompiles {
 pub struct TeaEvmFactory;
 
 /// Read the TEA/ETH exchange rate from the GasPriceOracle and return the
-/// L1 cost multiplier as `(numerator, denominator)`.
+/// L1 cost multiplier as `(numerator, denominator)`. The pure-math part —
+/// extracting the 160-bit price from a packed slot and applying the
+/// backup-rate fallback — lives in `tea_l1_cost::multiplier_from_oracle_value`
+/// so the FPVM side in `kona::fpvm_evm::factory` consumes the same logic
+/// and cannot drift on a one-sided refactor.
 fn tea_l1_cost_multiplier<DB: Database>(db: &mut DB) -> Option<(U256, U256)> {
     let raw =
         db.storage(l1_cost::GAS_PRICE_ORACLE_ADDR, l1_cost::LATEST_PRICE_RATIO_SLOT_U256).ok()?;
-    let price = l1_cost::extract_price_from_u256(raw);
-    let rate = l1_cost::tea_per_wad_eth_or_backup(price);
-    Some((rate, l1_cost::WAD))
+    Some(l1_cost::multiplier_from_oracle_value(raw))
 }
 
 impl EvmFactory for TeaEvmFactory {

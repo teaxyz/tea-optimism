@@ -18,9 +18,11 @@ use revm::{
 
 /// Reads the TEA/ETH exchange rate from the on-chain GasPriceOracle and
 /// returns the L1 cost multiplier as `(numerator, denominator)`. Mirror
-/// of `tea_reth::evm::factory::tea_l1_cost_multiplier`; both call sites
-/// share the constants via the `tea-l1-cost` crate so the EL and FPVM
-/// cannot drift.
+/// of `tea_reth::evm::factory::tea_l1_cost_multiplier`. The pure-math part
+/// — masking the 160-bit price out of the packed oracle slot and applying
+/// the backup-rate fallback — lives in `tea_l1_cost::multiplier_from_oracle_value`
+/// so EL and FPVM consume the same code path and cannot drift on a
+/// one-sided refactor.
 ///
 /// Returns `None` if the storage read fails (e.g. account does not exist).
 /// op-revm's patched L1-cost path treats `None` as multiplier=1, matching
@@ -29,9 +31,7 @@ fn tea_l1_cost_multiplier<DB: Database>(db: &mut DB) -> Option<(U256, U256)> {
     let raw = db
         .storage(tea_l1_cost::GAS_PRICE_ORACLE_ADDR, tea_l1_cost::LATEST_PRICE_RATIO_SLOT_U256)
         .ok()?;
-    let price = tea_l1_cost::extract_price_from_u256(raw);
-    let rate = tea_l1_cost::tea_per_wad_eth_or_backup(price);
-    Some((rate, tea_l1_cost::WAD))
+    Some(tea_l1_cost::multiplier_from_oracle_value(raw))
 }
 
 /// Factory producing [`OpEvm`]s with FPVM-accelerated precompile overrides enabled.

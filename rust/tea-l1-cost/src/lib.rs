@@ -52,9 +52,16 @@ pub fn extract_price_from_slot(slot_value: B256) -> U256 {
 
 /// Extracts the TEA/ETH price from the oracle storage value (U256).
 ///
-/// The price occupies the lower 160 bits of the packed slot value.
+/// The price occupies the lower 160 bits of the packed slot value. This is
+/// the invariant the op-revm patch's `saturating_mul(numerator, tx_l1_cost)`
+/// relies on for overflow-safety: with a 160-bit-capped numerator and a
+/// realistic tx_l1_cost (~2^60 max), the product is bounded by 2^220, far
+/// below `U256::MAX` (2^256). Tests pin this in [`tests::test_mask_160_caps_at_160_bits`].
 pub fn extract_price_from_u256(value: U256) -> U256 {
-    // Lower 160 bits: 2 full 64-bit limbs + 32 bits
+    // U256 limbs are little-endian: limb[0] = bits 0..64, limb[1] = bits
+    // 64..128, limb[2] = bits 128..192, limb[3] = bits 192..256. To mask
+    // the lower 160 bits we keep limbs 0 and 1 fully (128 bits) and the
+    // low 32 bits of limb 2 (32 more bits) → 128 + 32 = 160. Limb 3 cleared.
     const MASK_160: U256 = U256::from_limbs([u64::MAX, u64::MAX, 0x00000000FFFFFFFF, 0]);
     value & MASK_160
 }
@@ -62,6 +69,24 @@ pub fn extract_price_from_u256(value: U256) -> U256 {
 /// Returns the TEA per WAD ETH value, using the backup rate if the oracle value is zero.
 pub fn tea_per_wad_eth_or_backup(oracle_value: U256) -> U256 {
     if oracle_value.is_zero() { U256::from(BACKUP_TEA_PER_ETH) * WAD } else { oracle_value }
+}
+
+/// Build the op-revm `l1_cost_multiplier` value `(numerator, denominator)`
+/// from a raw oracle slot value.
+///
+/// Combines [`extract_price_from_u256`] (which enforces the 160-bit mask
+/// — load-bearing for the op-revm patch's `saturating_mul` safety) with
+/// [`tea_per_wad_eth_or_backup`]. Use this from EvmFactory `create_evm`
+/// implementations rather than chaining the primitives manually — keeps
+/// EL (tea-reth) and FPVM (kona) from drifting on a single-pipeline change.
+///
+/// Returns `(rate, WAD)` such that the op-revm patch computes
+/// `tx_l1_cost.saturating_mul(rate) / WAD` — matching
+/// [`apply_tea_exchange_rate`].
+pub fn multiplier_from_oracle_value(raw: U256) -> (U256, U256) {
+    let price = extract_price_from_u256(raw);
+    let rate = tea_per_wad_eth_or_backup(price);
+    (rate, WAD)
 }
 
 #[cfg(test)]
@@ -258,6 +283,78 @@ mod tests {
     fn test_tea_per_wad_eth_or_backup_nonzero() {
         let custom_rate = U256::from(42u64) * WAD;
         assert_eq!(tea_per_wad_eth_or_backup(custom_rate), custom_rate);
+    }
+
+    /// Mask invariant: `extract_price_from_u256` MUST always produce a value
+    /// that fits in 160 bits, regardless of input.
+    ///
+    /// This is the load-bearing precondition for the op-revm patch's
+    /// `tx_l1_cost.saturating_mul(numerator) / denominator` safety: with a
+    /// 160-bit-capped numerator and a realistic tx_l1_cost ≤ 2^60, the
+    /// product is bounded by 2^220 — far below `U256::MAX`. If this test
+    /// ever fails (e.g., a refactor of `MASK_160` drops a bit), the
+    /// saturation-divergence risk noted in PR #11's audit becomes real.
+    #[test]
+    fn test_mask_160_caps_at_160_bits() {
+        let two_pow_160 = U256::from(1u128) << 160;
+        // U256::MAX must mask down to exactly (2^160 - 1).
+        let masked_max = extract_price_from_u256(U256::MAX);
+        assert_eq!(masked_max, two_pow_160 - U256::from(1u64));
+        assert!(masked_max < two_pow_160);
+
+        // A value with bits set only in the upper 96 bits must mask to zero.
+        let upper_only = U256::MAX << 160;
+        assert_eq!(extract_price_from_u256(upper_only), U256::ZERO);
+
+        // Spot check: a value with the boundary bit (bit 159) set survives,
+        // and a value with bit 160 set is stripped.
+        let bit_159 = U256::from(1u64) << 159;
+        let bit_160 = U256::from(1u64) << 160;
+        assert_eq!(extract_price_from_u256(bit_159), bit_159);
+        assert_eq!(extract_price_from_u256(bit_160), U256::ZERO);
+    }
+
+    /// `multiplier_from_oracle_value` always produces a numerator that's safe
+    /// to feed into the op-revm patch's `saturating_mul` against any realistic
+    /// `tx_l1_cost`. Concretely: for a corrupted oracle slot at `U256::MAX`
+    /// and `tx_l1_cost = 2^60` (above any plausible real value), the product
+    /// fits in 220 bits and never saturates.
+    #[test]
+    fn test_multiplier_from_oracle_value_never_saturates_realistic_cost() {
+        let (numerator, denominator) = multiplier_from_oracle_value(U256::MAX);
+
+        // Numerator is post-mask, so ≤ 2^160 - 1.
+        let two_pow_160 = U256::from(1u128) << 160;
+        assert!(numerator < two_pow_160);
+        assert_eq!(denominator, WAD);
+
+        // 2^60 is two orders of magnitude above any plausible Fjord cost
+        // (~1e16 ≈ 2^53). Product fits comfortably in U256 with headroom.
+        let realistic_max_cost: U256 = U256::from(1u128) << 60;
+        let product = realistic_max_cost.checked_mul(numerator).expect("no overflow at 2^60");
+        // Headroom: product < 2^220, U256::MAX = 2^256 - 1. Margin: 36 bits.
+        assert!(product < U256::MAX >> 36, "leaves >=36 bits of headroom under U256::MAX");
+    }
+
+    /// `multiplier_from_oracle_value(0)` engages backup-rate just like the
+    /// raw primitives — confirms the new helper doesn't change behavior.
+    #[test]
+    fn test_multiplier_from_oracle_value_backup_path() {
+        let (numerator, denominator) = multiplier_from_oracle_value(U256::ZERO);
+        assert_eq!(numerator, U256::from(BACKUP_TEA_PER_ETH) * WAD);
+        assert_eq!(denominator, WAD);
+    }
+
+    /// `multiplier_from_oracle_value` agrees with the raw primitives on
+    /// `examplePriceRatio` — the canonical Go-test packed-slot value.
+    #[test]
+    fn test_multiplier_from_oracle_value_packed_slot() {
+        let packed = U256::from_be_bytes(alloy_primitives::hex!(
+            "00000000000000006793192400000000000000000000003627e8f712373c0000"
+        ));
+        let (numerator, denominator) = multiplier_from_oracle_value(packed);
+        assert_eq!(numerator, U256::from(999u64) * WAD);
+        assert_eq!(denominator, WAD);
     }
 
     /// Exchange rate of zero → cost is zero.
