@@ -115,12 +115,15 @@ pub fn precompile() -> Precompile {
 }
 
 /// Calculates the gas required for SSHSIG verification.
+///
+/// Saturating arithmetic mirrors `ssh_verify::required_gas`.
 pub fn required_gas(input: &[u8]) -> u64 {
     if input.len() <= SSHSIG_VERIFY_INPUT_LENGTH_KINK {
         return SSHSIG_VERIFY_BASE_GAS;
     }
     let additional_bytes = input.len() - SSHSIG_VERIFY_INPUT_LENGTH_KINK;
-    SSHSIG_VERIFY_BASE_GAS + SSHSIG_VERIFY_GAS_PER_BYTE * additional_bytes as u64
+    SSHSIG_VERIFY_BASE_GAS
+        .saturating_add(SSHSIG_VERIFY_GAS_PER_BYTE.saturating_mul(additional_bytes as u64))
 }
 
 /// 32-byte result indicating success (1).
@@ -289,6 +292,13 @@ fn run_verification(decoded: &SshSigVerifyInput) -> bool {
         Ok(b) => b,
         Err(_) => return false,
     };
+
+    // Reject trailing bytes in the SSH wire-format signature blob — same
+    // encoding-malleability rationale as the trailing-byte check on the
+    // pubkey blob in ssh_common::verify_ssh_*.
+    if sig_parse_offset != decoded.signature.len() {
+        return false;
+    }
 
     match key_type {
         b"ssh-ed25519" => {

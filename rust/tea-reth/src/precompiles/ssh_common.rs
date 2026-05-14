@@ -105,6 +105,16 @@ pub fn verify_ssh_ed25519(
         _ => return false,
     };
 
+    // Reject trailing bytes in the SSH wire-format pubkey blob. The
+    // canonical encoding is `string("ssh-ed25519") + string(32-byte-key)`
+    // with nothing after. Trailing-byte tolerance would let two distinct
+    // `publicKey` ABI inputs verify the same signature, which is harmless
+    // for the primitive but a footgun for any caller that hashes the
+    // pubkey bytes off-chain to derive an identity.
+    if key_offset != pub_key_data.len() {
+        return false;
+    }
+
     if sig_blob.len() != 64 {
         return false;
     }
@@ -155,8 +165,20 @@ pub fn verify_ssh_rsa(
         Err(_) => return false,
     };
 
-    // Strict canonical mpint strip — rejects non-canonical encodings that
-    // could be used to bypass the modulus bounds check.
+    // Reject trailing bytes in the SSH wire-format pubkey blob — same
+    // rationale as in verify_ssh_ed25519 above.
+    if key_offset != pub_key_data.len() {
+        return false;
+    }
+
+    // Strict canonical mpint strip on both e and n. Without canonicalising
+    // e, an attacker could pad it with extraneous leading zeros to produce
+    // distinct `publicKey` byte sequences that map to the same (n, e) RSA
+    // key — same caller-side identity-derivation footgun as trailing bytes.
+    let e_unpadded = match strip_mpint_pad(e_bytes) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
     let n_unpadded = match strip_mpint_pad(n_bytes) {
         Ok(b) => b,
         Err(_) => return false,
@@ -169,7 +191,7 @@ pub fn verify_ssh_rsa(
         return false;
     }
 
-    let e = rsa::BigUint::from_bytes_be(e_bytes);
+    let e = rsa::BigUint::from_bytes_be(e_unpadded);
     let n = rsa::BigUint::from_bytes_be(n_unpadded);
     let pub_key = match rsa::RsaPublicKey::new(n, e) {
         Ok(k) => k,
@@ -309,7 +331,7 @@ mod tests {
         // Canonical SSH mpint: trim extraneous leading zeros, then pad with
         // 0x00 if the high bit is set.
         let mut start = 0;
-        while start < value.len() - 1 && value[start] == 0 {
+        while start < value.len().saturating_sub(1) && value[start] == 0 {
             start += 1;
         }
         let trimmed = &value[start..];
