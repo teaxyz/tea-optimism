@@ -475,6 +475,58 @@ mod tests {
         );
     }
 
+    /// End-to-end version of the bypass: a *real* RSA-1024 keypair signs a
+    /// real message, then the modulus is wire-encoded as a non-canonical
+    /// 257-byte mpint. On the pre-fix code (lenient single strip + byte-only
+    /// min check), the signature verifies because the underlying integer
+    /// matches the embedded key and PKCS#1 v1.5 + SHA-256 happily accepts.
+    /// On the post-fix code, the strict strip + `bits()` check reject before
+    /// any crypto runs. The fake-key variant above proves the strip layer
+    /// catches it; this version proves the precompile result is also `false`
+    /// when the attacker has full control of a matching keypair.
+    #[test]
+    fn verify_ssh_rsa_rejects_padded_modulus_with_real_keypair() {
+        use rand_08::SeedableRng;
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::traits::PublicKeyParts;
+        use signature::{SignatureEncoding, Signer};
+
+        let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
+        let priv_key = rsa::RsaPrivateKey::new(&mut rng, 1024)
+            .expect("RSA-1024 keygen");
+        let pub_key = rsa::RsaPublicKey::from(&priv_key);
+        let n_raw = pub_key.n().to_bytes_be();
+        assert_eq!(n_raw.len(), 128);
+
+        let message = b"e2e padded-mpint bypass demo".as_slice();
+        let signing_key: SigningKey<Sha256> = SigningKey::new(priv_key);
+        let sig_bytes = signing_key.sign(message).to_bytes();
+        assert_eq!(sig_bytes.len(), 128);
+
+        // Non-canonical mpint: [0x00] + [0x00 × 128] + [128 real bytes] = 257.
+        let mut malicious_mpint: Vec<u8> = vec![0x00; 129];
+        malicious_mpint.extend_from_slice(&n_raw);
+        assert_eq!(malicious_mpint.len(), 257);
+
+        let mut pub_blob = Vec::new();
+        write_ssh_string(&mut pub_blob, b"ssh-rsa");
+        write_ssh_mpint(&mut pub_blob, &pub_key.e().to_bytes_be());
+        // Inject the malicious mpint as a raw SSH-string framing (4 + 257 bytes).
+        pub_blob.extend_from_slice(&(malicious_mpint.len() as u32).to_be_bytes());
+        pub_blob.extend_from_slice(&malicious_mpint);
+
+        let mut o = 0usize;
+        let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
+
+        let accepted =
+            verify_ssh_rsa(&pub_blob, o, message, b"rsa-sha2-256", &sig_bytes);
+        assert!(
+            !accepted,
+            "VULN: real 1024-bit signature accepted via non-canonical mpint — \
+             2048-bit floor is bypassable"
+        );
+    }
+
     // ─────────────────────────────────────────── verify_ssh_ed25519
 
     fn sign_ed25519(message: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
