@@ -333,6 +333,13 @@ mod tests {
     /// not just bytes our own helpers re-synthesize.
     const FIXTURE_ED25519: &str = include_str!("testdata_sshsig_verify_ed25519.hex");
     const FIXTURE_RSA: &str = include_str!("testdata_sshsig_verify_rsa.hex");
+    /// Real `git commit -S` output (gpg.format=ssh) — the SSHSIG armor from a
+    /// signed commit's `gpgsig` field, parsed to (payload, namespace="git",
+    /// pubkey, signature). Payload is the commit content with the gpgsig
+    /// block stripped (matches what `git verify-commit` checks).
+    /// Verified end-to-end with `ssh-keygen -Y verify` before embedding.
+    const FIXTURE_GIT_COMMIT: &str =
+        include_str!("testdata_sshsig_git_commit_ed25519.hex");
 
     fn hex_decode(s: &str) -> Vec<u8> {
         alloy_primitives::hex::decode(s.trim()).expect("valid hex")
@@ -587,6 +594,27 @@ mod tests {
     #[test]
     fn fixture_real_ssh_keygen_rsa_tampered_payload_rejects() {
         let mut input = hex_decode(FIXTURE_RSA);
+        input[160] ^= 0xFF;
+        assert_precompile_ok(&run(&input), FAILURE_HEX);
+    }
+
+    /// Real `git commit -S` fixture (namespace="git"). End-to-end proof that
+    /// the precompile accepts the exact bytes git emits for SSH-signed
+    /// commits, not just synthetic test vectors. Counterpart to the
+    /// `ssh-keygen -Y sign` fixtures above — git's signing path is the
+    /// primary on-chain use case for this precompile.
+    #[test]
+    fn fixture_real_git_commit_signed_verifies() {
+        let input = hex_decode(FIXTURE_GIT_COMMIT);
+        assert_precompile_ok(&run(&input), SUCCESS_HEX);
+    }
+
+    /// Tampering the commit payload (e.g., changing the tree/author/message)
+    /// must reject. Offset 160 lands inside the first dynamic field (the
+    /// commit body) per the ABI layout.
+    #[test]
+    fn fixture_real_git_commit_tampered_payload_rejects() {
+        let mut input = hex_decode(FIXTURE_GIT_COMMIT);
         input[160] ^= 0xFF;
         assert_precompile_ok(&run(&input), FAILURE_HEX);
     }
