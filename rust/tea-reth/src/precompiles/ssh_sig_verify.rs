@@ -48,13 +48,18 @@
 //! - `ssh-ed25519`: Ed25519 signatures (64-byte sig, 32-byte pubkey).
 //! - `rsa-sha2-256`: RSA with SHA-256 (PKCS#1 v1.5), max 4096-bit key.
 //! - `rsa-sha2-512`: RSA with SHA-512 (PKCS#1 v1.5), max 4096-bit key.
+//! - `ecdsa-sha2-nistp256`: ECDSA on P-256 with SHA-256 (RFC 5656).
+//! - `ecdsa-sha2-nistp384`: ECDSA on P-384 with SHA-384 (RFC 5656).
+//! - `ecdsa-sha2-nistp521`: ECDSA on P-521 with SHA-512 (RFC 5656).
 //!
-//! Deprecated `ssh-rsa` (SHA-1) signatures are rejected.
+//! Deprecated `ssh-rsa` (SHA-1) signatures are rejected. ECDSA signatures are
+//! low-S-only (high-S form is rejected to prevent malleability — see
+//! `ssh_common::verify_ssh_ecdsa`).
 
 use alloy_primitives::{Address, Bytes, address};
 use revm::precompile::{Precompile, PrecompileId, PrecompileOutput, PrecompileResult};
 
-use super::ssh_common::{read_ssh_string, verify_ssh_ed25519, verify_ssh_rsa};
+use super::ssh_common::{read_ssh_string, verify_ssh_ecdsa, verify_ssh_ed25519, verify_ssh_rsa};
 
 /// SSHSIG verify precompile address.
 pub const SSHSIG_VERIFY_ADDRESS: Address =
@@ -307,6 +312,15 @@ fn run_verification(decoded: &SshSigVerifyInput) -> bool {
         b"ssh-rsa" => {
             verify_ssh_rsa(&decoded.public_key, key_offset, &envelope, sig_algo, sig_blob)
         }
+        // ECDSA dispatch — see ssh_verify.rs for the same arms. The inner
+        // `verify_ssh_ecdsa` cross-gates sig_algo against key_type and
+        // against the embedded curve_name; we accept any of the three
+        // here and let the inner gate decide.
+        b"ecdsa-sha2-nistp256"
+        | b"ecdsa-sha2-nistp384"
+        | b"ecdsa-sha2-nistp521" => {
+            verify_ssh_ecdsa(&decoded.public_key, key_offset, &envelope, sig_algo, sig_blob)
+        }
         _ => false,
     }
 }
@@ -405,6 +419,16 @@ mod tests {
         out.extend_from_slice(&ssh_mpint(&pub_key.e().to_bytes_be()));
         out.extend_from_slice(&ssh_mpint(&pub_key.n().to_bytes_be()));
         out
+    }
+
+    fn build_ecdsa_pubkey_blob(key_type: &[u8], curve_name: &[u8], q: &[u8]) -> Vec<u8> {
+        [ssh_string(key_type), ssh_string(curve_name), ssh_string(q)].concat()
+    }
+
+    /// RFC 5656 §3.1.2: the ECDSA sig_blob is itself SSH-encoded as
+    /// `mpint(r) || mpint(s)`.
+    fn build_ecdsa_sig_inner(r: &[u8], s: &[u8]) -> Vec<u8> {
+        [ssh_mpint(r), ssh_mpint(s)].concat()
     }
 
     /// ABI-encode `(bytes payload, bytes namespace, bytes pubkey, bytes signature)`.
@@ -664,6 +688,104 @@ mod tests {
     fn rsa_sha2_512_round_trip() {
         let input = sign_sshsig_rsa_sha512(b"signed by rsa-512", b"git");
         assert_precompile_ok(&run(&input), SUCCESS_HEX);
+    }
+
+    // ─────────────────────── ECDSA SSHSIG round-trip tests
+    //
+    // Cover the new dispatch arms in `run_verification` for each of the
+    // three NIST curves. The cross-gate / low-S / canonical-encoding
+    // primitives are tested in `ssh_common.rs`; this layer just proves
+    // the SSHSIG envelope path correctly hands off to `verify_ssh_ecdsa`.
+
+    fn sign_sshsig_ecdsa_nistp256(payload: &[u8], namespace: &[u8]) -> Vec<u8> {
+        use rand_08::SeedableRng;
+        use signature::Signer;
+        use p256::ecdsa::{Signature, SigningKey};
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+        let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
+        let signing_key = SigningKey::random(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        let q_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+
+        let envelope = build_sshsig_envelope(payload, namespace);
+        let sig: Signature = signing_key.sign(&envelope);
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let (r, s) = sig.split_bytes();
+
+        let pub_blob = build_ecdsa_pubkey_blob(b"ecdsa-sha2-nistp256", b"nistp256", &q_bytes);
+        let sig_inner = build_ecdsa_sig_inner(&r, &s);
+        let sig_blob = build_signature_blob(b"ecdsa-sha2-nistp256", &sig_inner);
+        encode_input(payload, namespace, &pub_blob, &sig_blob)
+    }
+
+    fn sign_sshsig_ecdsa_nistp384(payload: &[u8], namespace: &[u8]) -> Vec<u8> {
+        use rand_08::SeedableRng;
+        use signature::Signer;
+        use p384::ecdsa::{Signature, SigningKey};
+        use p384::elliptic_curve::sec1::ToEncodedPoint;
+
+        let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
+        let signing_key = SigningKey::random(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        let q_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+
+        let envelope = build_sshsig_envelope(payload, namespace);
+        let sig: Signature = signing_key.sign(&envelope);
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let (r, s) = sig.split_bytes();
+
+        let pub_blob = build_ecdsa_pubkey_blob(b"ecdsa-sha2-nistp384", b"nistp384", &q_bytes);
+        let sig_inner = build_ecdsa_sig_inner(&r, &s);
+        let sig_blob = build_signature_blob(b"ecdsa-sha2-nistp384", &sig_inner);
+        encode_input(payload, namespace, &pub_blob, &sig_blob)
+    }
+
+    fn sign_sshsig_ecdsa_nistp521(payload: &[u8], namespace: &[u8]) -> Vec<u8> {
+        use rand_08::SeedableRng;
+        use signature::Signer;
+        use p521::ecdsa::{Signature, SigningKey, VerifyingKey};
+        use p521::elliptic_curve::sec1::ToEncodedPoint;
+
+        let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
+        let signing_key = SigningKey::random(&mut rng);
+        let verifying_key = VerifyingKey::from(&signing_key);
+        let q_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+
+        let envelope = build_sshsig_envelope(payload, namespace);
+        let sig: Signature = signing_key.sign(&envelope);
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let (r, s) = sig.split_bytes();
+
+        let pub_blob = build_ecdsa_pubkey_blob(b"ecdsa-sha2-nistp521", b"nistp521", &q_bytes);
+        let sig_inner = build_ecdsa_sig_inner(&r, &s);
+        let sig_blob = build_signature_blob(b"ecdsa-sha2-nistp521", &sig_inner);
+        encode_input(payload, namespace, &pub_blob, &sig_blob)
+    }
+
+    #[test]
+    fn ecdsa_nistp256_round_trip() {
+        let input = sign_sshsig_ecdsa_nistp256(b"signed by ecdsa-256", b"git");
+        assert_precompile_ok(&run(&input), SUCCESS_HEX);
+    }
+
+    #[test]
+    fn ecdsa_nistp384_round_trip() {
+        let input = sign_sshsig_ecdsa_nistp384(b"signed by ecdsa-384", b"git");
+        assert_precompile_ok(&run(&input), SUCCESS_HEX);
+    }
+
+    #[test]
+    fn ecdsa_nistp521_round_trip() {
+        let input = sign_sshsig_ecdsa_nistp521(b"signed by ecdsa-521", b"git");
+        assert_precompile_ok(&run(&input), SUCCESS_HEX);
+    }
+
+    #[test]
+    fn ecdsa_nistp256_tampered_payload_rejects() {
+        let mut input = sign_sshsig_ecdsa_nistp256(b"original payload", b"file");
+        input[160] ^= 0xFF; // first byte of payload data region
+        assert_precompile_ok(&run(&input), FAILURE_HEX);
     }
 
     // ─────────────────────── Tampered-input tests
