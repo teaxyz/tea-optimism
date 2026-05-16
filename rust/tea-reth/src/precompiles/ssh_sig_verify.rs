@@ -32,11 +32,21 @@
 //! - `publicKey`: SSH wire format (RFC 4253) public key bytes.
 //! - `signature`: SSH wire format signature (`string algorithm, string sig_blob`).
 //!
-//! # Hardcoded SSHSIG fields
+//! # SSHSIG hash algorithm handling
 //!
-//! - `hash_algorithm = "sha512"` — matches `ssh-keygen -Y sign` default and git.
-//!   Callers wanting `sha256` must use a future variant; SHA-512 is locked in
-//!   here to keep the ABI tight and the audit surface small.
+//! `ssh-keygen -Y sign` defaults to SHA-512, and git uses SHA-512 for SSH-
+//! signed tags/commits, so the primary verification path tries SHA-512 first.
+//! On failure the precompile retries with a SHA-256 envelope to cover signers
+//! invoked with `ssh-keygen -Y sign -O hashalg=sha256`. Both envelopes route
+//! through the same `verify_ssh_ed25519` / `verify_ssh_rsa` /
+//! `verify_ssh_ecdsa` paths — only the envelope hash differs.
+//!
+//! Gas note: precompile gas is pre-computed from input size before any
+//! verification work runs, so callers are billed identically whether the
+//! signature happened to be SHA-512 or SHA-256. The retry adds a few µs of
+//! CPU on the SHA-512-fails-then-SHA-256-succeeds path; it does not change
+//! observed gas cost.
+//!
 //! - `reserved = ""` — per the SSHSIG spec, always empty in version 1.
 //!
 //! # Output
@@ -102,10 +112,6 @@ pub const MAX_PUBKEY_BYTES: usize = 1024;
 ///
 /// Covers an `ssh-rsa` 4096-bit signature (~530 bytes including framing).
 pub const MAX_SIGNATURE_BYTES: usize = 1024;
-
-/// Hardcoded SSHSIG hash algorithm field. SHA-512 matches `ssh-keygen -Y sign`
-/// default and what git uses for SSH-signed tags/commits.
-const SSHSIG_HASH_ALGORITHM: &[u8] = b"sha512";
 
 /// SSHSIG magic preamble per PROTOCOL.sshsig.
 const SSHSIG_MAGIC: &[u8] = b"SSHSIG";
@@ -228,22 +234,53 @@ fn read_dynamic_bytes(input: &[u8], offset: usize, max_len: usize) -> Result<Vec
 
 // ─────────────────────────────────────────── Envelope reconstruction
 
-/// Build the SSHSIG signed-data envelope per PROTOCOL.sshsig:
+/// Build the SSHSIG signed-data envelope per PROTOCOL.sshsig using SHA-512.
 ///
 /// ```text
 /// "SSHSIG" || string(namespace) || string("") || string("sha512") || string(SHA-512(payload))
 /// ```
+///
+/// SHA-512 is the `ssh-keygen -Y sign` default and what `git commit -S` /
+/// `git tag -s` produce for SSH-signed objects, so this is the primary
+/// verification path. The SHA-256 fallback lives in
+/// [`build_sshsig_envelope_with_hash`].
+///
+/// `cfg(test)`-only: production code reuses
+/// [`build_sshsig_envelope_with_hash`] directly in `run_verification` to
+/// avoid double-hashing the payload (it needs both SHA-512 and SHA-256
+/// envelopes in one place). The test helpers keep using this convenience
+/// wrapper because it matches what the original `sign_sshsig_*` helpers
+/// expect.
+#[cfg(test)]
 fn build_sshsig_envelope(payload: &[u8], namespace: &[u8]) -> Vec<u8> {
     use sha2::Digest;
     let payload_hash = sha2::Sha512::digest(payload);
+    build_sshsig_envelope_with_hash(namespace, b"sha512", payload_hash.as_slice())
+}
 
-    // 6 (magic) + 4+ns + 4 (empty reserved) + 4+6 ("sha512") + 4+64 (hash)
-    let mut envelope = Vec::with_capacity(SSHSIG_MAGIC.len() + namespace.len() + 86);
+/// Build the SSHSIG envelope from a pre-computed payload hash. Factored out
+/// of [`build_sshsig_envelope`] so the SHA-256 retry path (`ssh-keygen -Y
+/// sign -O hashalg=sha256`) reuses the same wire-format reconstruction.
+///
+/// `hash_algo_name` is the wire-format string that appears inside the
+/// envelope (currently `b"sha512"` or `b"sha256"`); `hash_bytes` is the
+/// caller-computed digest of the payload using that algorithm.
+fn build_sshsig_envelope_with_hash(
+    namespace: &[u8],
+    hash_algo_name: &[u8],
+    hash_bytes: &[u8],
+) -> Vec<u8> {
+    // Capacity hint: 6 magic + (4 + ns) + 4 empty reserved + (4 + algo_name) +
+    // (4 + hash_len). Slight overshoot is fine — Vec only reallocates if
+    // exceeded.
+    let mut envelope = Vec::with_capacity(
+        SSHSIG_MAGIC.len() + 4 + namespace.len() + 4 + 4 + hash_algo_name.len() + 4 + hash_bytes.len(),
+    );
     envelope.extend_from_slice(SSHSIG_MAGIC);
     write_ssh_string(&mut envelope, namespace);
     write_ssh_string(&mut envelope, b"");
-    write_ssh_string(&mut envelope, SSHSIG_HASH_ALGORITHM);
-    write_ssh_string(&mut envelope, payload_hash.as_slice());
+    write_ssh_string(&mut envelope, hash_algo_name);
+    write_ssh_string(&mut envelope, hash_bytes);
     envelope
 }
 
@@ -280,8 +317,6 @@ fn run_verification(decoded: &SshSigVerifyInput) -> bool {
         return false;
     }
 
-    let envelope = build_sshsig_envelope(&decoded.payload, &decoded.namespace);
-
     let mut key_offset = 0usize;
     let key_type = match read_ssh_string(&decoded.public_key, &mut key_offset) {
         Ok(t) => t,
@@ -305,13 +340,65 @@ fn run_verification(decoded: &SshSigVerifyInput) -> bool {
         return false;
     }
 
+    // Try SHA-512 envelope first (the `ssh-keygen -Y sign` default and what
+    // git uses for SSH-signed tags/commits — the common case). If verification
+    // fails, fall back to SHA-256 to cover `ssh-keygen -Y sign -O hashalg=sha256`
+    // signers. Precompile gas is pre-computed from input size before any work
+    // runs, so the caller pays the same regardless of which envelope succeeded;
+    // the retry only adds a few µs of CPU on the SHA-256 path.
+    {
+        use sha2::Digest;
+        let sha512_hash = sha2::Sha512::digest(&decoded.payload);
+        let envelope_sha512 = build_sshsig_envelope_with_hash(
+            &decoded.namespace,
+            b"sha512",
+            sha512_hash.as_slice(),
+        );
+        if verify_with_envelope(
+            key_type,
+            &decoded.public_key,
+            key_offset,
+            &envelope_sha512,
+            sig_algo,
+            sig_blob,
+        ) {
+            return true;
+        }
+
+        let sha256_hash = sha2::Sha256::digest(&decoded.payload);
+        let envelope_sha256 = build_sshsig_envelope_with_hash(
+            &decoded.namespace,
+            b"sha256",
+            sha256_hash.as_slice(),
+        );
+        verify_with_envelope(
+            key_type,
+            &decoded.public_key,
+            key_offset,
+            &envelope_sha256,
+            sig_algo,
+            sig_blob,
+        )
+    }
+}
+
+/// Dispatch verification over a pre-built envelope by SSH key type. Factored
+/// out of `run_verification` so the SHA-512 / SHA-256 envelope-retry path
+/// doesn't duplicate the dispatch table (any future key-type addition lands
+/// in one place and applies to both envelopes automatically).
+fn verify_with_envelope(
+    key_type: &[u8],
+    public_key: &[u8],
+    key_offset: usize,
+    envelope: &[u8],
+    sig_algo: &[u8],
+    sig_blob: &[u8],
+) -> bool {
     match key_type {
         b"ssh-ed25519" => {
-            verify_ssh_ed25519(&decoded.public_key, key_offset, &envelope, sig_algo, sig_blob)
+            verify_ssh_ed25519(public_key, key_offset, envelope, sig_algo, sig_blob)
         }
-        b"ssh-rsa" => {
-            verify_ssh_rsa(&decoded.public_key, key_offset, &envelope, sig_algo, sig_blob)
-        }
+        b"ssh-rsa" => verify_ssh_rsa(public_key, key_offset, envelope, sig_algo, sig_blob),
         // ECDSA dispatch — see ssh_verify.rs for the same arms. The inner
         // `verify_ssh_ecdsa` cross-gates sig_algo against key_type and
         // against the embedded curve_name; we accept any of the three
@@ -319,7 +406,7 @@ fn run_verification(decoded: &SshSigVerifyInput) -> bool {
         b"ecdsa-sha2-nistp256"
         | b"ecdsa-sha2-nistp384"
         | b"ecdsa-sha2-nistp521" => {
-            verify_ssh_ecdsa(&decoded.public_key, key_offset, &envelope, sig_algo, sig_blob)
+            verify_ssh_ecdsa(public_key, key_offset, envelope, sig_algo, sig_blob)
         }
         _ => false,
     }
@@ -786,6 +873,116 @@ mod tests {
         let mut input = sign_sshsig_ecdsa_nistp256(b"original payload", b"file");
         input[160] ^= 0xFF; // first byte of payload data region
         assert_precompile_ok(&run(&input), FAILURE_HEX);
+    }
+
+    // ─────────────────────── SHA-256 envelope-hash retry path tests
+    //
+    // `ssh-keygen -Y sign -O hashalg=sha256` produces signatures over a
+    // SHA-256-flavored SSHSIG envelope. The default `ssh-keygen -Y sign`
+    // and `git commit -S` produce SHA-512. The precompile tries SHA-512
+    // first and falls back to SHA-256 — both verify, neither requires the
+    // caller to know which the signer used.
+
+    /// Build an SSHSIG envelope using SHA-256 — the form `ssh-keygen -Y sign
+    /// -O hashalg=sha256` produces. Mirrors `build_sshsig_envelope` (SHA-512)
+    /// but with a SHA-256 digest and `"sha256"` algorithm string in the
+    /// envelope.
+    fn build_sshsig_envelope_sha256(payload: &[u8], namespace: &[u8]) -> Vec<u8> {
+        use sha2::Digest;
+        let payload_hash = sha2::Sha256::digest(payload);
+        build_sshsig_envelope_with_hash(namespace, b"sha256", payload_hash.as_slice())
+    }
+
+    /// Sign `payload` with the fixed ed25519 key but produce a SHA-256
+    /// envelope (the `hashalg=sha256` variant). Mirrors `sign_sshsig_ed25519`.
+    fn sign_sshsig_ed25519_sha256(payload: &[u8], namespace: &[u8]) -> Vec<u8> {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ED25519_SEED);
+        let verifying_key = signing_key.verifying_key();
+
+        let envelope = build_sshsig_envelope_sha256(payload, namespace);
+        let sig = signing_key.sign(&envelope);
+
+        let pub_key_blob = build_ed25519_pubkey_blob(verifying_key.as_bytes());
+        let sig_blob = build_signature_blob(b"ssh-ed25519", &sig.to_bytes());
+
+        encode_input(payload, namespace, &pub_key_blob, &sig_blob)
+    }
+
+    #[test]
+    fn envelope_sha256_layout_matches_spec() {
+        // Verifies the SHA-256 envelope is well-formed and the helper
+        // produces exactly the bytes `ssh-keygen -Y sign -O hashalg=sha256`
+        // would feed to the signing key.
+        //   "SSHSIG" || string(namespace) || string("") || string("sha256") || string(SHA-256(payload))
+        let payload = b"hello world";
+        let envelope = build_sshsig_envelope_sha256(payload, b"file");
+        assert_eq!(&envelope[0..6], b"SSHSIG");
+        assert_eq!(&envelope[6..14], &[0, 0, 0, 4, b'f', b'i', b'l', b'e']);
+        assert_eq!(&envelope[14..18], &[0, 0, 0, 0]); // reserved
+        assert_eq!(&envelope[18..28], &[0, 0, 0, 6, b's', b'h', b'a', b'2', b'5', b'6']);
+        assert_eq!(&envelope[28..32], &[0, 0, 0, 32]); // SHA-256 = 32 bytes
+        let expected = {
+            use sha2::Digest;
+            sha2::Sha256::digest(payload).to_vec()
+        };
+        assert_eq!(&envelope[32..64], expected.as_slice());
+        assert_eq!(envelope.len(), 64);
+    }
+
+    #[test]
+    fn ed25519_sshsig_sha256_envelope_verifies() {
+        // The load-bearing test: a signer using `hashalg=sha256` now
+        // verifies. Before the fallback was added, this returned bytes32(0).
+        let input = sign_sshsig_ed25519_sha256(b"hello hashalg=sha256", b"file");
+        assert_precompile_ok(&run(&input), SUCCESS_HEX);
+    }
+
+    #[test]
+    fn ed25519_sshsig_both_envelopes_verify_for_same_signer() {
+        // Same key + same payload + same namespace, signed once over the
+        // SHA-512 envelope and once over the SHA-256 envelope — both
+        // verify. Proves the retry path is transparent to callers; they
+        // don't need to know which `hashalg` the signer chose.
+        let payload = b"deterministic across envelopes";
+        let namespace = b"file";
+        let input_sha512 = sign_sshsig_ed25519(payload, namespace);
+        let input_sha256 = sign_sshsig_ed25519_sha256(payload, namespace);
+        assert_ne!(
+            input_sha512, input_sha256,
+            "the two inputs must differ — the signature is over different envelopes"
+        );
+        assert_precompile_ok(&run(&input_sha512), SUCCESS_HEX);
+        assert_precompile_ok(&run(&input_sha256), SUCCESS_HEX);
+    }
+
+    #[test]
+    fn ed25519_sshsig_sha256_tampered_payload_rejects() {
+        // Even with the SHA-256 envelope path, tampering still rejects.
+        let mut input = sign_sshsig_ed25519_sha256(b"original payload", b"file");
+        input[160] ^= 0xFF;
+        assert_precompile_ok(&run(&input), FAILURE_HEX);
+    }
+
+    #[test]
+    fn rsa_sshsig_sha256_envelope_verifies() {
+        // RSA over SHA-256 envelope — same retry path, RSA key type.
+        use rand_08::SeedableRng;
+        use rsa::pkcs1v15::SigningKey;
+        use sha2::Sha256;
+        use signature::{SignatureEncoding, Signer};
+
+        let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
+        let priv_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("rsa-2048 keygen");
+        let pub_key = rsa::RsaPublicKey::from(&priv_key);
+
+        let envelope = build_sshsig_envelope_sha256(b"rsa sha256 envelope", b"file");
+        let signing_key: SigningKey<Sha256> = SigningKey::new(priv_key);
+        let sig = signing_key.sign(&envelope);
+
+        let pub_key_blob = build_rsa_pubkey_blob(&pub_key);
+        let sig_blob = build_signature_blob(b"rsa-sha2-256", &sig.to_bytes());
+        let input = encode_input(b"rsa sha256 envelope", b"file", &pub_key_blob, &sig_blob);
+        assert_precompile_ok(&run(&input), SUCCESS_HEX);
     }
 
     // ─────────────────────── Tampered-input tests
