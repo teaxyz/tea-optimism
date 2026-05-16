@@ -4,6 +4,35 @@
 //!
 //! Input format: `abi.encode(bytes32 message, bytes8 keyId, bytes publicKey, bytes signature)`
 //! Returns `bytes32(1)` for valid signatures, `bytes32(0)` for invalid.
+//!
+//! # Hash algorithm policy
+//!
+//! This precompile verifies the GPG signature primitive **mathematically** —
+//! given (message, pubkey, signature), it returns whether the signature is a
+//! valid GPG signature over the message under the pubkey. It does not opine
+//! on the *strength* of the hash algorithm the signer chose.
+//!
+//! GPG signatures using SHA-1, MD5, or RIPEMD-160 are still cryptographically
+//! valid per the OpenPGP protocol; rejecting them at the precompile layer
+//! would break legacy keys (pre-2014 GPG defaulted to SHA-1, and a significant
+//! fraction of long-lived signing keys still emit SHA-1 sigs by configuration
+//! or by certificate). The relevant attack (chosen-prefix collision against
+//! SHA-1/MD5) also requires the attacker to control content the legitimate
+//! signer is willing to sign — a constraint that depends entirely on the
+//! application semantics around the signature, not on the precompile.
+//!
+//! **Callers wanting cryptographic-strength guarantees** (e.g., that the
+//! signature was made under SHA-256 or stronger) must enforce that policy
+//! at the application layer *before* invoking this precompile. The OpenPGP
+//! signature packet exposes the hash algorithm in a fixed offset; parsing
+//! it out is a few lines of Solidity. In the tea-protocol contract suite,
+//! `PrecompileClaimVerifier.sol` is the canonical place for that gate —
+//! contributor-claim verifications and on-chain identity claims that rely on
+//! a hash-strength guarantee should reject weak-hash sigs at that layer.
+//!
+//! Changing this behavior here would silently break every legacy key that
+//! existing callers may already trust — a policy change of that magnitude
+//! belongs at the policy layer, not buried in a verification precompile.
 
 use alloy_primitives::{Address, Bytes, address};
 use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey};
