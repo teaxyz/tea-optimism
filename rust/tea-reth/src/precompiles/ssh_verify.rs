@@ -22,9 +22,13 @@
 //!   Verified with `verify_strict` to reject non-canonical S / small-subgroup R.
 //! - `rsa-sha2-256`: RSA with SHA-256 (PKCS#1 v1.5).
 //! - `rsa-sha2-512`: RSA with SHA-512 (PKCS#1 v1.5).
+//! - `ecdsa-sha2-nistp256`: ECDSA on P-256 with SHA-256 (RFC 5656).
+//! - `ecdsa-sha2-nistp384`: ECDSA on P-384 with SHA-384 (RFC 5656).
+//! - `ecdsa-sha2-nistp521`: ECDSA on P-521 with SHA-512 (RFC 5656).
 //!
 //! RSA modulus must be 2048..=4096 bits. Deprecated `ssh-rsa` (SHA-1) signatures
-//! are rejected explicitly.
+//! are rejected explicitly. ECDSA signatures are low-S-only (high-S form is
+//! rejected to prevent signature malleability — see `ssh_common::verify_ssh_ecdsa`).
 //!
 //! All SSH wire-format parsing and signature verification is delegated to
 //! [`crate::precompiles::ssh_common`] so this precompile and `0x0698` share a
@@ -33,7 +37,7 @@
 use alloy_primitives::{Address, Bytes, address};
 use revm::precompile::{Precompile, PrecompileId, PrecompileOutput, PrecompileResult};
 
-use super::ssh_common::{read_ssh_string, verify_ssh_ed25519, verify_ssh_rsa};
+use super::ssh_common::{read_ssh_string, verify_ssh_ecdsa, verify_ssh_ed25519, verify_ssh_rsa};
 
 /// SSH verify precompile address.
 pub const SSH_VERIFY_ADDRESS: Address = address!("0x0000000000000000000000000000000000000697");
@@ -225,6 +229,15 @@ fn run_verification(public_key: &[u8], signature: &[u8], message: &[u8]) -> bool
     match key_type {
         b"ssh-ed25519" => verify_ssh_ed25519(public_key, key_offset, message, sig_algo, sig_blob),
         b"ssh-rsa" => verify_ssh_rsa(public_key, key_offset, message, sig_algo, sig_blob),
+        // ECDSA dispatch: the inner verify fn decides which of the three
+        // NIST curves to use based on sig_algo (cross-gated against
+        // key_type by the match arm here and against the embedded
+        // curve_name inside `verify_ssh_ecdsa`).
+        b"ecdsa-sha2-nistp256"
+        | b"ecdsa-sha2-nistp384"
+        | b"ecdsa-sha2-nistp521" => {
+            verify_ssh_ecdsa(public_key, key_offset, message, sig_algo, sig_blob)
+        }
         _ => false,
     }
 }
@@ -721,6 +734,132 @@ mod tests {
         let gas = required_gas(&input);
         let result = ssh_verify_run(&input, gas);
         assert_precompile_ok(&result, gas, SUCCESS_HEX);
+    }
+
+    // === ECDSA dispatch tests (runtime-signed end-to-end) ===
+    //
+    // Each test signs a 32-byte message with a freshly-generated ECDSA
+    // keypair on the named curve, wire-format encodes the result the same
+    // way OpenSSH does, and runs it through the precompile end-to-end.
+    // Proves the new dispatch arms (`b"ecdsa-sha2-nistp{256,384,521}"`) in
+    // `run_verification` are reachable and produce the expected accept
+    // signal. The cross-gate / low-S / canonical-encoding tests for the
+    // primitive itself live in `ssh_common.rs` next to the shared helper.
+
+    fn build_ecdsa_pubkey_blob_local(key_type: &[u8], curve_name: &[u8], q: &[u8]) -> Vec<u8> {
+        [ssh_wire_string(key_type), ssh_wire_string(curve_name), ssh_wire_string(q)].concat()
+    }
+
+    fn build_ecdsa_sig_blob_local(r: &[u8], s: &[u8]) -> Vec<u8> {
+        // RFC 5656 §3.1.2: the sig_blob is itself an SSH-encoded stream of
+        // mpint(r) || mpint(s) — we use `ssh_wire_mpint` to get canonical
+        // padding (prepend 0x00 if high bit set).
+        [ssh_wire_mpint(r), ssh_wire_mpint(s)].concat()
+    }
+
+    #[test]
+    fn test_ssh_verify_ecdsa_nistp256_round_trip() {
+        use rand_08::SeedableRng;
+        use signature::Signer;
+        use p256::ecdsa::{Signature, SigningKey};
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+        let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
+        let signing_key = SigningKey::random(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        let q_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+
+        let message = [0xAAu8; 32];
+        let sig: Signature = signing_key.sign(&message);
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let (r, s) = sig.split_bytes();
+
+        let pub_blob =
+            build_ecdsa_pubkey_blob_local(b"ecdsa-sha2-nistp256", b"nistp256", &q_bytes);
+        let sig_inner = build_ecdsa_sig_blob_local(&r, &s);
+        let sig_blob = build_signature_blob(b"ecdsa-sha2-nistp256", &sig_inner);
+        let input = encode_ssh_verify_input(&message, &pub_blob, &sig_blob);
+        let gas = required_gas(&input);
+        assert_precompile_ok(&ssh_verify_run(&input, gas), gas, SUCCESS_HEX);
+    }
+
+    #[test]
+    fn test_ssh_verify_ecdsa_nistp384_round_trip() {
+        use rand_08::SeedableRng;
+        use signature::Signer;
+        use p384::ecdsa::{Signature, SigningKey};
+        use p384::elliptic_curve::sec1::ToEncodedPoint;
+
+        let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
+        let signing_key = SigningKey::random(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        let q_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+
+        let message = [0xAAu8; 32];
+        let sig: Signature = signing_key.sign(&message);
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let (r, s) = sig.split_bytes();
+
+        let pub_blob =
+            build_ecdsa_pubkey_blob_local(b"ecdsa-sha2-nistp384", b"nistp384", &q_bytes);
+        let sig_inner = build_ecdsa_sig_blob_local(&r, &s);
+        let sig_blob = build_signature_blob(b"ecdsa-sha2-nistp384", &sig_inner);
+        let input = encode_ssh_verify_input(&message, &pub_blob, &sig_blob);
+        let gas = required_gas(&input);
+        assert_precompile_ok(&ssh_verify_run(&input, gas), gas, SUCCESS_HEX);
+    }
+
+    #[test]
+    fn test_ssh_verify_ecdsa_nistp521_round_trip() {
+        use rand_08::SeedableRng;
+        use signature::Signer;
+        use p521::ecdsa::{Signature, SigningKey, VerifyingKey};
+        use p521::elliptic_curve::sec1::ToEncodedPoint;
+
+        let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
+        let signing_key = SigningKey::random(&mut rng);
+        let verifying_key = VerifyingKey::from(&signing_key);
+        let q_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+
+        let message = [0xAAu8; 32];
+        let sig: Signature = signing_key.sign(&message);
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let (r, s) = sig.split_bytes();
+
+        let pub_blob =
+            build_ecdsa_pubkey_blob_local(b"ecdsa-sha2-nistp521", b"nistp521", &q_bytes);
+        let sig_inner = build_ecdsa_sig_blob_local(&r, &s);
+        let sig_blob = build_signature_blob(b"ecdsa-sha2-nistp521", &sig_inner);
+        let input = encode_ssh_verify_input(&message, &pub_blob, &sig_blob);
+        let gas = required_gas(&input);
+        assert_precompile_ok(&ssh_verify_run(&input, gas), gas, SUCCESS_HEX);
+    }
+
+    #[test]
+    fn test_ssh_verify_ecdsa_nistp256_wrong_message_rejects() {
+        use rand_08::SeedableRng;
+        use signature::Signer;
+        use p256::ecdsa::{Signature, SigningKey};
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+        let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
+        let signing_key = SigningKey::random(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        let q_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+
+        let message = [0xAAu8; 32];
+        let sig: Signature = signing_key.sign(&message);
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let (r, s) = sig.split_bytes();
+
+        let pub_blob =
+            build_ecdsa_pubkey_blob_local(b"ecdsa-sha2-nistp256", b"nistp256", &q_bytes);
+        let sig_inner = build_ecdsa_sig_blob_local(&r, &s);
+        let sig_blob = build_signature_blob(b"ecdsa-sha2-nistp256", &sig_inner);
+        let mut input = encode_ssh_verify_input(&message, &pub_blob, &sig_blob);
+        input[0] ^= 0xFF; // tamper the ABI message slot
+        let gas = required_gas(&input);
+        assert_precompile_ok(&ssh_verify_run(&input, gas), gas, FAILURE_HEX);
     }
 
     // === Helper: ABI-encode SSH verify input ===

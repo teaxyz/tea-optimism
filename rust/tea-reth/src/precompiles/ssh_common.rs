@@ -231,6 +231,223 @@ pub fn verify_ssh_rsa(
     }
 }
 
+/// Verify an SSH ECDSA signature against `message`, per RFC 5656.
+///
+/// `pub_key_data` is the full SSH wire-format public key blob; `offset` is the
+/// position immediately after the `key_type` string (same convention as
+/// [`verify_ssh_rsa`]). `sig_algo` and `sig_blob` are the two strings parsed
+/// from the SSH signature wire format.
+///
+/// # Wire formats (RFC 5656)
+///
+/// Public key (after the consumed `key_type`):
+/// ```text
+///   string("nistpXXX")           ← embedded curve name; cross-gated below
+///   string(Q)                    ← uncompressed SEC1 point: 0x04 || X || Y
+/// ```
+///
+/// Signature blob (RFC 5656 §3.1.2): the blob is itself SSH-wire-encoded:
+/// ```text
+///   mpint(r) mpint(s)
+/// ```
+///
+/// # Security gates
+///
+/// - **Algorithm cross-gate**: `sig_algo` must match `key_type` exactly — an
+///   ecdsa-sha2-nistp256 key cannot verify an ecdsa-sha2-nistp384 signature
+///   even if the embedded SEC1 point happens to decode under both curves.
+/// - **Curve-name cross-gate**: the second string in the pubkey blob is the
+///   embedded curve name ("nistp256" / "nistp384" / "nistp521") and must
+///   agree with the algorithm suffix. RFC 5656 §3.1 mandates this; without
+///   the check, a pubkey with `key_type=ecdsa-sha2-nistp256` but
+///   `curve_name=nistp384` could pass.
+/// - **Trailing-byte rejection** on the pubkey blob — same
+///   identity-derivation footgun rationale as [`verify_ssh_ed25519`] /
+///   [`verify_ssh_rsa`].
+/// - **Strict canonical mpint** on both `r` and `s` via [`strip_mpint_pad`].
+/// - **Low-S enforcement** (BIP-62 style): reject any signature where
+///   `S > n/2`. ECDSA admits two valid `s` values for each `(r, message)`
+///   pair (`s` and `n - s`), so accepting both forms is a signature-
+///   malleability footgun — we reject the non-canonical high-S form rather
+///   than silently normalising it, so callers that hash signature bytes to
+///   derive identity cannot be tricked into seeing two distinct "valid"
+///   signatures for the same `(pubkey, message)`.
+pub fn verify_ssh_ecdsa(
+    pub_key_data: &[u8],
+    offset: usize,
+    message: &[u8],
+    sig_algo: &[u8],
+    sig_blob: &[u8],
+) -> bool {
+    // Algorithm cross-gate + curve-name dispatch in one match. Each arm
+    // pins the expected curve_name suffix and the SEC1 uncompressed-point
+    // length so a sig_algo + key_type match cannot also accept a Q from a
+    // different curve.
+    let mut key_offset = offset;
+    let curve_name = match read_ssh_string(pub_key_data, &mut key_offset) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let q_bytes = match read_ssh_string(pub_key_data, &mut key_offset) {
+        Ok(q) => q,
+        Err(_) => return false,
+    };
+
+    // Reject trailing bytes in the SSH wire-format pubkey blob — same
+    // rationale as in verify_ssh_ed25519 / verify_ssh_rsa above.
+    if key_offset != pub_key_data.len() {
+        return false;
+    }
+
+    // Parse mpint(r), mpint(s) from the inner signature blob and reject any
+    // trailing bytes there as well — the SSHSIG / SSH primitive wire format
+    // gives the sig_blob string an exact length, so a well-formed signer
+    // never produces trailing bytes.
+    let mut sig_offset = 0usize;
+    let r_bytes = match read_ssh_string(sig_blob, &mut sig_offset) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let s_bytes = match read_ssh_string(sig_blob, &mut sig_offset) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    if sig_offset != sig_blob.len() {
+        return false;
+    }
+    let r_unpadded = match strip_mpint_pad(r_bytes) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let s_unpadded = match strip_mpint_pad(s_bytes) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+
+    match sig_algo {
+        b"ecdsa-sha2-nistp256" => {
+            if curve_name != b"nistp256" {
+                return false;
+            }
+            verify_ecdsa_p256(q_bytes, message, r_unpadded, s_unpadded)
+        }
+        b"ecdsa-sha2-nistp384" => {
+            if curve_name != b"nistp384" {
+                return false;
+            }
+            verify_ecdsa_p384(q_bytes, message, r_unpadded, s_unpadded)
+        }
+        b"ecdsa-sha2-nistp521" => {
+            if curve_name != b"nistp521" {
+                return false;
+            }
+            verify_ecdsa_p521(q_bytes, message, r_unpadded, s_unpadded)
+        }
+        _ => false,
+    }
+}
+
+/// Pack `r_unpadded` / `s_unpadded` into a fixed-width big-endian buffer of
+/// `field_bytes` per scalar, left-padding with zeros. ECDSA `Signature::from_scalars`
+/// expects exactly `field_bytes`-wide inputs; mpint stripping leaves a value
+/// whose byte length is in `[0, field_bytes]`. Returns `None` if either scalar
+/// exceeds the field width (which would mean a non-canonical input — the SSH
+/// mpint should have been the minimal canonical encoding).
+fn pad_scalars(
+    r_unpadded: &[u8],
+    s_unpadded: &[u8],
+    field_bytes: usize,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    if r_unpadded.len() > field_bytes || s_unpadded.len() > field_bytes {
+        return None;
+    }
+    let mut r_padded = vec![0u8; field_bytes];
+    let mut s_padded = vec![0u8; field_bytes];
+    r_padded[field_bytes - r_unpadded.len()..].copy_from_slice(r_unpadded);
+    s_padded[field_bytes - s_unpadded.len()..].copy_from_slice(s_unpadded);
+    Some((r_padded, s_padded))
+}
+
+/// Verify ECDSA on P-256 with SHA-256.
+fn verify_ecdsa_p256(q_bytes: &[u8], message: &[u8], r: &[u8], s: &[u8]) -> bool {
+    use p256::ecdsa::{Signature, VerifyingKey};
+    let verifying_key = match VerifyingKey::from_sec1_bytes(q_bytes) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    let (r_padded, s_padded) = match pad_scalars(r, s, 32) {
+        Some(pair) => pair,
+        None => return false,
+    };
+    let mut sig_bytes = [0u8; 64];
+    sig_bytes[..32].copy_from_slice(&r_padded);
+    sig_bytes[32..].copy_from_slice(&s_padded);
+    let signature = match Signature::from_slice(&sig_bytes) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    // Low-S enforcement: reject non-canonical high-S sigs rather than
+    // silently normalising — see the function-level doc above for why.
+    if signature.normalize_s().is_some() {
+        return false;
+    }
+    // `Verifier::verify` on a `VerifyingKey<NistP256>` takes the raw
+    // message and hashes with SHA-256 internally (per RFC 6979 / RFC 5656).
+    SignatureVerifier::verify(&verifying_key, message, &signature).is_ok()
+}
+
+/// Verify ECDSA on P-384 with SHA-384.
+fn verify_ecdsa_p384(q_bytes: &[u8], message: &[u8], r: &[u8], s: &[u8]) -> bool {
+    use p384::ecdsa::{Signature, VerifyingKey};
+    let verifying_key = match VerifyingKey::from_sec1_bytes(q_bytes) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    let (r_padded, s_padded) = match pad_scalars(r, s, 48) {
+        Some(pair) => pair,
+        None => return false,
+    };
+    let mut sig_bytes = [0u8; 96];
+    sig_bytes[..48].copy_from_slice(&r_padded);
+    sig_bytes[48..].copy_from_slice(&s_padded);
+    let signature = match Signature::from_slice(&sig_bytes) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if signature.normalize_s().is_some() {
+        return false;
+    }
+    SignatureVerifier::verify(&verifying_key, message, &signature).is_ok()
+}
+
+/// Verify ECDSA on P-521 with SHA-512.
+///
+/// Note P-521's field is 521 bits, so each scalar is 66 bytes (the high byte
+/// has only 1 bit used). A canonical mpint of `r` or `s` therefore lands in
+/// `[0, 66]` bytes — `pad_scalars` handles the left-pad to exactly 66.
+fn verify_ecdsa_p521(q_bytes: &[u8], message: &[u8], r: &[u8], s: &[u8]) -> bool {
+    use p521::ecdsa::{Signature, VerifyingKey};
+    let verifying_key = match VerifyingKey::from_sec1_bytes(q_bytes) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    let (r_padded, s_padded) = match pad_scalars(r, s, 66) {
+        Some(pair) => pair,
+        None => return false,
+    };
+    let mut sig_bytes = [0u8; 132];
+    sig_bytes[..66].copy_from_slice(&r_padded);
+    sig_bytes[66..].copy_from_slice(&s_padded);
+    let signature = match Signature::from_slice(&sig_bytes) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if signature.normalize_s().is_some() {
+        return false;
+    }
+    SignatureVerifier::verify(&verifying_key, message, &signature).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,5 +845,308 @@ mod tests {
         // Overwrite the S half (bytes 32..64). The original sig's R stays.
         sig[32..64].copy_from_slice(&curve_order_le);
         assert!(!verify_ssh_ed25519(&pub_blob, o, message, &algo, &sig));
+    }
+
+    // ─────────────────────────────────────────── verify_ssh_ecdsa
+
+    /// Build an SSH wire-format ECDSA public key blob:
+    ///   string(key_type) + string(curve_name) + string(Q)
+    fn build_ecdsa_pubkey_blob(key_type: &[u8], curve_name: &[u8], q: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_ssh_string(&mut out, key_type);
+        write_ssh_string(&mut out, curve_name);
+        write_ssh_string(&mut out, q);
+        out
+    }
+
+    /// Build an SSH wire-format ECDSA signature blob:
+    ///   mpint(r) || mpint(s)
+    /// (RFC 5656 §3.1.2 — the blob is itself an SSH-encoded stream.)
+    fn build_ecdsa_sig_blob(r_be: &[u8], s_be: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_ssh_mpint(&mut out, r_be);
+        write_ssh_mpint(&mut out, s_be);
+        out
+    }
+
+    /// Sign `message` with a freshly-generated P-256 keypair, returning
+    /// `(pubkey_blob, sig_algo, sig_blob)` in the same shape as the other
+    /// `sign_*` helpers. The blobs are exactly what a real `ssh-keygen` /
+    /// OpenSSH would emit for this curve.
+    fn sign_ecdsa_nistp256(message: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        use signature::Signer as EcdsaSigner;
+        use p256::ecdsa::{Signature, SigningKey};
+
+        let mut rng = rand_08::rngs::StdRng::from_seed_helper();
+        let signing_key = SigningKey::random(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        let q_point = verifying_key.to_encoded_point(false); // uncompressed
+        let q_bytes = q_point.as_bytes().to_vec();
+
+        let signature: Signature = signing_key.sign(message);
+        // Normalise to low-S to ensure verify accepts (sign() can emit either form).
+        let signature = signature.normalize_s().unwrap_or(signature);
+        let (r, s) = signature.split_bytes();
+
+        let pub_blob =
+            build_ecdsa_pubkey_blob(b"ecdsa-sha2-nistp256", b"nistp256", &q_bytes);
+        let sig_blob = build_ecdsa_sig_blob(&r, &s);
+        (pub_blob, b"ecdsa-sha2-nistp256".to_vec(), sig_blob)
+    }
+
+    fn sign_ecdsa_nistp384(message: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        use signature::Signer as EcdsaSigner;
+        use p384::ecdsa::{Signature, SigningKey};
+
+        let mut rng = rand_08::rngs::StdRng::from_seed_helper();
+        let signing_key = SigningKey::random(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        let q_point = verifying_key.to_encoded_point(false);
+        let q_bytes = q_point.as_bytes().to_vec();
+
+        let signature: Signature = signing_key.sign(message);
+        let signature = signature.normalize_s().unwrap_or(signature);
+        let (r, s) = signature.split_bytes();
+
+        let pub_blob =
+            build_ecdsa_pubkey_blob(b"ecdsa-sha2-nistp384", b"nistp384", &q_bytes);
+        let sig_blob = build_ecdsa_sig_blob(&r, &s);
+        (pub_blob, b"ecdsa-sha2-nistp384".to_vec(), sig_blob)
+    }
+
+    fn sign_ecdsa_nistp521(message: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        use signature::Signer as EcdsaSigner;
+        use p521::ecdsa::{Signature, SigningKey, VerifyingKey};
+
+        let mut rng = rand_08::rngs::StdRng::from_seed_helper();
+        let signing_key = SigningKey::random(&mut rng);
+        // p521 0.13.3 gates `SigningKey::verifying_key` behind a non-existent
+        // `verifying` feature — work around by going through the From impl.
+        let verifying_key = VerifyingKey::from(&signing_key);
+        let q_point = verifying_key.to_encoded_point(false);
+        let q_bytes = q_point.as_bytes().to_vec();
+
+        let signature: Signature = signing_key.sign(message);
+        let signature = signature.normalize_s().unwrap_or(signature);
+        let (r, s) = signature.split_bytes();
+
+        let pub_blob =
+            build_ecdsa_pubkey_blob(b"ecdsa-sha2-nistp521", b"nistp521", &q_bytes);
+        let sig_blob = build_ecdsa_sig_blob(&r, &s);
+        (pub_blob, b"ecdsa-sha2-nistp521".to_vec(), sig_blob)
+    }
+
+    /// Shim for the deterministic seed used across all sign_* helpers, so
+    /// CI runs are reproducible. Mirrors the `[7u8; 32]` pattern.
+    trait FromSeedHelper {
+        fn from_seed_helper() -> rand_08::rngs::StdRng;
+    }
+    impl FromSeedHelper for rand_08::rngs::StdRng {
+        fn from_seed_helper() -> rand_08::rngs::StdRng {
+            use rand_08::SeedableRng;
+            rand_08::rngs::StdRng::from_seed([7u8; 32])
+        }
+    }
+
+    #[test]
+    fn verify_ssh_ecdsa_p256_round_trip() {
+        let message = b"hello p256";
+        let (pub_blob, algo, sig) = sign_ecdsa_nistp256(message);
+        let mut o = 0usize;
+        let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
+        assert!(verify_ssh_ecdsa(&pub_blob, o, message, &algo, &sig));
+    }
+
+    #[test]
+    fn verify_ssh_ecdsa_p384_round_trip() {
+        let message = b"hello p384";
+        let (pub_blob, algo, sig) = sign_ecdsa_nistp384(message);
+        let mut o = 0usize;
+        let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
+        assert!(verify_ssh_ecdsa(&pub_blob, o, message, &algo, &sig));
+    }
+
+    #[test]
+    fn verify_ssh_ecdsa_p521_round_trip() {
+        let message = b"hello p521";
+        let (pub_blob, algo, sig) = sign_ecdsa_nistp521(message);
+        let mut o = 0usize;
+        let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
+        assert!(verify_ssh_ecdsa(&pub_blob, o, message, &algo, &sig));
+    }
+
+    #[test]
+    fn verify_ssh_ecdsa_p256_rejects_tampered_message() {
+        let message = b"hello p256";
+        let (pub_blob, algo, sig) = sign_ecdsa_nistp256(message);
+        let mut o = 0usize;
+        let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
+        let mut bad = message.to_vec();
+        bad[0] ^= 0xFF;
+        assert!(!verify_ssh_ecdsa(&pub_blob, o, &bad, &algo, &sig));
+    }
+
+    #[test]
+    fn verify_ssh_ecdsa_p384_rejects_tampered_message() {
+        let message = b"hello p384";
+        let (pub_blob, algo, sig) = sign_ecdsa_nistp384(message);
+        let mut o = 0usize;
+        let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
+        let mut bad = message.to_vec();
+        bad[0] ^= 0xFF;
+        assert!(!verify_ssh_ecdsa(&pub_blob, o, &bad, &algo, &sig));
+    }
+
+    #[test]
+    fn verify_ssh_ecdsa_p521_rejects_tampered_message() {
+        let message = b"hello p521";
+        let (pub_blob, algo, sig) = sign_ecdsa_nistp521(message);
+        let mut o = 0usize;
+        let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
+        let mut bad = message.to_vec();
+        bad[0] ^= 0xFF;
+        assert!(!verify_ssh_ecdsa(&pub_blob, o, &bad, &algo, &sig));
+    }
+
+    #[test]
+    fn verify_ssh_ecdsa_rejects_algo_mismatch_with_rsa() {
+        // P-256 key, sig_algo labelled rsa-sha2-256 → algo cross-gate rejects.
+        let message = b"hello p256";
+        let (pub_blob, _algo, sig) = sign_ecdsa_nistp256(message);
+        let mut o = 0usize;
+        let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
+        assert!(!verify_ssh_ecdsa(&pub_blob, o, message, b"rsa-sha2-256", &sig));
+    }
+
+    #[test]
+    fn verify_ssh_ecdsa_rejects_cross_curve_algo() {
+        // P-256 key, sig_algo claims ecdsa-sha2-nistp384 → curve-name
+        // cross-gate inside verify_ssh_ecdsa rejects (the embedded
+        // curve_name "nistp256" doesn't match the sig_algo's "nistp384"
+        // suffix).
+        let message = b"hello p256";
+        let (pub_blob, _algo, sig) = sign_ecdsa_nistp256(message);
+        let mut o = 0usize;
+        let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
+        assert!(!verify_ssh_ecdsa(
+            &pub_blob,
+            o,
+            message,
+            b"ecdsa-sha2-nistp384",
+            &sig,
+        ));
+    }
+
+    #[test]
+    fn verify_ssh_ecdsa_rejects_mismatched_embedded_curve_name() {
+        // Forge a pubkey blob whose key_type says ecdsa-sha2-nistp256 but
+        // whose embedded curve_name says "nistp384" — curve-name cross-gate
+        // must reject.
+        use signature::Signer as EcdsaSigner;
+        use p256::ecdsa::{Signature, SigningKey};
+
+        let mut rng = rand_08::rngs::StdRng::from_seed_helper();
+        let signing_key = SigningKey::random(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        let q_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+
+        let message = b"forge curve_name";
+        let signature: Signature = signing_key.sign(message);
+        let signature = signature.normalize_s().unwrap_or(signature);
+        let (r, s) = signature.split_bytes();
+
+        // key_type = nistp256, but curve_name = "nistp384" (lie).
+        let pub_blob =
+            build_ecdsa_pubkey_blob(b"ecdsa-sha2-nistp256", b"nistp384", &q_bytes);
+        let sig_blob = build_ecdsa_sig_blob(&r, &s);
+        let mut o = 0usize;
+        let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
+        assert!(!verify_ssh_ecdsa(
+            &pub_blob,
+            o,
+            message,
+            b"ecdsa-sha2-nistp256",
+            &sig_blob,
+        ));
+    }
+
+    #[test]
+    fn verify_ssh_ecdsa_rejects_trailing_pubkey_bytes() {
+        // Append a stray byte after the canonical pubkey blob — the
+        // trailing-byte gate in verify_ssh_ecdsa must reject.
+        let message = b"hello p256";
+        let (mut pub_blob, algo, sig) = sign_ecdsa_nistp256(message);
+        pub_blob.push(0xAB);
+        let mut o = 0usize;
+        let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
+        assert!(!verify_ssh_ecdsa(&pub_blob, o, message, &algo, &sig));
+    }
+
+    #[test]
+    fn verify_ssh_ecdsa_rejects_trailing_sig_blob_bytes() {
+        // Append a stray byte after the canonical mpint(r)||mpint(s) — the
+        // trailing-byte gate inside the inner sig_blob parse must reject.
+        let message = b"hello p256";
+        let (pub_blob, algo, mut sig) = sign_ecdsa_nistp256(message);
+        sig.push(0xAB);
+        let mut o = 0usize;
+        let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
+        assert!(!verify_ssh_ecdsa(&pub_blob, o, message, &algo, &sig));
+    }
+
+    #[test]
+    fn verify_ssh_ecdsa_p256_rejects_high_s_form() {
+        // Construct the high-S variant of a valid low-S signature. ECDSA
+        // admits two valid `s` for every `(r, message)` pair (`s` and
+        // `n - s`); we reject the non-canonical high-S form to prevent
+        // signature malleability — accepting both would let a caller that
+        // hashes signature bytes off-chain to derive identity see two
+        // distinct "valid" sigs for the same `(pubkey, message)`.
+        use signature::Signer as EcdsaSigner;
+        use p256::ecdsa::{Signature, SigningKey};
+
+        let mut rng = rand_08::rngs::StdRng::from_seed_helper();
+        let signing_key = SigningKey::random(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        let q_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+
+        let message = b"high-s malleability";
+        let low_s_sig: Signature = signing_key.sign(message);
+        let low_s_sig = low_s_sig.normalize_s().unwrap_or(low_s_sig);
+        // Flip to high-S by negating the scalar: high-S = -low_s_sig.
+        // `Signature::normalize_s` returns None when already low; calling
+        // `normalize_s` on the high-S form gives back the low-S, so the
+        // pair (sig, sig_minus_s) is exactly {low, high}.
+        let (r_scalar, s_scalar) = low_s_sig.split_scalars();
+        let high_s_scalar = -*s_scalar;
+        let high_s_sig = Signature::from_scalars(r_scalar.to_bytes(), high_s_scalar.to_bytes())
+            .expect("from_scalars constructs a valid high-S signature");
+        assert!(
+            high_s_sig.normalize_s().is_some(),
+            "constructed signature must be the high-S form"
+        );
+
+        // Sanity check: the high-S signature is mathematically valid (the
+        // bare ECDSA algorithm accepts both forms; only our strict-mode
+        // wrapper rejects it).
+        use signature::Verifier as EcdsaVerifier;
+        assert!(verifying_key.verify(message, &high_s_sig).is_ok());
+
+        let (r, s) = high_s_sig.split_bytes();
+        let pub_blob =
+            build_ecdsa_pubkey_blob(b"ecdsa-sha2-nistp256", b"nistp256", &q_bytes);
+        let sig_blob = build_ecdsa_sig_blob(&r, &s);
+        let mut o = 0usize;
+        let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
+        assert!(
+            !verify_ssh_ecdsa(
+                &pub_blob,
+                o,
+                message,
+                b"ecdsa-sha2-nistp256",
+                &sig_blob,
+            ),
+            "high-S signature must be rejected to prevent malleability"
+        );
     }
 }
