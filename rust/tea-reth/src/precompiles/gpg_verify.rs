@@ -35,7 +35,8 @@
 //! belongs at the policy layer, not buried in a verification precompile.
 
 use alloy_primitives::{Address, Bytes, address};
-use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey};
+use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey, SignedPublicSubKey};
+use pgp::packet::SignatureType;
 use pgp::types::KeyDetails;
 use revm::precompile::{Precompile, PrecompileId, PrecompileOutput, PrecompileResult};
 use std::io::Cursor;
@@ -86,6 +87,35 @@ fn fingerprint_to_key_id(fp: &pgp::types::Fingerprint) -> [u8; 8] {
         id.copy_from_slice(&bytes[bytes.len() - 8..]);
     }
     id
+}
+
+/// Parse exactly one OpenPGP object from `bytes`, rejecting empty or
+/// multi-object streams.
+///
+/// `Deserializable::from_bytes` silently returns only the *first* object in a
+/// stream, so an attacker can append additional key or signature objects to a
+/// blob and have them ignored — producing multiple distinct byte strings that
+/// all verify identically (TEAO1-172). Requiring exactly one object removes that
+/// ambiguity: the verified bytes are the only bytes.
+fn parse_single<T: Deserializable>(bytes: &[u8]) -> Result<T, &'static str> {
+    let mut iter = T::from_bytes_many(Cursor::new(bytes)).map_err(|_| "parse error")?;
+    let first = match iter.next() {
+        Some(Ok(obj)) => obj,
+        _ => return Err("no parseable object"),
+    };
+    if iter.next().is_some() {
+        return Err("trailing object");
+    }
+    Ok(first)
+}
+
+/// Whether a subkey advertises signing capability in any of its binding
+/// signatures. An encryption-only subkey must never be elevated into a signing
+/// authority (TEAO1-160). The binding signatures consulted here are the same
+/// ones validated by [`SignedPublicSubKey::verify_bindings`], so a forged flag
+/// cannot pass without also forging the primary's binding signature.
+fn subkey_can_sign(sk: &SignedPublicSubKey) -> bool {
+    sk.signatures.iter().any(|sig| sig.key_flags().sign())
 }
 
 /// Decoded GPG verify precompile input.
@@ -177,8 +207,8 @@ fn gpg_verify_run(input: &[u8], gas_limit: u64) -> PrecompileResult {
         }
     };
 
-    // Parse public key
-    let pub_key = match SignedPublicKey::from_bytes(Cursor::new(&pub_key_bytes)) {
+    // Parse public key — reject empty or multi-object streams (TEAO1-172).
+    let pub_key: SignedPublicKey = match parse_single(&pub_key_bytes) {
         Ok(key) => key,
         Err(_) => {
             return PrecompileResult::Err(revm::precompile::PrecompileError::Other(
@@ -187,22 +217,35 @@ fn gpg_verify_run(input: &[u8], gas_limit: u64) -> PrecompileResult {
         }
     };
 
-    // Check key ID — the expected key ID must match the primary key or one of its subkeys.
-    // This mirrors Go's gopenpgp behavior where NewKeyRing creates a ring from the full key.
     let primary_id = fingerprint_to_key_id(&pub_key.fingerprint());
+
+    // Determine which subkeys may act as signing authorities. A subkey is only
+    // eligible if its binding to the primary is cryptographically valid
+    // (TEAO1-141 — a grafted subkey from another cert has no valid binding) AND
+    // it advertises signing capability (TEAO1-160 — an encryption-only subkey
+    // must not sign).
+    let eligible_subkeys: Vec<&SignedPublicSubKey> = pub_key
+        .public_subkeys
+        .iter()
+        .filter(|sk| sk.verify_bindings(&pub_key.primary_key).is_ok() && subkey_can_sign(sk))
+        .collect();
+
+    // Key-ID membership gate: the claimed key ID must name the primary key or
+    // one of its subkeys. This is an early rejection for inputs whose key ID is
+    // absent from the certificate; the binding security property is enforced at
+    // verification below, where the key that verifies must be the claimed one.
     let any_subkey_matches = pub_key
         .public_subkeys
         .iter()
         .any(|sk| fingerprint_to_key_id(&sk.fingerprint()) == expected_key_id);
-
     if primary_id != expected_key_id && !any_subkey_matches {
         return PrecompileResult::Err(revm::precompile::PrecompileError::Other(
             "public key and key id do not match".into(),
         ));
     }
 
-    // Parse detached signature
-    let sig = match DetachedSignature::from_bytes(Cursor::new(&sig_bytes)) {
+    // Parse detached signature — reject empty or multi-object streams (TEAO1-172).
+    let sig: DetachedSignature = match parse_single(&sig_bytes) {
         Ok(sig) => sig,
         Err(_) => {
             return PrecompileResult::Err(revm::precompile::PrecompileError::Other(
@@ -211,10 +254,24 @@ fn gpg_verify_run(input: &[u8], gas_limit: u64) -> PrecompileResult {
         }
     };
 
-    // Verify signature — try primary key and all subkeys (mirrors Go's keyring behavior).
-    // The signature's embedded issuer determines which key actually verifies it.
-    let verified = sig.verify(&pub_key, &message).is_ok()
-        || pub_key.public_subkeys.iter().any(|sk| sig.verify(sk, &message).is_ok());
+    // Only Binary-class signatures bind the exact 32-byte message. Text
+    // signatures canonicalize line endings, so distinct byte strings collide
+    // (TEAO1-166); Timestamp and Standalone signatures bind no message data at
+    // all (TEAO1-148). Reject everything but Binary.
+    if sig.signature.typ() != Some(SignatureType::Binary) {
+        return PrecompileResult::Ok(PrecompileOutput::new(gas_cost, failure_result()));
+    }
+
+    // Verify, binding the verifying key to the claimed key ID (TEAO1-144): the
+    // signature only counts if the key whose ID the caller claimed is the key
+    // that actually verifies it — the primary key, or an eligible signing
+    // subkey carrying that ID. A signature from a sibling key (different ID in
+    // the same cert) no longer satisfies a claim about another key.
+    let verified = (primary_id == expected_key_id && sig.verify(&pub_key, &message).is_ok())
+        || eligible_subkeys.iter().any(|sk| {
+            fingerprint_to_key_id(&sk.fingerprint()) == expected_key_id
+                && sig.verify(sk, &message).is_ok()
+        });
 
     if verified {
         PrecompileResult::Ok(PrecompileOutput::new(gas_cost, success_result()))
@@ -333,14 +390,62 @@ mod tests {
     }
 
     /// Ported from: `TestPrecompiledGPGVerify_LongInput` (contracts_test.go:609)
-    /// 9504-byte input (RSA, large key), gas=123340, expected=0x01 (valid)
-    /// Gas = 23500 + (9504-3264)*16 = 123340
+    /// 9504-byte input (RSA, large key), expected=0x01 (valid).
+    ///
+    /// This fixture is signed by a signing **subkey**, not the primary key. The
+    /// original tea-geth vector declared the *primary* key ID and still accepted
+    /// it, but that is exactly the loose behavior TEAO1-144 closes: the precompile
+    /// now requires the claimed key ID to name the key that actually signed. So we
+    /// declare the truthful issuer (the signing subkey's ID) and assert success —
+    /// proving a correctly-attributed subkey signature still verifies. (The
+    /// rejection of the primary-ID claim is covered by
+    /// `test_gpg_verify_subkey_signed_cannot_claim_primary_id`.)
     #[test]
     fn test_gpg_verify_long_input() {
         let input = hex_decode(LONG_INPUT);
         assert_eq!(input.len(), 9504);
-        let result = gpg_verify_run(&input, 123_340);
-        assert_precompile_ok(&result, 123_340, SUCCESS_HEX);
+        let decoded = decode_input(&input).expect("decode ok");
+        let pub_key =
+            SignedPublicKey::from_bytes(Cursor::new(&decoded.public_key)).expect("valid key");
+        let sig =
+            DetachedSignature::from_bytes(Cursor::new(&decoded.signature)).expect("valid sig");
+
+        // Identify the subkey that actually produced the signature (the issuer).
+        let signer_id = pub_key
+            .public_subkeys
+            .iter()
+            .find(|sk| sig.verify(sk, &decoded.message).is_ok())
+            .map(|sk| fingerprint_to_key_id(&sk.fingerprint()))
+            .expect("a signing subkey verifies the long-input signature");
+
+        let truthful =
+            encode_gpg_verify_input(&decoded.message, &signer_id, &decoded.public_key, &decoded.signature);
+        let gas = required_gas(&truthful);
+        let result = gpg_verify_run(&truthful, gas);
+        assert_precompile_ok(&result, gas, SUCCESS_HEX);
+    }
+
+    /// TEAO1-144 regression: the long-input fixture is signed by a subkey. A
+    /// caller must not be able to claim the **primary** key's ID (a sibling of
+    /// the actual signer in the same certificate) for that signature. The
+    /// original fixture bytes declare exactly the primary ID, so they are a real
+    /// vector for this attack and must now return `bytes32(0)`.
+    #[test]
+    fn test_gpg_verify_subkey_signed_cannot_claim_primary_id() {
+        let input = hex_decode(LONG_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+        let pub_key =
+            SignedPublicKey::from_bytes(Cursor::new(&decoded.public_key)).expect("valid key");
+        let primary_id = fingerprint_to_key_id(&pub_key.fingerprint());
+        assert_eq!(decoded.key_id, primary_id, "fixture declares the primary key ID");
+
+        let gas = required_gas(&input);
+        let result = gpg_verify_run(&input, gas);
+        let output = result.as_ref().expect("Ok result");
+        assert!(
+            output.bytes.iter().all(|&b| b == 0),
+            "a subkey-signed signature must not verify under the primary key ID"
+        );
     }
 
     /// Ported from: `TestPrecompiledGPGVerify_LongInputOOG` (contracts_test.go:619)
@@ -566,6 +671,207 @@ mod tests {
         for sk in &pub_key.public_subkeys {
             let sk_id = fingerprint_to_key_id(&sk.fingerprint());
             assert_ne!(sk_id, primary_id, "RSA subkey ID should differ from primary");
+        }
+    }
+
+    // --- Security-fix tests (Cantina §0x0696) ---
+
+    /// Generate a fresh, deterministic ed25519 key, optionally with a signing
+    /// subkey. Used to build negative test vectors in-process (no gpg CLI).
+    fn gen_ed25519(seed: u8, signing_subkey: bool) -> pgp::composed::SignedSecretKey {
+        use pgp::composed::{KeyType, SecretKeyParamsBuilder, SubkeyParamsBuilder};
+        use rand_08::SeedableRng;
+        let mut rng = rand_08::rngs::StdRng::from_seed([seed; 32]);
+        let mut params = SecretKeyParamsBuilder::default();
+        params
+            .key_type(KeyType::Ed25519)
+            .can_certify(true)
+            .can_sign(true)
+            .primary_user_id("Test <test@example.com>".into());
+        if signing_subkey {
+            params.subkey(
+                SubkeyParamsBuilder::default()
+                    .key_type(KeyType::Ed25519)
+                    .can_sign(true)
+                    .build()
+                    .expect("subkey params"),
+            );
+        }
+        params.build().expect("key params").generate(&mut rng).expect("generate key")
+    }
+
+    /// TEAO1-172: appending a second OpenPGP object to the publicKey blob must be
+    /// rejected (the single-object guard), even though the first object is valid.
+    #[test]
+    fn test_gpg_verify_rejects_concatenated_public_key() {
+        let input = hex_decode(ED25519_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+
+        // Baseline: the single, unmodified object verifies.
+        let base = encode_gpg_verify_input(
+            &decoded.message,
+            &decoded.key_id,
+            &decoded.public_key,
+            &decoded.signature,
+        );
+        let base_res = gpg_verify_run(&base, required_gas(&base));
+        assert_precompile_ok(&base_res, required_gas(&base), SUCCESS_HEX);
+
+        // Two concatenated public-key objects must be rejected.
+        let doubled: Vec<u8> = [decoded.public_key.clone(), decoded.public_key.clone()].concat();
+        let attack =
+            encode_gpg_verify_input(&decoded.message, &decoded.key_id, &doubled, &decoded.signature);
+        let result = gpg_verify_run(&attack, required_gas(&attack));
+        assert!(
+            matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))),
+            "concatenated public-key objects must be rejected, got: {result:?}"
+        );
+    }
+
+    /// TEAO1-172: appending a second object to the signature blob must be rejected.
+    #[test]
+    fn test_gpg_verify_rejects_concatenated_signature() {
+        let input = hex_decode(ED25519_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+
+        let doubled: Vec<u8> = [decoded.signature.clone(), decoded.signature.clone()].concat();
+        let attack =
+            encode_gpg_verify_input(&decoded.message, &decoded.key_id, &decoded.public_key, &doubled);
+        let result = gpg_verify_run(&attack, required_gas(&attack));
+        assert!(
+            matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))),
+            "concatenated signature objects must be rejected, got: {result:?}"
+        );
+    }
+
+    /// TEAO1-160: the signing-eligibility filter must discriminate between
+    /// signing and non-signing subkeys. The long-input certificate contains
+    /// both, so `subkey_can_sign` must return both true and false across it —
+    /// proving the filter has teeth on a real certificate.
+    #[test]
+    fn test_eligibility_filters_non_signing_subkeys() {
+        let input = hex_decode(LONG_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+        let pub_key =
+            SignedPublicKey::from_bytes(Cursor::new(&decoded.public_key)).expect("valid key");
+        assert!(
+            pub_key.public_subkeys.iter().any(|sk| !subkey_can_sign(sk)),
+            "fixture should contain a non-signing subkey (filtered out)"
+        );
+        assert!(
+            pub_key.public_subkeys.iter().any(subkey_can_sign),
+            "fixture should contain a signing subkey (retained)"
+        );
+    }
+
+    /// TEAO1-166 / TEAO1-148: only Binary-class signatures bind the exact 32-byte
+    /// message. A Text-class detached signature over the same key/message must be
+    /// rejected by the binary-only gate (the same gate rejects Timestamp and
+    /// Standalone, which bind no message data).
+    #[test]
+    fn test_gpg_verify_rejects_text_signature() {
+        use pgp::crypto::hash::HashAlgorithm;
+        use pgp::ser::Serialize;
+        use pgp::types::Password;
+        use rand_08::SeedableRng;
+
+        let ssk = gen_ed25519(9, false);
+        let spk = ssk.to_public_key();
+        let message = [0x42u8; 32];
+        let mut rng = rand_08::rngs::StdRng::from_seed([42u8; 32]);
+        let text_sig = DetachedSignature::sign_text_data(
+            &mut rng,
+            &*ssk,
+            &Password::empty(),
+            HashAlgorithm::Sha256,
+            &message[..],
+        )
+        .expect("text sign");
+        assert_ne!(
+            text_sig.signature.typ(),
+            Some(SignatureType::Binary),
+            "control: this is a non-Binary signature"
+        );
+
+        let key_id = fingerprint_to_key_id(&spk.fingerprint());
+        let input = encode_gpg_verify_input(
+            &message,
+            &key_id,
+            &spk.to_bytes().expect("pub bytes"),
+            &text_sig.to_bytes().expect("sig bytes"),
+        );
+        let gas = required_gas(&input);
+        let output = gpg_verify_run(&input, gas).as_ref().expect("Ok").bytes.clone();
+        assert!(
+            output.iter().all(|&b| b == 0),
+            "text-mode signature must be rejected by the binary-only gate"
+        );
+    }
+
+    /// Control for the binary gate: a freshly generated Binary detached signature
+    /// over the exact 32-byte message, declared under the truthful primary key
+    /// ID, must verify. Guards against the gate over-rejecting valid signatures.
+    #[test]
+    fn test_gpg_verify_binary_signature_verifies() {
+        use pgp::crypto::hash::HashAlgorithm;
+        use pgp::ser::Serialize;
+        use pgp::types::Password;
+        use rand_08::SeedableRng;
+
+        let ssk = gen_ed25519(11, false);
+        let spk = ssk.to_public_key();
+        let message = [0x37u8; 32];
+        let mut rng = rand_08::rngs::StdRng::from_seed([12u8; 32]);
+        let sig = DetachedSignature::sign_binary_data(
+            &mut rng,
+            &*ssk,
+            &Password::empty(),
+            HashAlgorithm::Sha256,
+            &message[..],
+        )
+        .expect("binary sign");
+
+        let key_id = fingerprint_to_key_id(&spk.fingerprint());
+        let input = encode_gpg_verify_input(
+            &message,
+            &key_id,
+            &spk.to_bytes().expect("pub bytes"),
+            &sig.to_bytes().expect("sig bytes"),
+        );
+        let gas = required_gas(&input);
+        let result = gpg_verify_run(&input, gas);
+        assert_precompile_ok(&result, gas, SUCCESS_HEX);
+    }
+
+    /// TEAO1-141: a subkey grafted from a different certificate has no valid
+    /// binding signature to the victim's primary key, so it must fail the
+    /// binding check and never be treated as an eligible signing authority.
+    #[test]
+    fn test_grafted_subkey_fails_binding_check() {
+        let victim = gen_ed25519(1, false); // primary only
+        let attacker = gen_ed25519(2, true); // primary + signing subkey
+        let victim_pub = victim.to_public_key();
+        let attacker_pub = attacker.to_public_key();
+        assert!(!attacker_pub.public_subkeys.is_empty(), "attacker has a signing subkey");
+
+        // Graft the attacker's signing subkey onto the victim's primary identity.
+        let grafted = SignedPublicKey {
+            primary_key: victim_pub.primary_key.clone(),
+            details: victim_pub.details.clone(),
+            public_subkeys: attacker_pub.public_subkeys.clone(),
+        };
+        for sk in &grafted.public_subkeys {
+            assert!(
+                sk.verify_bindings(&grafted.primary_key).is_err(),
+                "grafted subkey must fail binding to the victim primary (TEAO1-141)"
+            );
+        }
+        // Control: in its own certificate the same subkey binds correctly.
+        for sk in &attacker_pub.public_subkeys {
+            assert!(
+                sk.verify_bindings(&attacker_pub.primary_key).is_ok(),
+                "legitimately-bound subkey must pass its own binding check"
+            );
         }
     }
 
