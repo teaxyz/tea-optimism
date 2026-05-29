@@ -61,8 +61,9 @@ fn test_wrong_address_is_not_precompile() {
     let db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
     let mut evm = factory.create_evm(db, make_evm_env());
 
-    // Call a nearby address that is NOT a precompile.
-    let wrong_addr = address!("0x0000000000000000000000000000000000000698");
+    // Call a nearby address that is NOT a precompile. 0x0696/0697/0698 are the
+    // GPG/SSH/SSHSIG precompiles; 0x0699 is unregistered.
+    let wrong_addr = address!("0x0000000000000000000000000000000000000699");
     let result = evm.transact_system_call(CALLER, wrong_addr, Bytes::new());
     let result = result.expect("EVM transact should succeed (empty call)");
 
@@ -341,4 +342,34 @@ fn test_evm_factory_packed_slot_with_timestamp() {
     // The price should be 999 * WAD (timestamp stripped)
     let expected_price = U256::from(999u64) * tea_reth::l1_cost::WAD;
     assert_eq!(numerator, expected_price, "should extract price ignoring timestamp");
+}
+
+/// TEAO1-132: on a non-Tea chain the factory must NOT install the TEA/ETH
+/// multiplier — even with a non-zero oracle slot seeded — so generic OP replay
+/// stays byte-identical to canonical Optimism. The multiplier must be `None`.
+#[test]
+fn test_multiplier_none_off_tea_chain() {
+    let mut db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
+    db.insert_account_storage(
+        tea_reth::l1_cost::GAS_PRICE_ORACLE_ADDR,
+        tea_reth::l1_cost::LATEST_PRICE_RATIO_SLOT_U256,
+        U256::from(999u64) * tea_reth::l1_cost::WAD,
+    )
+    .expect("insert storage");
+
+    // Ethereum mainnet (chain id 1) — not a Tea chain.
+    let env = EvmEnv {
+        cfg_env: CfgEnv::new()
+            .with_chain_id(1)
+            .with_spec_and_mainnet_gas_params(OpSpecId::FJORD),
+        ..Default::default()
+    };
+    let factory = tea_reth::evm::TeaEvmFactory;
+    let evm = factory.create_evm(db, env);
+
+    assert_eq!(
+        evm.ctx().chain.l1_cost_multiplier,
+        None,
+        "off-Tea chains must not receive the TEA multiplier (TEAO1-132)"
+    );
 }

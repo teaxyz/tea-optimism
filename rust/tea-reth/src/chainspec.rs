@@ -1,27 +1,15 @@
 //! Tea chain specification and chain ID detection.
+//!
+//! The chain-ID constants and the [`is_tea`] gate live in the shared
+//! `tea-l1-cost` crate so the execution layer (tea-reth) and the fault-proof
+//! VM (kona) apply the exact same gate and cannot drift (TEAO1-132). They are
+//! re-exported here to preserve the `crate::chainspec::*` paths used across the
+//! crate.
 
-/// Tea mainnet chain ID
-pub const TEA_CHAIN_ID: u64 = 6122;
-
-/// Tea testnet 1 chain ID
-pub const TEA_TESTNET1_CHAIN_ID: u64 = 10218;
-
-/// Tea testnet 2 chain ID
-pub const TEA_TESTNET2_CHAIN_ID: u64 = 14314;
-
-/// Nethermind Tea test network chain ID
-pub const NETHERMIND_TEA_TESTNET_CHAIN_ID: u64 = 3257160925;
-
-/// Returns `true` if the given chain ID is a Tea network.
-pub fn is_tea(chain_id: u64) -> bool {
-    matches!(
-        chain_id,
-        TEA_CHAIN_ID
-            | TEA_TESTNET1_CHAIN_ID
-            | TEA_TESTNET2_CHAIN_ID
-            | NETHERMIND_TEA_TESTNET_CHAIN_ID
-    )
-}
+pub use tea_l1_cost::{
+    NETHERMIND_TEA_TESTNET_CHAIN_ID, TEA_CHAIN_ID, TEA_TESTNET1_CHAIN_ID, TEA_TESTNET2_CHAIN_ID,
+    is_tea,
+};
 
 #[cfg(test)]
 mod tests {

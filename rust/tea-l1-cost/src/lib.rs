@@ -30,6 +30,33 @@ pub const LATEST_PRICE_RATIO_SLOT_U256: U256 = U256::from_be_bytes(LATEST_PRICE_
 /// Backup TEA per ETH exchange rate (1,500,000 TEA per ETH).
 pub const BACKUP_TEA_PER_ETH: u64 = 1_500_000;
 
+/// Tea mainnet chain ID.
+pub const TEA_CHAIN_ID: u64 = 6122;
+/// Tea testnet 1 chain ID.
+pub const TEA_TESTNET1_CHAIN_ID: u64 = 10218;
+/// Tea testnet 2 chain ID.
+pub const TEA_TESTNET2_CHAIN_ID: u64 = 14314;
+/// Nethermind Tea test network chain ID.
+pub const NETHERMIND_TEA_TESTNET_CHAIN_ID: u64 = 3257160925;
+
+/// Returns `true` if `chain_id` is a Tea network.
+///
+/// The TEA/ETH L1-cost multiplier — including the 1,500,000× backup-rate
+/// fallback — MUST only be applied on Tea chains. Off Tea, callers must leave
+/// `l1_cost_multiplier` unset (`None`) so generic OP replay stays byte-identical
+/// to canonical Optimism (TEAO1-132). This predicate lives here, in the crate
+/// shared by both the execution layer (tea-reth) and the fault-proof VM (kona),
+/// so the gate cannot drift between the two.
+pub fn is_tea(chain_id: u64) -> bool {
+    matches!(
+        chain_id,
+        TEA_CHAIN_ID
+            | TEA_TESTNET1_CHAIN_ID
+            | TEA_TESTNET2_CHAIN_ID
+            | NETHERMIND_TEA_TESTNET_CHAIN_ID
+    )
+}
+
 /// WAD = 1e18, used as scaling denominator.
 pub const WAD: U256 = U256::from_limbs([1_000_000_000_000_000_000u64, 0, 0, 0]);
 
@@ -106,6 +133,23 @@ mod tests {
     //!   - fjordFee = 3_203_000 (rollup_cost_test.go:36)
 
     use super::*;
+
+    /// Ported from tea-geth `IsTea()` (params/config.go:1034). The gate now
+    /// lives in this shared crate so EL and FPVM cannot disagree (TEAO1-132).
+    #[test]
+    fn test_is_tea() {
+        assert!(is_tea(TEA_CHAIN_ID));
+        assert!(is_tea(TEA_TESTNET1_CHAIN_ID));
+        assert!(is_tea(TEA_TESTNET2_CHAIN_ID));
+        assert!(is_tea(NETHERMIND_TEA_TESTNET_CHAIN_ID));
+        // Non-Tea chains, boundaries, and extremes.
+        assert!(!is_tea(1)); // Ethereum mainnet
+        assert!(!is_tea(10)); // OP mainnet
+        assert!(!is_tea(0));
+        assert!(!is_tea(TEA_CHAIN_ID - 1));
+        assert!(!is_tea(TEA_CHAIN_ID + 1));
+        assert!(!is_tea(u64::MAX));
+    }
 
     // Fjord fee for the emptyTx from Go tests (rollup_cost_test.go:36):
     // 100_000_000 * (2 * 1000 * 1e6 * 16 + 3 * 10 * 1e6) / 1e12 = 3_203_000
