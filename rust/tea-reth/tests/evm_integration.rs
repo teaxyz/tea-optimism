@@ -61,8 +61,9 @@ fn test_wrong_address_is_not_precompile() {
     let db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
     let mut evm = factory.create_evm(db, make_evm_env());
 
-    // Call a nearby address that is NOT a precompile.
-    let wrong_addr = address!("0x0000000000000000000000000000000000000698");
+    // Call a nearby address that is NOT a precompile. 0x0696/0697/0698 are the
+    // GPG/SSH/SSHSIG precompiles; 0x0699 is unregistered.
+    let wrong_addr = address!("0x0000000000000000000000000000000000000699");
     let result = evm.transact_system_call(CALLER, wrong_addr, Bytes::new());
     let result = result.expect("EVM transact should succeed (empty call)");
 
