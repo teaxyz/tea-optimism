@@ -275,8 +275,7 @@ contract L2Genesis_Run_Test is L2Genesis_TestInit {
             gasPayingTokenSymbol: "",
             nativeAssetLiquidityAmount: type(uint248).max,
             liquidityControllerOwner: address(0x000000000000000000000000000000000000000d),
-            useL2CM: false
-
+            useL2CM: false,
             // TEA
             l1CGTBridge: address(0x7278C0d99Ba37cE53d6983CfC52a181EF891581F)
         });

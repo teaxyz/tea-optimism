@@ -70,7 +70,7 @@ contract GasPriceOracle is TeaWAPOracle, ISemver {
     /// @param _data Unsigned fully RLP-encoded transaction to get the L1 fee for.
     /// @return L1 fee that should be paid for the tx
     function getL1Fee(bytes memory _data) external view returns (uint256) {
-        (, uint160 latestPrice) = getLatestPrice();
+        uint160 latestPrice = _cachedPriceOrBackup();
         if (isFjord) {
             return latestPrice * _getL1FeeFjord(_data) / 1e18;
         } else if (isEcotone) {
@@ -93,8 +93,20 @@ contract GasPriceOracle is TeaWAPOracle, ISemver {
         // txSize / 255 + 16 is the practical fastlz upper-bound covers %99.99 txs.
         uint256 flzUpperBound = txSize + txSize / 255 + 16;
 
-        (, uint160 latestPrice) = getLatestPrice();
+        uint160 latestPrice = _cachedPriceOrBackup();
         return latestPrice * _fjordL1Cost(flzUpperBound) / 1e18;
+    }
+
+    /// @notice The cached TEA/ETH price, falling back to the backup rate when the
+    ///         cached slot has never been written. On non-CGT deployments the
+    ///         plain `L1Block` never calls `updateGasTokenPriceRatio`, so the slot
+    ///         stays empty and the fee helpers would otherwise quote zero — while
+    ///         the runtime fee logic and `teaPerETH()` use the backup rate. This
+    ///         keeps the view helpers consistent with settlement (TEAO1-165).
+    function _cachedPriceOrBackup() internal view returns (uint160) {
+        (, uint160 latestPrice) = getLatestPrice();
+        if (latestPrice == 0) return getFallbackPrice();
+        return latestPrice;
     }
 
     /// @notice Pulls the latest price from the oracle and updates the ratio storage slot.

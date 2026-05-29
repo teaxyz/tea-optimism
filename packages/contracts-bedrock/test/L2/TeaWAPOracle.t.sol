@@ -58,6 +58,38 @@ contract MockOracle {
     }
 }
 
+/// @dev Like MockOracle, but quotes a non-gwei-aligned rate so the old 1-gwei
+///      sample would floor it while a full-1e18 sample preserves it (TEAO1-189).
+contract PreciseMockOracle {
+    address otherToken;
+
+    constructor(address _otherToken) {
+        otherToken = _otherToken;
+    }
+
+    function getReserves() public pure returns (uint256, uint256, uint256) {
+        return (0, 1e18, 0);
+    }
+
+    function factory() public view returns (address) {
+        return address(this);
+    }
+
+    function isPaused() public pure returns (bool) {
+        return false;
+    }
+
+    function tokens() public view returns (address, address) {
+        return (Predeploys.WETH, otherToken);
+    }
+
+    // 2_999_000_000 TEA-wei per 1e18 WETH. quote(1 gwei) floors to 2, which the
+    // old code scaled back to 2_000_000_000; quote(1e18) yields the exact value.
+    function quote(address, uint256 amount, uint256) external pure returns (uint256) {
+        return amount * 2_999_000_000 / 1e18;
+    }
+}
+
 contract TeaWAPOracle_Test is CommonTest {
     MockOracle public oracle;
     address myWeth;
@@ -159,6 +191,46 @@ contract TeaWAPOracle_Test is CommonTest {
         (uint96 finalTs, uint160 finalPrice) = gasPriceOracle.getLatestPrice();
         assertEq(finalTs, block.timestamp);
         assertEq(finalPrice, 1_500_000e18);
+    }
+
+    /// TEAO1-189: sampling a full 1e18 of WETH must not quantize the price down
+    /// to gwei precision. With a 2_999_000_000 rate, the old 1-gwei sample floored
+    /// to 2_000_000_000; the full-WAD sample must preserve 2_999_000_000.
+    function testTeaWAP_FullWadSampleNoQuantization() public {
+        PreciseMockOracle p = new PreciseMockOracle(myWeth);
+        vm.prank(Ownable(Predeploys.PROXY_ADMIN).owner());
+        gasPriceOracle.setOracleConfig(10, 1e18, address(p));
+
+        vm.prank(address(l1Block));
+        gasPriceOracle.updateGasTokenPriceRatio();
+
+        (, uint160 price) = gasPriceOracle.getLatestPrice();
+        assertEq(price, 2_999_000_000, "full-1e18 sample must not floor to gwei precision");
+    }
+
+    /// TEAO1-185: convertETHToTea must read the cached price (5-minute grace),
+    /// matching what execution settles against — not the live oracle, which flips
+    /// to the fallback the instant it is unavailable.
+    function testTeaWAP_ConvertUsesCachedNotLive() public {
+        vm.prank(Ownable(Predeploys.PROXY_ADMIN).owner());
+        gasPriceOracle.setOracleConfig(10, 1e18, address(oracle));
+
+        vm.prank(address(l1Block));
+        gasPriceOracle.updateGasTokenPriceRatio();
+
+        (, uint160 cached) = gasPriceOracle.getLatestPrice();
+        assertEq(cached, 2_000_000e18);
+
+        // Break the live oracle. teaPerETH() would now return the fallback
+        // (1_500_000e18), but the cached price is still valid within the grace
+        // window and is what settlement uses.
+        vm.etch(address(oracle), abi.encode(""));
+
+        assertEq(
+            GasPriceOracle(address(gasPriceOracle)).convertETHToTea(1e18),
+            2_000_000e18,
+            "convertETHToTea must use the cached price, not the live fallback"
+        );
     }
 
     function testTeaWAP_NonWETHOracleFails() public {
