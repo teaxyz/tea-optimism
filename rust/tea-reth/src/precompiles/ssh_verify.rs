@@ -236,7 +236,7 @@ fn run_verification(public_key: &[u8], signature: &[u8], message: &[u8]) -> bool
         b"ecdsa-sha2-nistp256"
         | b"ecdsa-sha2-nistp384"
         | b"ecdsa-sha2-nistp521" => {
-            verify_ssh_ecdsa(public_key, key_offset, message, sig_algo, sig_blob)
+            verify_ssh_ecdsa(key_type, public_key, key_offset, message, sig_algo, sig_blob)
         }
         _ => false,
     }

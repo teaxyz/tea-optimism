@@ -42,6 +42,14 @@ pub fn strip_mpint_pad(bytes: &[u8]) -> Result<&[u8], &'static str> {
         }
         return Ok(&bytes[1..]);
     }
+    // RFC 4251 §5: a positive mpint whose most-significant byte has the high
+    // bit set MUST carry the leading `0x00` sign pad. A signless high-bit value
+    // is non-canonical — reject it, otherwise `0x00||x` and `x` decode to the
+    // same RSA modulus / ECDSA scalar, aliasing one key or signature across two
+    // distinct publicKey / sig_blob byte strings (TEAO1-168 / TEAO1-183).
+    if bytes.first().is_some_and(|b| b & 0x80 != 0) {
+        return Err("missing mpint sign pad");
+    }
     Ok(bytes)
 }
 
@@ -273,12 +281,24 @@ pub fn verify_ssh_rsa(
 ///   derive identity cannot be tricked into seeing two distinct "valid"
 ///   signatures for the same `(pubkey, message)`.
 pub fn verify_ssh_ecdsa(
+    key_type: &[u8],
     pub_key_data: &[u8],
     offset: usize,
     message: &[u8],
     sig_algo: &[u8],
     sig_blob: &[u8],
 ) -> bool {
+    // Outer key_type cross-gate (TEAO1-163): the SSH key_type string that
+    // precedes the pubkey blob must equal the signature algorithm. Without it,
+    // a blob advertising `ecdsa-sha2-nistp256` could verify an
+    // `ecdsa-sha2-nistp384` signature as long as the embedded curve_name agreed
+    // with sig_algo — aliasing one key across multiple advertised identities.
+    // This makes the function's documented "sig_algo must match key_type"
+    // guarantee real rather than aspirational.
+    if key_type != sig_algo {
+        return false;
+    }
+
     // Algorithm cross-gate + curve-name dispatch in one match. Each arm
     // pins the expected curve_name suffix and the SEC1 uncompressed-point
     // length so a sig_algo + key_type match cannot also accept a Q from a
@@ -462,11 +482,21 @@ mod tests {
 
     #[test]
     fn strip_mpint_pad_noop_when_no_leading_zero() {
+        // High bit unset → no sign pad required → returned unchanged.
         assert_eq!(
             strip_mpint_pad(&[0x7F, 0xFF, 0x01]).unwrap(),
             &[0x7F, 0xFF, 0x01]
         );
-        assert_eq!(strip_mpint_pad(&[0x80, 0xFF]).unwrap(), &[0x80, 0xFF]);
+    }
+
+    /// TEAO1-168 / TEAO1-183: a high-bit-set value with no leading `0x00` sign
+    /// pad is a non-canonical (signless) mpint and must be rejected, so that
+    /// `0x00||x` and `x` cannot alias the same integer.
+    #[test]
+    fn strip_mpint_pad_rejects_missing_sign_pad() {
+        assert!(strip_mpint_pad(&[0x80, 0xFF]).is_err());
+        assert!(strip_mpint_pad(&[0xFF]).is_err());
+        assert!(strip_mpint_pad(&[0x80]).is_err());
     }
 
     #[test]
@@ -954,7 +984,7 @@ mod tests {
         let (pub_blob, algo, sig) = sign_ecdsa_nistp256(message);
         let mut o = 0usize;
         let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
-        assert!(verify_ssh_ecdsa(&pub_blob, o, message, &algo, &sig));
+        assert!(verify_ssh_ecdsa(&algo, &pub_blob, o, message, &algo, &sig));
     }
 
     #[test]
@@ -963,7 +993,7 @@ mod tests {
         let (pub_blob, algo, sig) = sign_ecdsa_nistp384(message);
         let mut o = 0usize;
         let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
-        assert!(verify_ssh_ecdsa(&pub_blob, o, message, &algo, &sig));
+        assert!(verify_ssh_ecdsa(&algo, &pub_blob, o, message, &algo, &sig));
     }
 
     #[test]
@@ -972,7 +1002,7 @@ mod tests {
         let (pub_blob, algo, sig) = sign_ecdsa_nistp521(message);
         let mut o = 0usize;
         let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
-        assert!(verify_ssh_ecdsa(&pub_blob, o, message, &algo, &sig));
+        assert!(verify_ssh_ecdsa(&algo, &pub_blob, o, message, &algo, &sig));
     }
 
     #[test]
@@ -983,7 +1013,7 @@ mod tests {
         let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
         let mut bad = message.to_vec();
         bad[0] ^= 0xFF;
-        assert!(!verify_ssh_ecdsa(&pub_blob, o, &bad, &algo, &sig));
+        assert!(!verify_ssh_ecdsa(&algo, &pub_blob, o, &bad, &algo, &sig));
     }
 
     #[test]
@@ -994,7 +1024,7 @@ mod tests {
         let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
         let mut bad = message.to_vec();
         bad[0] ^= 0xFF;
-        assert!(!verify_ssh_ecdsa(&pub_blob, o, &bad, &algo, &sig));
+        assert!(!verify_ssh_ecdsa(&algo, &pub_blob, o, &bad, &algo, &sig));
     }
 
     #[test]
@@ -1005,17 +1035,24 @@ mod tests {
         let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
         let mut bad = message.to_vec();
         bad[0] ^= 0xFF;
-        assert!(!verify_ssh_ecdsa(&pub_blob, o, &bad, &algo, &sig));
+        assert!(!verify_ssh_ecdsa(&algo, &pub_blob, o, &bad, &algo, &sig));
     }
 
     #[test]
     fn verify_ssh_ecdsa_rejects_algo_mismatch_with_rsa() {
-        // P-256 key, sig_algo labelled rsa-sha2-256 → algo cross-gate rejects.
+        // P-256 key, sig_algo labelled rsa-sha2-256 → key_type cross-gate rejects.
         let message = b"hello p256";
         let (pub_blob, _algo, sig) = sign_ecdsa_nistp256(message);
         let mut o = 0usize;
         let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
-        assert!(!verify_ssh_ecdsa(&pub_blob, o, message, b"rsa-sha2-256", &sig));
+        assert!(!verify_ssh_ecdsa(
+            b"ecdsa-sha2-nistp256",
+            &pub_blob,
+            o,
+            message,
+            b"rsa-sha2-256",
+            &sig
+        ));
     }
 
     #[test]
@@ -1029,6 +1066,7 @@ mod tests {
         let mut o = 0usize;
         let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
         assert!(!verify_ssh_ecdsa(
+            b"ecdsa-sha2-nistp256",
             &pub_blob,
             o,
             message,
@@ -1062,6 +1100,7 @@ mod tests {
         let mut o = 0usize;
         let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
         assert!(!verify_ssh_ecdsa(
+            b"ecdsa-sha2-nistp256",
             &pub_blob,
             o,
             message,
@@ -1079,7 +1118,7 @@ mod tests {
         pub_blob.push(0xAB);
         let mut o = 0usize;
         let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
-        assert!(!verify_ssh_ecdsa(&pub_blob, o, message, &algo, &sig));
+        assert!(!verify_ssh_ecdsa(&algo, &pub_blob, o, message, &algo, &sig));
     }
 
     #[test]
@@ -1091,7 +1130,7 @@ mod tests {
         sig.push(0xAB);
         let mut o = 0usize;
         let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
-        assert!(!verify_ssh_ecdsa(&pub_blob, o, message, &algo, &sig));
+        assert!(!verify_ssh_ecdsa(&algo, &pub_blob, o, message, &algo, &sig));
     }
 
     #[test]
@@ -1140,6 +1179,7 @@ mod tests {
         let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
         assert!(
             !verify_ssh_ecdsa(
+                b"ecdsa-sha2-nistp256",
                 &pub_blob,
                 o,
                 message,
@@ -1147,6 +1187,117 @@ mod tests {
                 &sig_blob,
             ),
             "high-S signature must be rejected to prevent malleability"
+        );
+    }
+
+    /// TEAO1-163: the outer SSH `key_type` must equal the signature algorithm.
+    /// Here the blob's key_type lies as `ecdsa-sha2-nistp256` while the embedded
+    /// curve_name and sig_algo are both a self-consistent `ecdsa-sha2-nistp384`.
+    /// Pre-fix this verified (the curve_name agreed with sig_algo and key_type
+    /// was never consulted); the outer key_type gate must now reject it.
+    #[test]
+    fn verify_ssh_ecdsa_rejects_mismatched_outer_key_type() {
+        use p384::ecdsa::{Signature, SigningKey};
+        use signature::Signer as EcdsaSigner;
+
+        let mut rng = rand_08::rngs::StdRng::from_seed_helper();
+        let signing_key = SigningKey::random(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        let q_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+
+        let message = b"mislabeled outer key_type";
+        let sig: Signature = signing_key.sign(message);
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let (r, s) = sig.split_bytes();
+
+        // Outer key_type lies as nistp256; embedded curve + sig_algo are nistp384
+        // and mutually consistent, so only the key_type gate can catch this.
+        let pub_blob = build_ecdsa_pubkey_blob(b"ecdsa-sha2-nistp256", b"nistp384", &q_bytes);
+        let sig_blob = build_ecdsa_sig_blob(&r, &s);
+        let mut o = 0usize;
+        let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
+        assert!(
+            !verify_ssh_ecdsa(
+                b"ecdsa-sha2-nistp256", // outer key_type (the lie)
+                &pub_blob,
+                o,
+                message,
+                b"ecdsa-sha2-nistp384", // sig_algo, matches embedded curve_name
+                &sig_blob,
+            ),
+            "mismatched outer key_type must be rejected (TEAO1-163)"
+        );
+
+        // Control: a truthful key_type==sig_algo==nistp384 blob still verifies.
+        let good_blob = build_ecdsa_pubkey_blob(b"ecdsa-sha2-nistp384", b"nistp384", &q_bytes);
+        let mut og = 0usize;
+        let _ = read_ssh_string(&good_blob, &mut og).unwrap();
+        assert!(verify_ssh_ecdsa(
+            b"ecdsa-sha2-nistp384",
+            &good_blob,
+            og,
+            message,
+            b"ecdsa-sha2-nistp384",
+            &sig_blob,
+        ));
+    }
+
+    /// TEAO1-183: a signless high-bit `r` scalar (raw, without the mandatory
+    /// `0x00` sign pad) must be rejected, so it cannot alias the canonically
+    /// padded form. Control: the canonical signature still verifies.
+    #[test]
+    fn verify_ssh_ecdsa_rejects_signless_r_scalar() {
+        use p256::ecdsa::{Signature, SigningKey};
+        use signature::Signer as EcdsaSigner;
+
+        let mut rng = rand_08::rngs::StdRng::from_seed_helper();
+        let signing_key = SigningKey::random(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        let q_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+
+        // Find a message whose signature's r has the high bit set (needs a pad).
+        let mut message = Vec::new();
+        let (r, s) = loop {
+            let sig: Signature = signing_key.sign(&message);
+            let sig = sig.normalize_s().unwrap_or(sig);
+            let (r, s) = sig.split_bytes();
+            if r[0] & 0x80 != 0 {
+                break (r, s);
+            }
+            message.push(0u8);
+        };
+
+        let pub_blob = build_ecdsa_pubkey_blob(b"ecdsa-sha2-nistp256", b"nistp256", &q_bytes);
+
+        // Canonical control: build_ecdsa_sig_blob writes mpint(r) with the 0x00 pad.
+        let canonical = build_ecdsa_sig_blob(&r, &s);
+        let mut o = 0usize;
+        let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
+        assert!(verify_ssh_ecdsa(
+            b"ecdsa-sha2-nistp256",
+            &pub_blob,
+            o,
+            &message,
+            b"ecdsa-sha2-nistp256",
+            &canonical
+        ));
+
+        // Alias: write r as a raw SSH string (high bit set, no 0x00 pad).
+        let mut signless = Vec::new();
+        write_ssh_string(&mut signless, &r);
+        write_ssh_mpint(&mut signless, &s);
+        let mut o2 = 0usize;
+        let _ = read_ssh_string(&pub_blob, &mut o2).unwrap();
+        assert!(
+            !verify_ssh_ecdsa(
+                b"ecdsa-sha2-nistp256",
+                &pub_blob,
+                o2,
+                &message,
+                b"ecdsa-sha2-nistp256",
+                &signless
+            ),
+            "signless high-bit r scalar must be rejected (TEAO1-183)"
         );
     }
 }

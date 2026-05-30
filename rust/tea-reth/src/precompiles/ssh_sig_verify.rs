@@ -406,7 +406,7 @@ fn verify_with_envelope(
         b"ecdsa-sha2-nistp256"
         | b"ecdsa-sha2-nistp384"
         | b"ecdsa-sha2-nistp521" => {
-            verify_ssh_ecdsa(public_key, key_offset, envelope, sig_algo, sig_blob)
+            verify_ssh_ecdsa(key_type, public_key, key_offset, envelope, sig_algo, sig_blob)
         }
         _ => false,
     }
