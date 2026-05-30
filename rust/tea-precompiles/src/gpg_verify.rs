@@ -34,37 +34,24 @@
 //! existing callers may already trust — a policy change of that magnitude
 //! belongs at the policy layer, not buried in a verification precompile.
 
-use alloy_primitives::{Address, Bytes, address};
+use alloy_primitives::Bytes;
 use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey, SignedPublicSubKey};
 use pgp::packet::SignatureType;
 use pgp::types::KeyDetails;
 use revm::precompile::{Precompile, PrecompileId, PrecompileOutput, PrecompileResult};
 use std::io::Cursor;
 
-/// GPG verify precompile address.
-pub const GPG_VERIFY_ADDRESS: Address = address!("0x0000000000000000000000000000000000000696");
-
-/// Base gas cost for GPG verification.
-pub const GPG_VERIFY_BASE_GAS: u64 = 23_500;
-
-/// Per-byte gas cost above the kink point.
-pub const GPG_VERIFY_GAS_PER_BYTE: u64 = 16;
-
-/// Input length kink point — below this, only base gas is charged.
-pub const GPG_VERIFY_INPUT_LENGTH_KINK: usize = 3264;
+/// Address + gas schedule live in the no_std [`crate::gas`] module so the FPVM
+/// can charge identical gas without linking this crate's crypto. Re-exported
+/// here so internal call sites and the public API are unchanged.
+pub use crate::gas::{
+    GPG_VERIFY_ADDRESS, GPG_VERIFY_BASE_GAS, GPG_VERIFY_GAS_PER_BYTE,
+    GPG_VERIFY_INPUT_LENGTH_KINK, gpg_required_gas as required_gas,
+};
 
 /// Returns the GPG verify precompile for registration.
 pub fn precompile() -> Precompile {
     Precompile::new(PrecompileId::custom("gpg_verify"), GPG_VERIFY_ADDRESS, gpg_verify_run)
-}
-
-/// Calculates the gas required for GPG verification.
-pub fn required_gas(input: &[u8]) -> u64 {
-    if input.len() <= GPG_VERIFY_INPUT_LENGTH_KINK {
-        return GPG_VERIFY_BASE_GAS;
-    }
-    let additional_bytes = input.len() - GPG_VERIFY_INPUT_LENGTH_KINK;
-    GPG_VERIFY_BASE_GAS + GPG_VERIFY_GAS_PER_BYTE * additional_bytes as u64
 }
 
 /// 32-byte result indicating success (1).

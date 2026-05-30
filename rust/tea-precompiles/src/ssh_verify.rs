@@ -34,22 +34,18 @@
 //! [`crate::precompiles::ssh_common`] so this precompile and `0x0698` share a
 //! single audited implementation.
 
-use alloy_primitives::{Address, Bytes, address};
+use alloy_primitives::Bytes;
 use revm::precompile::{Precompile, PrecompileId, PrecompileOutput, PrecompileResult};
 
 use super::ssh_common::{read_ssh_string, verify_ssh_ecdsa, verify_ssh_ed25519, verify_ssh_rsa};
 
-/// SSH verify precompile address.
-pub const SSH_VERIFY_ADDRESS: Address = address!("0x0000000000000000000000000000000000000697");
-
-/// Base gas cost for SSH verification.
-pub const SSH_VERIFY_BASE_GAS: u64 = 23_500;
-
-/// Per-byte gas cost above the kink point.
-pub const SSH_VERIFY_GAS_PER_BYTE: u64 = 16;
-
-/// Input length kink point — below this, only base gas is charged.
-pub const SSH_VERIFY_INPUT_LENGTH_KINK: usize = 3264;
+/// Address + gas schedule live in the no_std [`crate::gas`] module so the FPVM
+/// can charge identical gas without linking this crate's crypto. Re-exported
+/// here so internal call sites and the public API are unchanged.
+pub use crate::gas::{
+    SSH_VERIFY_ADDRESS, SSH_VERIFY_BASE_GAS, SSH_VERIFY_GAS_PER_BYTE,
+    SSH_VERIFY_INPUT_LENGTH_KINK, ssh_required_gas as required_gas,
+};
 
 /// Maximum SSH wire-format public key blob size in bytes.
 ///
@@ -69,21 +65,6 @@ pub const MAX_SIGNATURE_BYTES: usize = 1024;
 /// Returns the SSH verify precompile for registration.
 pub fn precompile() -> Precompile {
     Precompile::new(PrecompileId::custom("ssh_verify"), SSH_VERIFY_ADDRESS, ssh_verify_run)
-}
-
-/// Calculates the gas required for SSH verification.
-///
-/// Uses saturating arithmetic so that an astronomically-large `input.len()`
-/// (which would only ever appear in a fuzz / property-test setting — real
-/// EVM calldata is bounded by quadratic memory expansion gas) cannot wrap
-/// the result and undercharge.
-pub fn required_gas(input: &[u8]) -> u64 {
-    if input.len() <= SSH_VERIFY_INPUT_LENGTH_KINK {
-        return SSH_VERIFY_BASE_GAS;
-    }
-    let additional_bytes = input.len() - SSH_VERIFY_INPUT_LENGTH_KINK;
-    SSH_VERIFY_BASE_GAS
-        .saturating_add(SSH_VERIFY_GAS_PER_BYTE.saturating_mul(additional_bytes as u64))
 }
 
 /// 32-byte result indicating success (1).

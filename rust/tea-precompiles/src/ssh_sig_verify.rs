@@ -66,29 +66,18 @@
 //! low-S-only (high-S form is rejected to prevent malleability — see
 //! `ssh_common::verify_ssh_ecdsa`).
 
-use alloy_primitives::{Address, Bytes, address};
+use alloy_primitives::Bytes;
 use revm::precompile::{Precompile, PrecompileId, PrecompileOutput, PrecompileResult};
 
 use super::ssh_common::{read_ssh_string, verify_ssh_ecdsa, verify_ssh_ed25519, verify_ssh_rsa};
 
-/// SSHSIG verify precompile address.
-pub const SSHSIG_VERIFY_ADDRESS: Address =
-    address!("0x0000000000000000000000000000000000000698");
-
-/// Base gas cost for SSHSIG verification.
-///
-/// Slightly above `0x0697`'s 23,500 to cover the additional SHA-512 over the
-/// payload plus the ~100-byte envelope reconstruction.
-pub const SSHSIG_VERIFY_BASE_GAS: u64 = 25_000;
-
-/// Per-byte gas cost above the kink point.
-///
-/// Mirrors `0x0697`. Covers the linear cost of SHA-512 (payload) and the
-/// inner SSH primitive's own hash pass over the envelope.
-pub const SSHSIG_VERIFY_GAS_PER_BYTE: u64 = 16;
-
-/// Input length kink point — below this, only base gas is charged.
-pub const SSHSIG_VERIFY_INPUT_LENGTH_KINK: usize = 3264;
+/// Address + gas schedule live in the no_std [`crate::gas`] module so the FPVM
+/// can charge identical gas without linking this crate's crypto. Re-exported
+/// here so internal call sites and the public API are unchanged.
+pub use crate::gas::{
+    SSHSIG_VERIFY_ADDRESS, SSHSIG_VERIFY_BASE_GAS, SSHSIG_VERIFY_GAS_PER_BYTE,
+    SSHSIG_VERIFY_INPUT_LENGTH_KINK, sshsig_required_gas as required_gas,
+};
 
 /// Maximum payload size in bytes (16 KiB).
 ///
@@ -123,18 +112,6 @@ pub fn precompile() -> Precompile {
         SSHSIG_VERIFY_ADDRESS,
         sshsig_verify_run,
     )
-}
-
-/// Calculates the gas required for SSHSIG verification.
-///
-/// Saturating arithmetic mirrors `ssh_verify::required_gas`.
-pub fn required_gas(input: &[u8]) -> u64 {
-    if input.len() <= SSHSIG_VERIFY_INPUT_LENGTH_KINK {
-        return SSHSIG_VERIFY_BASE_GAS;
-    }
-    let additional_bytes = input.len() - SSHSIG_VERIFY_INPUT_LENGTH_KINK;
-    SSHSIG_VERIFY_BASE_GAS
-        .saturating_add(SSHSIG_VERIFY_GAS_PER_BYTE.saturating_mul(additional_bytes as u64))
 }
 
 /// 32-byte result indicating success (1).

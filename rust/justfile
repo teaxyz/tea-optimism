@@ -166,6 +166,9 @@ check-no-std:
     # tea (shared between tea-reth EL and kona FPVM — must stay no_std-clean
     # or the FPVM build will silently fail when this crate is bumped)
     tea-l1-cost
+    # tea-precompiles --no-default-features is the gas-only slice the FPVM links
+    # (crypto is std-gated); guard it so a no_std regression in gas.rs is caught.
+    tea-precompiles
   )
 
   # We need to install the riscv32imac-unknown-none-elf target before starting to build the no-std crates.
