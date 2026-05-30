@@ -32,26 +32,10 @@ op-alloy-network.workspace = true
 # arithmetic in one place so EL and FPVM cannot drift)
 tea-l1-cost.workspace = true
 
-# pgp
-pgp = "0.19"
-
-# ssh
-ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
-rsa = { version = "0.9", default-features = false, features = ["std"] }
-sha2.workspace = true
-signature = { version = "2", default-features = false }
-# NIST-curve ECDSA for ecdsa-sha2-nistp{256,384,521} SSH keys (RFC 5656).
-# All three pull ecdsa 0.16 + signature 2.x — same versions rsa 0.9 / ed25519-dalek 2
-# already pull, so no version-pin conflicts. `std` is needed for the verifier
-# error type to implement std::error::Error (matches rsa's `std` feature gate).
-# `arithmetic` is what unlocks SEC1 point parsing + low-S `normalize_s`; on
-# p521 the synchronous `Signer::sign` impl is also gated behind `getrandom`
-# (used only by the test-harness keygen helpers, but needs to be in the
-# top-level `dependencies` block since `dev-dependencies` cannot enable
-# features on a non-dev dep).
-p256 = { version = "0.13", default-features = false, features = ["std", "ecdsa", "arithmetic"] }
-p384 = { version = "0.13", default-features = false, features = ["std", "ecdsa", "arithmetic"] }
-p521 = { version = "0.13", default-features = false, features = ["std", "ecdsa", "arithmetic", "getrandom"] }
+# tea precompiles (GPG/SSH/SSHSIG verify at 0x0696-0x0698). Lives in its own
+# std crate so kona-host's fault-proof accelerator runs the exact same crypto
+# as the EL — see tea-precompiles/src/lib.rs.
+tea-precompiles.workspace = true
 
 # misc
 clap = { workspace = true, features = ["derive", "env"] }
@@ -61,10 +45,6 @@ tracing.workspace = true
 [dev-dependencies]
 alloy-primitives = { workspace = true, features = ["std"] }
 hex = "0.4.3"
-# rand 0.8 (matches rand_core 0.6 — what rsa 0.9 accepts as the CryptoRng
-# parameter for RsaPrivateKey::new). Used in tests to keygen + sign at runtime
-# so we can exercise verify_rsa with realistic RSA-4096 keys end-to-end.
-rand_08 = { workspace = true }
 
 [features]
 default = []
