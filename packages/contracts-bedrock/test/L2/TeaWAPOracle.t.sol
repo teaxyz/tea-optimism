@@ -241,4 +241,37 @@ contract TeaWAPOracle_Test is CommonTest {
         vm.expectRevert();
         gasPriceOracle.setOracleConfig(10, 1e18, address(nonWethOracle));
     }
+
+    /// @dev SECURITY REGRESSION GUARD — only the owner may write the fallback
+    ///      price. The fallback feeds L1-fee scaling whenever the live oracle is
+    ///      unavailable, so an attacker-writable fallback would be a fee-
+    ///      manipulation hole. A non-owner caller MUST revert and the stored
+    ///      fallback MUST be unchanged.
+    function testTeaWAP_setFallbackPrice_nonOwner_reverts() public {
+        // getFallbackPrice is not on IGasPriceOracle; read via the concrete type.
+        GasPriceOracle gpo = GasPriceOracle(address(gasPriceOracle));
+        uint160 priceBefore = gpo.getFallbackPrice();
+
+        vm.prank(makeAddr("attacker"));
+        vm.expectRevert("TeaWAPOracle: admin only");
+        gasPriceOracle.setFallbackPrice(123_456);
+
+        assertEq(gpo.getFallbackPrice(), priceBefore, "fallback must be unchanged by a non-owner");
+    }
+
+    /// @dev SECURITY REGRESSION GUARD — only the owner may write the oracle
+    ///      address / config slot. Pointing the oracle at an attacker-controlled
+    ///      pool would let an attacker set the TEA/ETH price, so this must be
+    ///      owner-gated. A non-owner caller MUST revert and the oracle address
+    ///      MUST be unchanged.
+    function testTeaWAP_setOracleConfig_nonOwner_reverts() public {
+        (address oracleBefore,,,,) = gasPriceOracle.getOracleConfig();
+
+        vm.prank(makeAddr("attacker"));
+        vm.expectRevert("TeaWAPOracle: admin only");
+        gasPriceOracle.setOracleConfig(10, 1e18, address(oracle));
+
+        (address oracleAfter,,,,) = gasPriceOracle.getOracleConfig();
+        assertEq(oracleAfter, oracleBefore, "oracle address must be unchanged by a non-owner");
+    }
 }

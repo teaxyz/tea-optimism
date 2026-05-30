@@ -189,6 +189,24 @@ contract GasPriceOracleEcotone_Test is GasPriceOracle_Test {
         gasPriceOracle.setEcotone();
     }
 
+    /// @dev SECURITY REGRESSION GUARD — write access to the cached price slot.
+    ///      The cached TEA/ETH price (used to scale L1 fees) is only writable via
+    ///      updateGasTokenPriceRatio(), gated to the L1Block attributes predeploy
+    ///      (the system depositor path). A non-system caller MUST revert AND MUST
+    ///      NOT mutate the cached price slot. If this ever fails, the price slot has
+    ///      become attacker-writable — a critical fee-manipulation hole.
+    function test_updateGasTokenPriceRatio_wrongCaller_reverts() external {
+        (uint96 tsBefore, uint160 priceBefore) = gasPriceOracle.getLatestPrice();
+
+        vm.prank(makeAddr("attacker"));
+        vm.expectRevert("GasPriceOracle: only L1_BLOCK_ATTRIBUTES can update");
+        gasPriceOracle.updateGasTokenPriceRatio();
+
+        (uint96 tsAfter, uint160 priceAfter) = gasPriceOracle.getLatestPrice();
+        assertEq(tsAfter, tsBefore, "timestamp must be unchanged by a rejected caller");
+        assertEq(priceAfter, priceBefore, "cached price must be unchanged by a rejected caller");
+    }
+
     /// @dev Tests that `gasPrice` is set correctly.
     function test_gasPrice_succeeds() external {
         vm.fee(100);
