@@ -308,7 +308,7 @@ mod tests {
     #[test]
     fn test_gas_calculation_base() {
         assert_eq!(required_gas(&vec![0u8; GPG_VERIFY_INPUT_LENGTH_KINK]), GPG_VERIFY_BASE_GAS);
-        assert_eq!(required_gas(&vec![0u8; 100]), GPG_VERIFY_BASE_GAS);
+        assert_eq!(required_gas(&[0u8; 100]), GPG_VERIFY_BASE_GAS);
     }
 
     #[test]
@@ -884,7 +884,7 @@ mod tests {
         buf.extend_from_slice(&u256_bytes(128));
 
         // [96..128] offset to signature (128 + 32 + padded_len(publicKey))
-        let pub_key_padded_len = (public_key.len() + 31) / 32 * 32;
+        let pub_key_padded_len = public_key.len().div_ceil(32) * 32;
         let sig_offset = 128 + 32 + pub_key_padded_len;
         buf.extend_from_slice(&u256_bytes(sig_offset));
 
@@ -897,7 +897,7 @@ mod tests {
         // signature: length + data (padded to 32 bytes)
         buf.extend_from_slice(&u256_bytes(signature.len()));
         buf.extend_from_slice(signature);
-        let sig_padded_len = (signature.len() + 31) / 32 * 32;
+        let sig_padded_len = signature.len().div_ceil(32) * 32;
         let sig_padding = sig_padded_len - signature.len();
         buf.extend_from_slice(&vec![0u8; sig_padding]);
 

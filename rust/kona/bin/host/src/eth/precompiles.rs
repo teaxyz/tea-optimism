@@ -27,7 +27,7 @@ pub(crate) const ACCELERATED_PRECOMPILES: &[Precompile] = &[
 /// matching one on demand lets the fault-proof host run the *exact same*
 /// `tea-precompiles` crypto the EL runs, so a state mutation derived from one of
 /// these precompiles produces the same result in the EL and the proof
-/// (TEAO1-174). The no_std FPVM client cannot run this crypto, so it hints the
+/// (TEAO1-174). The `no_std` FPVM client cannot run this crypto, so it hints the
 /// address+input here and reads the result back through the preimage oracle.
 fn tea_accelerated_precompile(address: Address) -> Option<Precompile> {
     if address == gas::GPG_VERIFY_ADDRESS {

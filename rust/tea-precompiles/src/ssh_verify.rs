@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn test_gas_calculation_base() {
         assert_eq!(required_gas(&vec![0u8; SSH_VERIFY_INPUT_LENGTH_KINK]), SSH_VERIFY_BASE_GAS);
-        assert_eq!(required_gas(&vec![0u8; 100]), SSH_VERIFY_BASE_GAS);
+        assert_eq!(required_gas(&[0u8; 100]), SSH_VERIFY_BASE_GAS);
         assert_eq!(required_gas(&[]), SSH_VERIFY_BASE_GAS);
     }
 
@@ -743,7 +743,6 @@ mod tests {
         use rand_08::SeedableRng;
         use signature::Signer;
         use p256::ecdsa::{Signature, SigningKey};
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
         let signing_key = SigningKey::random(&mut rng);
@@ -769,7 +768,6 @@ mod tests {
         use rand_08::SeedableRng;
         use signature::Signer;
         use p384::ecdsa::{Signature, SigningKey};
-        use p384::elliptic_curve::sec1::ToEncodedPoint;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
         let signing_key = SigningKey::random(&mut rng);
@@ -795,7 +793,6 @@ mod tests {
         use rand_08::SeedableRng;
         use signature::Signer;
         use p521::ecdsa::{Signature, SigningKey, VerifyingKey};
-        use p521::elliptic_curve::sec1::ToEncodedPoint;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
         let signing_key = SigningKey::random(&mut rng);
@@ -821,7 +818,6 @@ mod tests {
         use rand_08::SeedableRng;
         use signature::Signer;
         use p256::ecdsa::{Signature, SigningKey};
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
         let signing_key = SigningKey::random(&mut rng);
@@ -862,7 +858,7 @@ mod tests {
         buf.extend_from_slice(&u256_bytes(96));
 
         // [64..96] offset to signature
-        let pub_key_padded_len = (public_key.len() + 31) / 32 * 32;
+        let pub_key_padded_len = public_key.len().div_ceil(32) * 32;
         let sig_offset = 96 + 32 + pub_key_padded_len;
         buf.extend_from_slice(&u256_bytes(sig_offset));
 
@@ -875,7 +871,7 @@ mod tests {
         // signature: length + data (padded to 32 bytes)
         buf.extend_from_slice(&u256_bytes(signature.len()));
         buf.extend_from_slice(signature);
-        let sig_padded_len = (signature.len() + 31) / 32 * 32;
+        let sig_padded_len = signature.len().div_ceil(32) * 32;
         let sig_padding = sig_padded_len - signature.len();
         buf.extend_from_slice(&vec![0u8; sig_padding]);
 

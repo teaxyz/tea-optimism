@@ -211,7 +211,7 @@ pub fn verify_ssh_rsa(
     // through the 256-byte floor; this clamps to the exact constants.
     use rsa::traits::PublicKeyParts;
     let n_bits = pub_key.n().bits();
-    if n_bits < MIN_RSA_MODULUS_BYTES * 8 || n_bits > MAX_RSA_MODULUS_BYTES * 8 {
+    if !(MIN_RSA_MODULUS_BYTES * 8..=MAX_RSA_MODULUS_BYTES * 8).contains(&n_bits) {
         return false;
     }
 
@@ -677,7 +677,7 @@ mod tests {
         write_ssh_string(&mut pub_blob, &[0x01, 0x00, 0x01]); // e = 65537
         // n: u32 length = 514, bytes = [0x00, 0xFF; 513] — strip → 513.
         let mut n_blob: Vec<u8> = vec![0x00];
-        n_blob.extend(std::iter::repeat(0xFFu8).take(513));
+        n_blob.extend(std::iter::repeat_n(0xFFu8, 513));
         pub_blob.extend_from_slice(&(n_blob.len() as u32).to_be_bytes());
         pub_blob.extend_from_slice(&n_blob);
 
@@ -700,7 +700,7 @@ mod tests {
         write_ssh_string(&mut pub_blob, &[0x01, 0x00, 0x01]);
         // n: 128 bytes with high bit set → mpint pad → 129 bytes; strip → 128.
         let mut n_raw = vec![0xC0u8];
-        n_raw.extend(std::iter::repeat(0xFFu8).take(127));
+        n_raw.extend(std::iter::repeat_n(0xFFu8, 127));
         write_ssh_mpint(&mut pub_blob, &n_raw);
 
         let mut o = 0usize;
@@ -710,7 +710,7 @@ mod tests {
             o,
             &[0u8; 32],
             b"rsa-sha2-256",
-            &vec![0xAAu8; 128],
+            &[0xAAu8; 128],
         ));
     }
 
@@ -728,7 +728,7 @@ mod tests {
         // Strict strip rejects the non-canonical multi-zero prefix.
         let mut mpint_payload: Vec<u8> = vec![0x00; 129]; // 1 pad + 128 extra
         mpint_payload.push(0x80);
-        mpint_payload.extend(std::iter::repeat(0xFFu8).take(127));
+        mpint_payload.extend(std::iter::repeat_n(0xFFu8, 127));
         // Wrap in SSH string framing (4-byte length prefix).
         let mut pub_blob = Vec::new();
         write_ssh_string(&mut pub_blob, b"ssh-rsa");
@@ -739,7 +739,7 @@ mod tests {
         let mut o = 0usize;
         let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
         assert!(
-            !verify_ssh_rsa(&pub_blob, o, &[0u8; 32], b"rsa-sha2-256", &vec![0xAAu8; 128]),
+            !verify_ssh_rsa(&pub_blob, o, &[0u8; 32], b"rsa-sha2-256", &[0xAAu8; 128]),
             "padded 1024-bit modulus must NOT pass — would bypass 2048-bit floor"
         );
     }

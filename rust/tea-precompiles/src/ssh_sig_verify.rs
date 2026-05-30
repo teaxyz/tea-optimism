@@ -502,7 +502,7 @@ mod tests {
         public_key: &[u8],
         signature: &[u8],
     ) -> Vec<u8> {
-        let pad32 = |n: usize| (n + 31) / 32 * 32;
+        let pad32 = |n: usize| n.div_ceil(32) * 32;
         let payload_off = 128;
         let namespace_off = payload_off + 32 + pad32(payload.len());
         let pubkey_off = namespace_off + 32 + pad32(namespace.len());
@@ -604,7 +604,7 @@ mod tests {
 
     #[test]
     fn gas_below_kink_is_base() {
-        assert_eq!(required_gas(&vec![0u8; 100]), SSHSIG_VERIFY_BASE_GAS);
+        assert_eq!(required_gas(&[0u8; 100]), SSHSIG_VERIFY_BASE_GAS);
         assert_eq!(required_gas(&[]), SSHSIG_VERIFY_BASE_GAS);
         assert_eq!(
             required_gas(&vec![0u8; SSHSIG_VERIFY_INPUT_LENGTH_KINK]),
@@ -765,7 +765,6 @@ mod tests {
         use rand_08::SeedableRng;
         use signature::Signer;
         use p256::ecdsa::{Signature, SigningKey};
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
         let signing_key = SigningKey::random(&mut rng);
@@ -787,7 +786,6 @@ mod tests {
         use rand_08::SeedableRng;
         use signature::Signer;
         use p384::ecdsa::{Signature, SigningKey};
-        use p384::elliptic_curve::sec1::ToEncodedPoint;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
         let signing_key = SigningKey::random(&mut rng);
@@ -809,7 +807,6 @@ mod tests {
         use rand_08::SeedableRng;
         use signature::Signer;
         use p521::ecdsa::{Signature, SigningKey, VerifyingKey};
-        use p521::elliptic_curve::sec1::ToEncodedPoint;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
         let signing_key = SigningKey::random(&mut rng);
@@ -1031,7 +1028,7 @@ mod tests {
         buf.extend_from_slice(&u256(128 + 32 + 64));
         buf.extend_from_slice(&u256(128 + 32 + 96));
         buf.extend_from_slice(&u256(MAX_PAYLOAD_BYTES + 1));
-        buf.extend_from_slice(&vec![0u8; 32]);
+        buf.extend_from_slice(&[0u8; 32]);
         assert_precompile_ok(&run(&buf), FAILURE_HEX);
     }
 
@@ -1050,7 +1047,7 @@ mod tests {
         // also rejected — but for the wrong reason. Post-strip, this exercises
         // the actual size cap.)
         let mut n_bytes: Vec<u8> = vec![0x00];
-        n_bytes.extend(std::iter::repeat(0xFFu8).take(513));
+        n_bytes.extend(std::iter::repeat_n(0xFFu8, 513));
         let pubkey = [
             ssh_string(b"ssh-rsa"),
             ssh_string(&[0x01, 0x00, 0x01]), // e = 65537
@@ -1067,13 +1064,13 @@ mod tests {
         // Forge a 1024-bit RSA pubkey (128-byte modulus) — below 2048-bit floor.
         let n_raw = {
             let mut v = vec![0xC0u8];
-            v.extend(std::iter::repeat(0xFFu8).take(127));
+            v.extend(std::iter::repeat_n(0xFFu8, 127));
             v
         };
         let mut pubkey = ssh_string(b"ssh-rsa");
         pubkey.extend_from_slice(&ssh_string(&[0x01, 0x00, 0x01]));
         pubkey.extend_from_slice(&ssh_mpint(&n_raw));
-        let sig = build_signature_blob(b"rsa-sha2-256", &vec![0xAAu8; 128]);
+        let sig = build_signature_blob(b"rsa-sha2-256", &[0xAAu8; 128]);
         let input = encode_input(b"payload", b"file", &pubkey, &sig);
         assert_precompile_ok(&run(&input), FAILURE_HEX);
     }
@@ -1092,7 +1089,7 @@ mod tests {
 
     #[test]
     fn truncated_offset_header_returns_failure() {
-        assert_precompile_ok(&run(&vec![0u8; 127]), FAILURE_HEX);
+        assert_precompile_ok(&run(&[0u8; 127]), FAILURE_HEX);
     }
 
     #[test]
