@@ -32,12 +32,8 @@ pub const BACKUP_TEA_PER_ETH: u64 = 1_500_000;
 
 /// Tea mainnet chain ID.
 pub const TEA_CHAIN_ID: u64 = 6122;
-/// Tea testnet 1 chain ID.
+/// Tea testnet chain ID.
 pub const TEA_TESTNET1_CHAIN_ID: u64 = 10218;
-/// Tea testnet 2 chain ID.
-pub const TEA_TESTNET2_CHAIN_ID: u64 = 14314;
-/// Nethermind Tea test network chain ID.
-pub const NETHERMIND_TEA_TESTNET_CHAIN_ID: u64 = 3257160925;
 
 /// Returns `true` if `chain_id` is a Tea network.
 ///
@@ -48,13 +44,7 @@ pub const NETHERMIND_TEA_TESTNET_CHAIN_ID: u64 = 3257160925;
 /// shared by both the execution layer (tea-reth) and the fault-proof VM (kona),
 /// so the gate cannot drift between the two.
 pub fn is_tea(chain_id: u64) -> bool {
-    matches!(
-        chain_id,
-        TEA_CHAIN_ID
-            | TEA_TESTNET1_CHAIN_ID
-            | TEA_TESTNET2_CHAIN_ID
-            | NETHERMIND_TEA_TESTNET_CHAIN_ID
-    )
+    matches!(chain_id, TEA_CHAIN_ID | TEA_TESTNET1_CHAIN_ID)
 }
 
 /// WAD = 1e18, used as scaling denominator.
@@ -140,8 +130,6 @@ mod tests {
     fn test_is_tea() {
         assert!(is_tea(TEA_CHAIN_ID));
         assert!(is_tea(TEA_TESTNET1_CHAIN_ID));
-        assert!(is_tea(TEA_TESTNET2_CHAIN_ID));
-        assert!(is_tea(NETHERMIND_TEA_TESTNET_CHAIN_ID));
         // Non-Tea chains, boundaries, and extremes.
         assert!(!is_tea(1)); // Ethereum mainnet
         assert!(!is_tea(10)); // OP mainnet

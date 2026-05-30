@@ -6,10 +6,7 @@
 //! re-exported here to preserve the `crate::chainspec::*` paths used across the
 //! crate.
 
-pub use tea_l1_cost::{
-    NETHERMIND_TEA_TESTNET_CHAIN_ID, TEA_CHAIN_ID, TEA_TESTNET1_CHAIN_ID, TEA_TESTNET2_CHAIN_ID,
-    is_tea,
-};
+pub use tea_l1_cost::{TEA_CHAIN_ID, TEA_TESTNET1_CHAIN_ID, is_tea};
 
 #[cfg(test)]
 mod tests {
@@ -19,13 +16,11 @@ mod tests {
     use super::*;
 
     /// Ported from: `IsTea()` (params/config.go:1034)
-    /// Validates all four Tea chain IDs and negative cases.
+    /// Validates both Tea chain IDs and negative cases.
     #[test]
     fn test_is_tea() {
         assert!(is_tea(TEA_CHAIN_ID));
         assert!(is_tea(TEA_TESTNET1_CHAIN_ID));
-        assert!(is_tea(TEA_TESTNET2_CHAIN_ID));
-        assert!(is_tea(NETHERMIND_TEA_TESTNET_CHAIN_ID));
         assert!(!is_tea(1)); // Ethereum mainnet
         assert!(!is_tea(10)); // OP mainnet
         assert!(!is_tea(0));
@@ -41,10 +36,6 @@ mod tests {
         assert!(!is_tea(TEA_CHAIN_ID + 1)); // 6123
         assert!(!is_tea(TEA_TESTNET1_CHAIN_ID - 1)); // 10217
         assert!(!is_tea(TEA_TESTNET1_CHAIN_ID + 1)); // 10219
-        assert!(!is_tea(TEA_TESTNET2_CHAIN_ID - 1)); // 14313
-        assert!(!is_tea(TEA_TESTNET2_CHAIN_ID + 1)); // 14315
-        assert!(!is_tea(NETHERMIND_TEA_TESTNET_CHAIN_ID - 1)); // 3257160924
-        assert!(!is_tea(NETHERMIND_TEA_TESTNET_CHAIN_ID + 1)); // 3257160926
     }
 
     /// u64::MAX should not be a Tea chain ID.
