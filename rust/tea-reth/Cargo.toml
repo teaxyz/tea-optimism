@@ -34,8 +34,9 @@ tea-l1-cost.workspace = true
 
 # tea precompiles (GPG/SSH/SSHSIG verify at 0x0696-0x0698). Lives in its own
 # std crate so kona-host's fault-proof accelerator runs the exact same crypto
-# as the EL — see tea-precompiles/src/lib.rs.
-tea-precompiles.workspace = true
+# as the EL — see tea-precompiles/src/lib.rs. The EL needs the full crypto, so
+# enable `std` (the workspace dep defaults it off for the no_std FPVM).
+tea-precompiles = { workspace = true, features = ["std"] }
 
 # misc
 clap = { workspace = true, features = ["derive", "env"] }

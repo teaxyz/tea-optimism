@@ -18,5 +18,10 @@ mod ecrecover;
 mod kzg_point_eval;
 mod utils;
 
+// Tea custom verification precompiles (0x0696-0x0698), host-accelerated.
+mod gpg_verify;
+mod ssh_sig_verify;
+mod ssh_verify;
+
 #[cfg(test)]
 mod test_utils;

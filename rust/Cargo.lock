@@ -5780,6 +5780,7 @@ dependencies = [
  "sha2",
  "spin 0.10.0",
  "tea-l1-cost",
+ "tea-precompiles",
  "tea-reth",
  "thiserror 2.0.18",
  "tokio",
@@ -6054,6 +6055,7 @@ dependencies = [
  "rocksdb",
  "serde",
  "serde_json",
+ "tea-precompiles",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -14748,6 +14750,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "tea-precompiles"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "ed25519-dalek",
+ "hex",
+ "p256",
+ "p384",
+ "p521",
+ "pgp",
+ "rand 0.8.5",
+ "revm",
+ "rsa",
+ "sha2",
+ "signature",
+]
+
+[[package]]
 name = "tea-reth"
 version = "0.1.0"
 dependencies = [
@@ -14755,16 +14775,10 @@ dependencies = [
  "alloy-op-evm",
  "alloy-primitives",
  "clap",
- "ed25519-dalek",
  "eyre",
  "hex",
  "op-alloy-network",
  "op-revm",
- "p256",
- "p384",
- "p521",
- "pgp",
- "rand 0.8.5",
  "reth-cli-util",
  "reth-node-builder",
  "reth-op",
@@ -14772,10 +14786,8 @@ dependencies = [
  "reth-optimism-cli",
  "reth-optimism-forks",
  "revm",
- "rsa",
- "sha2",
- "signature",
  "tea-l1-cost",
+ "tea-precompiles",
  "tracing",
 ]
 
