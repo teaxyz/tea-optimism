@@ -291,7 +291,7 @@ kona-macros = { path = "kona/crates/utilities/macros", version = "0.1.2", defaul
 # ==================== TEA INTERNAL CRATES ====================
 tea-l1-cost = { path = "tea-l1-cost", version = "0.1.0", default-features = false }
 tea-trace-ctx = { path = "tea-trace-ctx", version = "0.1.0" }
-tea-precompiles = { path = "tea-precompiles", version = "0.1.0" }
+tea-precompiles = { path = "tea-precompiles", version = "0.1.0", default-features = false }
 
 # ==================== OP-RETH INTERNAL CRATES ====================
 op-reth = { path = "op-reth/bin/" }

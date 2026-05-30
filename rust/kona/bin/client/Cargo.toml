@@ -47,6 +47,12 @@ alloy-evm = { workspace = true, features = ["op"] }
 # arithmetic, and backup-rate fallback in one place so FPVM cannot drift)
 tea-l1-cost.workspace = true
 
+# Tea precompiles — the FPVM links only the no_std `gas` slice (addresses + gas
+# schedule). The crypto is std-gated and runs on the host via the accelerated-
+# precompile path; default-features = false keeps the crypto out of the FPVM.
+# See TEAO1-174.
+tea-precompiles = { workspace = true }
+
 # General
 lru.workspace = true
 spin.workspace = true
@@ -67,6 +73,9 @@ sha2.workspace = true
 # tea-reth is publish=false within this workspace.
 tea-reth = { path = "../../../tea-reth" }
 tea-l1-cost.workspace = true
+# std crypto, so the accelerated-precompile parity tests can run the Tea
+# precompiles natively (mock host) and compare against the FPVM stub result.
+tea-precompiles = { workspace = true, features = ["std"] }
 alloy-primitives = { workspace = true, features = ["std"] }
 revm = { workspace = true, features = ["std"] }
 op-revm = { workspace = true, features = ["std"] }
