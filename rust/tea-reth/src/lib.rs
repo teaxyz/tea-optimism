@@ -13,4 +13,3 @@
 pub mod chainspec;
 pub mod evm;
 pub mod l1_cost;
-pub mod precompiles;
