@@ -66,6 +66,13 @@ thiserror.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 kona-preimage = { workspace = true, features = ["std"] }
+# std `block_on`: the accelerated-precompile test harness drives the mock host
+# and client on a multi_thread runtime and relies on `kona_proof::block_on`
+# using `block_in_place` + a real runtime. Without kona-proof's `std` feature
+# the no_std busy-wait `block_on` (no-op waker) compiles instead and the oracle
+# round-trip never makes progress -> the tests deadlock. Dev-dep only, so the
+# FPVM/no_std binary build is unaffected.
+kona-proof = { workspace = true, features = ["std"] }
 sha2.workspace = true
 # Cross-executor parity tests: prove that an EVM produced by tea-reth's
 # TeaEvmFactory (EL) and one produced by FpvmOpEvmFactory (FPVM) compute
