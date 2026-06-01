@@ -154,4 +154,112 @@ mod tests {
         assert_eq!(isthmus_first, isthmus);
         assert_eq!(fjord_second, fjord);
     }
+
+    // ── Multiplier installation on EVM construction (TEAO1-132/164/167/178) ──
+    //
+    // Every EVM the node builds is created through this factory: block
+    // execution, eth_call, eth_estimateGas, eth_simulateV1 (via base-reth's
+    // `evm_with_env` -> `create_evm`), and trace replay (via
+    // `evm_with_env_and_inspector` -> `create_evm_with_inspector`). Proving the
+    // factory installs the TEA L1-cost multiplier on a Tea chain (and leaves it
+    // `None` off-Tea) therefore proves the multiplier reaches every EVM-based
+    // RPC path with no per-RPC override:
+    //   - 164 (eth_simulateV1): covered by `create_evm`.
+    //   - 178 (trace replay):   covered by `create_evm_with_inspector`; a trace
+    //                           thus reproduces exactly what the EL charged.
+    //   - 167 (state-conditional re-validation): the txpool leg is
+    //     `apply_op_checks` (tested in the txpool crate); the payload/execution
+    //     leg is this factory.
+
+    /// A `Database` stub returning a fixed value for the GasPriceOracle's
+    /// `LATEST_PRICE_RATIO_SLOT` and defaults elsewhere — mirrors the kona
+    /// FPVM-side `OracleDb` so both sides exercise the same construction path.
+    #[derive(Debug, Default)]
+    struct OracleDb {
+        slot_value: U256,
+    }
+
+    // Implement the underlying `revm::Database`; `alloy_evm::Database` (the
+    // bound `create_evm` requires) is then satisfied by its blanket impl.
+    impl revm::Database for OracleDb {
+        type Error = core::convert::Infallible;
+
+        fn basic(
+            &mut self,
+            _address: alloy_primitives::Address,
+        ) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
+            Ok(None)
+        }
+
+        fn code_by_hash(
+            &mut self,
+            _code_hash: alloy_primitives::B256,
+        ) -> Result<revm::state::Bytecode, Self::Error> {
+            Ok(revm::state::Bytecode::default())
+        }
+
+        fn storage(
+            &mut self,
+            address: alloy_primitives::Address,
+            index: U256,
+        ) -> Result<U256, Self::Error> {
+            if address == l1_cost::GAS_PRICE_ORACLE_ADDR
+                && index == l1_cost::LATEST_PRICE_RATIO_SLOT_U256
+            {
+                Ok(self.slot_value)
+            } else {
+                Ok(U256::ZERO)
+            }
+        }
+
+        fn block_hash(&mut self, _number: u64) -> Result<alloy_primitives::B256, Self::Error> {
+            Ok(alloy_primitives::B256::ZERO)
+        }
+    }
+
+    fn tea_env() -> EvmEnv<OpSpecId> {
+        let cfg = revm::context::CfgEnv::new()
+            .with_chain_id(crate::chainspec::TEA_CHAIN_ID)
+            .with_spec_and_mainnet_gas_params(OpSpecId::default());
+        EvmEnv { cfg_env: cfg, ..Default::default() }
+    }
+
+    /// TEAO1-164: eth_simulateV1 builds its EVM via `evm_with_env` ->
+    /// `create_evm`. On a Tea chain the constructed EVM must carry the
+    /// oracle-derived multiplier so the simulation charges the real L1 cost.
+    #[test]
+    fn create_evm_installs_multiplier_on_tea_chain() {
+        let oracle_rate = U256::from(42u64) * l1_cost::WAD;
+        let expected = l1_cost::multiplier_from_oracle_value(oracle_rate);
+        let evm = TeaEvmFactory.create_evm(OracleDb { slot_value: oracle_rate }, tea_env());
+        assert_eq!(evm.ctx().chain.l1_cost_multiplier, Some(expected));
+    }
+
+    /// TEAO1-178: trace replay builds its EVM via `evm_with_env_and_inspector`
+    /// -> `create_evm_with_inspector`. That path must install the same
+    /// multiplier so a trace faithfully reproduces what the EL charged.
+    #[test]
+    fn create_evm_with_inspector_installs_multiplier_on_tea_chain() {
+        let oracle_rate = U256::from(7u64) * l1_cost::WAD;
+        let expected = l1_cost::multiplier_from_oracle_value(oracle_rate);
+        let evm = TeaEvmFactory.create_evm_with_inspector(
+            OracleDb { slot_value: oracle_rate },
+            tea_env(),
+            NoOpInspector,
+        );
+        assert_eq!(evm.ctx().chain.l1_cost_multiplier, Some(expected));
+    }
+
+    /// Off-Tea chains must never receive the multiplier (TEAO1-132); the same
+    /// RPC paths then compute L1 cost as canonical Optimism.
+    #[test]
+    fn create_evm_leaves_multiplier_none_off_tea() {
+        let cfg = revm::context::CfgEnv::new()
+            .with_chain_id(1)
+            .with_spec_and_mainnet_gas_params(OpSpecId::default());
+        let env = EvmEnv { cfg_env: cfg, ..Default::default() };
+        let evm = TeaEvmFactory
+            .create_evm(OracleDb { slot_value: U256::from(42u64) * l1_cost::WAD }, env);
+        assert_eq!(evm.ctx().chain.l1_cost_multiplier, None);
+    }
 }

@@ -69,6 +69,10 @@ fn main() {
 
     if let Err(err) =
         Cli::<OpChainSpecParser, RollupArgs>::parse().run(async move |builder, rollup_args| {
+            // TEAO1-152: reject the unsupported proofs-history flag fail-closed
+            // (see `ensure_proofs_history_unsupported`).
+            ensure_proofs_history_unsupported(rollup_args.proofs_history)?;
+
             let node = OpNode::new(rollup_args);
 
             info!(target: "tea_reth", "Launching Tea node with custom precompiles");
@@ -97,5 +101,36 @@ fn main() {
     {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
+    }
+}
+
+/// TEAO1-152: tea-reth does not wire op-reth's historical state-proof stack
+/// (`OpProofsExEx` / eth_getProof-history serving, which is unrelated to the
+/// kona fault proof). Reject the proofs-history flag explicitly rather than
+/// silently accepting and ignoring it. To enable the feature, install
+/// `OpProofsExEx` in the node launcher above instead of rejecting here.
+fn ensure_proofs_history_unsupported(proofs_history_enabled: bool) -> eyre::Result<()> {
+    if proofs_history_enabled {
+        eyre::bail!(
+            "--proofs-history is not supported by tea-reth: the historical \
+             state-proof (eth_getProof history) stack is not wired into this \
+             node. Remove the flag, or enable the OpProofsExEx stack if proof \
+             history is required."
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_proofs_history_unsupported;
+
+    /// TEAO1-152: the proofs-history flag must be rejected fail-closed, not
+    /// silently accepted (the stack is never installed, so accepting it would
+    /// mislead operators into thinking proof history is being served).
+    #[test]
+    fn proofs_history_flag_is_rejected() {
+        assert!(ensure_proofs_history_unsupported(true).is_err());
+        assert!(ensure_proofs_history_unsupported(false).is_ok());
     }
 }
