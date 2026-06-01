@@ -95,11 +95,14 @@ where
         // sampled from the *parent* block's post-state: the executor builds the
         // block's EVM once over parent state and op-revm preserves that
         // multiplier across the per-tx `L1BlockInfo` reloads, so every tx in
-        // this block was charged with the parent-state ratio (the intra-block
-        // refresh is the separate, still-deferred TEAO1-147). Reading the same
-        // state here keeps the receipt faithful to the deduction. Off-Tea
-        // chains (and missing state) leave the multiplier `None` -> raw OP fee,
-        // identical to upstream.
+        // this block was charged with the parent-state ratio. That block-boundary
+        // freeze is intentional, not a lag to fix: the multiplier is sourced from
+        // an AMM pool oracle whose spot price is flash-loan-manipulable within a
+        // block, so charging must read the pool's settled (parent-block) state,
+        // never an intermediate same-block value (Cantina TEAO1-147 — Won't-fix,
+        // by design). Reading that same state here keeps the receipt faithful to
+        // the deduction. Off-Tea chains (and missing state) leave the multiplier
+        // `None` -> raw OP fee, identical to upstream.
         if tea_l1_cost::is_tea(self.provider.chain_spec().chain().id()) {
             if let Some(parent) = block.header().number().checked_sub(1) {
                 if let Ok(state) = self.provider.history_by_block_number(parent) {
