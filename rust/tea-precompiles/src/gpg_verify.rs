@@ -187,6 +187,14 @@ fn read_dynamic_bytes(input: &[u8], offset: usize) -> Result<Vec<u8>, &'static s
     Ok(input[header_end..data_end].to_vec())
 }
 
+/// Only Binary-class signatures bind the exact 32-byte message digest the
+/// precompile is asked to verify. Text signatures canonicalize line endings, so
+/// distinct byte strings collide (TEAO1-166); Timestamp and Standalone
+/// signatures bind no message data at all (TEAO1-148). Accept Binary only.
+fn is_accepted_sig_type(typ: Option<SignatureType>) -> bool {
+    typ == Some(SignatureType::Binary)
+}
+
 /// GPG verify precompile entry point.
 ///
 /// Signature: `fn(&[u8], u64) -> PrecompileResult`
@@ -257,11 +265,8 @@ fn gpg_verify_run(input: &[u8], gas_limit: u64) -> PrecompileResult {
         }
     };
 
-    // Only Binary-class signatures bind the exact 32-byte message. Text
-    // signatures canonicalize line endings, so distinct byte strings collide
-    // (TEAO1-166); Timestamp and Standalone signatures bind no message data at
-    // all (TEAO1-148). Reject everything but Binary.
-    if sig.signature.typ() != Some(SignatureType::Binary) {
+    // Reject everything but Binary (TEAO1-166 / TEAO1-148) — see `is_accepted_sig_type`.
+    if !is_accepted_sig_type(sig.signature.typ()) {
         return PrecompileResult::Ok(PrecompileOutput::new(gas_cost, failure_result()));
     }
 
@@ -873,6 +878,19 @@ mod tests {
         let gas = required_gas(&input);
         let result = gpg_verify_run(&input, gas);
         assert_precompile_ok(&result, gas, SUCCESS_HEX);
+    }
+
+    /// TEAO1-148 (explicit): the binary-only gate rejects Timestamp and
+    /// Standalone signature classes (which bind no message data) and Text
+    /// (TEAO1-166), accepting only Binary. Deterministic coverage of the gate
+    /// predicate across the classes the high-level signing API can't forge.
+    #[test]
+    fn only_binary_sig_type_accepted() {
+        assert!(is_accepted_sig_type(Some(SignatureType::Binary)));
+        for typ in [SignatureType::Text, SignatureType::Standalone, SignatureType::Timestamp] {
+            assert!(!is_accepted_sig_type(Some(typ)), "{typ:?} must be rejected");
+        }
+        assert!(!is_accepted_sig_type(None));
     }
 
     /// TEAO1-141: a subkey grafted from a different certificate has no valid
