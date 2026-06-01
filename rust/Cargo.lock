@@ -12025,6 +12025,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strum",
+ "tea-l1-cost",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
