@@ -15,7 +15,7 @@ Scope basis: the 52-file Tea fork delta vs upstream Optimism `v1.16.7`. Triage i
 | ⛔ Out of scope | 22 | Pre-existing upstream Optimism — not in the Tea fork delta |
 | **Total** | **61** | |
 
-> **Updated 2026-06-01:** 6 fault-proof findings moved Deferred → N/A after the permissioned-launch decision (see [Update 2026-06-01](#update-2026-06-01) below). The later 2026-05-19 precompile security audit (F-1…F-8) is **not** part of these 61 — it is folded into the update section for completeness.
+> **Updated 2026-06-01:** 6 fault-proof findings moved Deferred → N/A after the permissioned-launch decision (see [Update 2026-06-01](#update-2026-06-01) below).
 
 ## PR → findings
 
@@ -27,15 +27,15 @@ Scope basis: the 52-file Tea fork delta vs upstream Optimism `v1.16.7`. Triage i
 | #21 — chain-gate multiplier + per-spec precompiles | 132, 145 |
 | #22 — CGT deployer intent validation + bridge wiring | 139 |
 | #23 — TeaWAP fee-math (de-quantize / cache-consistent / backup fallback) + oracle write-guard tests | 165, 185, 189 |
-| #27 — mirror Tea GPG/SSH/SSHSIG precompiles into the kona FPVM | 174 (N/A under permissioned — see update) + precompile-audit F-1/F-2/F-4 |
+| #27 — mirror Tea GPG/SSH/SSHSIG precompiles into the kona FPVM | 174 (N/A under permissioned — see update) |
 | #24 — `build-tea-reth` recipe fix | _(not an audit finding — build infra)_ |
 | #25 — `.gitignore .waaah` | _(not an audit finding — chore)_ |
 
 ---
 
-## <a name="update-2026-06-01"></a>Update 2026-06-01 — re-disposition + precompile audit
+## <a name="update-2026-06-01"></a>Update 2026-06-01 — fault-proof re-disposition (permissioned launch)
 
-Two changes since the 2025-05-27 triage: (1) mainnet launches with the **permissioned** dispute game and **kona** (not the Go op-program) as the fault-proof client — which makes the deferred fault-proof findings N/A for launch; (2) a separate **2026-05-19 precompile security audit** (tea-infra-do `docs/audits/tea-reth-precompiles-2026-05-19.md`) surfaced findings outside the Cantina 61.
+Mainnet launches with the **permissioned** dispute game and **kona** (not the Go op-program) as the fault-proof client. That re-dispositions the deferred fault-proof findings below from Deferred to N/A for the permissioned launch.
 
 **Re-dispositioned Deferred → N/A (6):**
 
@@ -48,18 +48,7 @@ Two changes since the 2025-05-27 triage: (1) mainnet launches with the **permiss
 | TEAO1-136 | ⚪ N/A while genesis-active — **guarded** | The clobber is op-node injecting **stock GPO/L1Block implementation bytecode** (an impl swap via `upgradeTo`, *not* a fallback-storage reset) at a fork-**activation** block. Tea mainnet has every fork at `time:0`; op-node does not inject upgrade txs for genesis-active forks (`IsEcotoneActivationBlock` — "activation at genesis does not count"), so it never fires. **GUARD:** any future fork scheduled at a non-zero timestamp MUST first patch that fork's `*_upgrade_transactions.go` to inject Tea's `+CGT` bytecode. |
 | TEAO1-140 | ⚪ N/A while genesis-active — **guarded** | Sibling of 136 (Ecotone would replace `L1BlockCGT` with stock `L1Block`, dropping the `updateGasTokenPriceRatio()` hook). Same genesis-active disarm + future-fork guard. |
 
-**Precompile audit (2026-05-19) — outside the Cantina 61, tracked here for completeness:**
-
-| F | Sev | Status |
-|---|-----|--------|
-| F-1 GPG `0x0696` ABI-decoder panic → consensus halt | Critical | ✅ **Fixed** in #27 (`d84f9e39b3`). Was live on the mainnet EL; empirically reproduced, hardened (checked_add / upper-24 reject / try_from) + regression-tested. |
-| F-2 ECDSA compressed-key aliasing | Medium | ✅ Fixed in #27 (uncompressed-SEC1 gate). |
-| F-4 `gpg_required_gas` overflow | Low | ✅ Fixed in #27 (saturating). |
-| F-3 GPG `Err` vs `bytes32(0)` | Low | 🚫 Won't-fix (FPVM stubs depend on the `Err`-propagation convention). |
-| F-8 GPG missing byte caps | Info | 🚫 Won't-do (uncappable — a real multi-subkey key fixture is 9504 bytes; already bounded by `input.len()` + pgp parser). |
-| F-5 / F-6 / F-7 | Info | Open (cosmetic / future gas-sizing). |
-
-⚠️ **Deployment dependency:** because F-1/F-2 change EL precompile behavior, merging #27 requires an **EL (tea-reth) fleet redeploy in lockstep with the new FPVM prestate** so EL ≡ kona-host ≡ FPVM.
+> Scope note: this tracker covers the **61 Cantina findings only**. The separate 2026-05-19 precompile audit (F-1…F-8) and the 2026-05-27 security audit (CR-/H-/L-) are tracked in their own tea-infra-do docs, not here.
 
 ---
 
