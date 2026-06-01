@@ -388,9 +388,21 @@ fn pad_scalars(
     Some((r_padded, s_padded))
 }
 
+/// RFC 5656 §3.1 mandates the *uncompressed* SEC1 point (`0x04 ‖ X ‖ Y`).
+/// `VerifyingKey::from_sec1_bytes` would otherwise also accept compressed
+/// (`0x02`/`0x03`) encodings, letting two distinct `publicKey` blobs map to the
+/// same key — which breaks callers that hash the blob to derive an on-chain
+/// identity. `field_bytes` is the curve coordinate width (32/48/66).
+fn is_uncompressed_sec1(q_bytes: &[u8], field_bytes: usize) -> bool {
+    q_bytes.first() == Some(&0x04) && q_bytes.len() == 1 + 2 * field_bytes
+}
+
 /// Verify ECDSA on P-256 with SHA-256.
 fn verify_ecdsa_p256(q_bytes: &[u8], message: &[u8], r: &[u8], s: &[u8]) -> bool {
     use p256::ecdsa::{Signature, VerifyingKey};
+    if !is_uncompressed_sec1(q_bytes, 32) {
+        return false;
+    }
     let verifying_key = match VerifyingKey::from_sec1_bytes(q_bytes) {
         Ok(k) => k,
         Err(_) => return false,
@@ -419,6 +431,9 @@ fn verify_ecdsa_p256(q_bytes: &[u8], message: &[u8], r: &[u8], s: &[u8]) -> bool
 /// Verify ECDSA on P-384 with SHA-384.
 fn verify_ecdsa_p384(q_bytes: &[u8], message: &[u8], r: &[u8], s: &[u8]) -> bool {
     use p384::ecdsa::{Signature, VerifyingKey};
+    if !is_uncompressed_sec1(q_bytes, 48) {
+        return false;
+    }
     let verifying_key = match VerifyingKey::from_sec1_bytes(q_bytes) {
         Ok(k) => k,
         Err(_) => return false,
@@ -447,6 +462,9 @@ fn verify_ecdsa_p384(q_bytes: &[u8], message: &[u8], r: &[u8], s: &[u8]) -> bool
 /// `[0, 66]` bytes — `pad_scalars` handles the left-pad to exactly 66.
 fn verify_ecdsa_p521(q_bytes: &[u8], message: &[u8], r: &[u8], s: &[u8]) -> bool {
     use p521::ecdsa::{Signature, VerifyingKey};
+    if !is_uncompressed_sec1(q_bytes, 66) {
+        return false;
+    }
     let verifying_key = match VerifyingKey::from_sec1_bytes(q_bytes) {
         Ok(k) => k,
         Err(_) => return false,
@@ -922,6 +940,47 @@ mod tests {
             build_ecdsa_pubkey_blob(b"ecdsa-sha2-nistp256", b"nistp256", &q_bytes);
         let sig_blob = build_ecdsa_sig_blob(&r, &s);
         (pub_blob, b"ecdsa-sha2-nistp256".to_vec(), sig_blob)
+    }
+
+    #[test]
+    fn is_uncompressed_sec1_gate() {
+        // F-2: only `0x04 ‖ X ‖ Y` of the exact curve width is accepted.
+        assert!(!is_uncompressed_sec1(&[0x02; 33], 32)); // compressed p256
+        assert!(!is_uncompressed_sec1(&[0x03; 33], 32));
+        assert!(!is_uncompressed_sec1(&[0x04; 64], 32)); // wrong length
+        assert!(is_uncompressed_sec1(&[0x04; 65], 32)); // valid p256
+        assert!(!is_uncompressed_sec1(&[0x04; 65], 48)); // p384 width mismatch
+        assert!(is_uncompressed_sec1(&[0x04; 97], 48)); // valid p384
+        assert!(is_uncompressed_sec1(&[0x04; 133], 66)); // valid p521
+    }
+
+    #[test]
+    fn verify_ecdsa_p256_rejects_compressed_pubkey() {
+        // F-2 regression: the *compressed* encoding of a key whose uncompressed
+        // form verifies a signature must itself be rejected (RFC 5656 §3.1), so
+        // two distinct `publicKey` blobs cannot alias onto the same key.
+        use p256::ecdsa::{Signature, SigningKey};
+        use signature::Signer as EcdsaSigner;
+
+        let mut rng = rand_08::rngs::StdRng::from_seed_helper();
+        let signing_key = SigningKey::random(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        let message = b"f-2 regression message";
+        let signature: Signature = signing_key.sign(message);
+        let signature = signature.normalize_s().unwrap_or(signature);
+        let (r, s) = signature.split_bytes();
+
+        let q_uncompressed = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+        let q_compressed = verifying_key.to_encoded_point(true).as_bytes().to_vec();
+
+        assert!(
+            verify_ecdsa_p256(&q_uncompressed, message, &r, &s),
+            "uncompressed key must still verify"
+        );
+        assert!(
+            !verify_ecdsa_p256(&q_compressed, message, &r, &s),
+            "compressed key must be rejected (F-2)"
+        );
     }
 
     fn sign_ecdsa_nistp384(message: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
