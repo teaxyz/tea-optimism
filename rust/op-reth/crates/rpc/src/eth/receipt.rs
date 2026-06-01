@@ -18,7 +18,7 @@ use reth_rpc_eth_api::{
     transaction::{ConvertReceiptInput, ReceiptConverter},
 };
 use reth_rpc_eth_types::{EthApiError, receipt::build_receipt};
-use reth_storage_api::BlockReader;
+use reth_storage_api::{BlockReader, StateProvider, StateProviderFactory};
 use std::fmt::Debug;
 
 impl<N, Rpc> LoadReceipt for OpEthApi<N, Rpc>
@@ -44,8 +44,11 @@ impl<Provider> OpReceiptConverter<Provider> {
 impl<Provider, N> ReceiptConverter<N> for OpReceiptConverter<Provider>
 where
     N: NodePrimitives<SignedTx: OpTransaction, Receipt = OpReceipt>,
-    Provider:
-        BlockReader<Block = N::Block> + ChainSpecProvider<ChainSpec: OpHardforks> + Debug + 'static,
+    Provider: BlockReader<Block = N::Block>
+        + ChainSpecProvider<ChainSpec: OpHardforks>
+        + StateProviderFactory
+        + Debug
+        + 'static,
 {
     type RpcReceipt = OpTransactionReceipt;
     type Error = OpEthApiError;
@@ -84,6 +87,35 @@ where
                 return Err(err.into());
             }
         };
+
+        // TEAO1-170/133/161: report the TEA-scaled L1 fee that was actually
+        // charged, not the raw OP fee. `l1_tx_data_fee` (via op-revm
+        // `calculate_tx_l1_cost`) multiplies the cost when `l1_cost_multiplier`
+        // is set, so we install the GasPriceOracle multiplier here. It is
+        // sampled from the *parent* block's post-state: the executor builds the
+        // block's EVM once over parent state and op-revm preserves that
+        // multiplier across the per-tx `L1BlockInfo` reloads, so every tx in
+        // this block was charged with the parent-state ratio (the intra-block
+        // refresh is the separate, still-deferred TEAO1-147). Reading the same
+        // state here keeps the receipt faithful to the deduction. Off-Tea
+        // chains (and missing state) leave the multiplier `None` -> raw OP fee,
+        // identical to upstream.
+        if tea_l1_cost::is_tea(self.provider.chain_spec().chain().id()) {
+            if let Some(parent) = block.header().number().checked_sub(1) {
+                if let Ok(state) = self.provider.history_by_block_number(parent) {
+                    let raw = state
+                        .storage(
+                            tea_l1_cost::GAS_PRICE_ORACLE_ADDR,
+                            tea_l1_cost::LATEST_PRICE_RATIO_SLOT,
+                        )
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    l1_block_info.l1_cost_multiplier =
+                        Some(tea_l1_cost::multiplier_from_oracle_value(raw));
+                }
+            }
+        }
 
         let mut receipts = Vec::with_capacity(inputs.len());
 
@@ -479,6 +511,58 @@ mod test {
             TX_META_TX_1_OP_MAINNET_BLOCK_124665056.l1_block_info.da_footprint_gas_scalar,
             "incorrect da footprint gas scalar"
         );
+    }
+
+    /// TEAO1-170/133/161: when the Tea receipt converter installs the
+    /// GasPriceOracle multiplier on the `L1BlockInfo`, the receipt's `l1Fee`
+    /// must scale by it — reporting the TEA-denominated fee the EL actually
+    /// deducted rather than the raw OP fee stock op-reth reports. The converter
+    /// reads that multiplier from parent-block state and sets it; this test
+    /// pins the scaling wiring it relies on.
+    #[test]
+    fn tea_multiplier_scales_receipt_l1_fee() {
+        let tx_1 =
+            OpTransactionSigned::decode_2718(&mut TX_1_OP_MAINNET_BLOCK_124665056.as_slice())
+                .unwrap();
+        let block: Block<OpTransactionSigned> = Block {
+            body: BlockBody {
+                transactions: vec![
+                    OpTransactionSigned::decode_2718(
+                        &mut TX_SET_L1_BLOCK_OP_MAINNET_BLOCK_124665056.as_slice(),
+                    )
+                    .unwrap(),
+                    tx_1.clone(),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut l1_block_info =
+            reth_optimism_evm::extract_l1_info(&block.body).expect("should extract l1 info");
+
+        // Raw OP fee (no multiplier) — what stock op-reth reports.
+        let raw = OpReceiptFieldsBuilder::new(BLOCK_124665056_TIMESTAMP, 124665056)
+            .l1_block_info(&*OP_MAINNET, &tx_1, &mut l1_block_info)
+            .expect("should parse revm l1 info")
+            .build()
+            .l1_block_info
+            .l1_fee
+            .expect("l1 fee present");
+        assert_eq!(raw, 24681034813, "raw OP l1 fee sanity check");
+
+        // With a 3x GasPriceOracle multiplier installed (as the Tea converter
+        // does from the oracle slot), the reported l1Fee must triple.
+        l1_block_info.clear_tx_l1_cost();
+        l1_block_info.l1_cost_multiplier =
+            Some((U256::from(3u64) * tea_l1_cost::WAD, tea_l1_cost::WAD));
+        let scaled = OpReceiptFieldsBuilder::new(BLOCK_124665056_TIMESTAMP, 124665056)
+            .l1_block_info(&*OP_MAINNET, &tx_1, &mut l1_block_info)
+            .expect("should parse revm l1 info")
+            .build()
+            .l1_block_info
+            .l1_fee
+            .expect("l1 fee present");
+        assert_eq!(scaled, raw * 3, "receipt l1Fee must scale by the TEA multiplier");
     }
 
     #[test]
