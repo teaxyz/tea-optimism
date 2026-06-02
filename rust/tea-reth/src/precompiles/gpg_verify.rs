@@ -37,6 +37,7 @@
 use alloy_primitives::{Address, Bytes, address};
 use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey, SignedPublicSubKey};
 use pgp::packet::{Packet, PacketParser, SignatureType};
+use pgp::ser::Serialize;
 use pgp::types::KeyDetails;
 use revm::precompile::{Precompile, PrecompileId, PrecompileOutput, PrecompileResult};
 use std::io::Cursor;
@@ -112,30 +113,25 @@ fn fingerprint_to_key_id(fp: &pgp::types::Fingerprint) -> [u8; 8] {
 ///    treat *any* packet error, *any* Marker/Padding packet, or *any* trailing
 ///    byte the parser stops short of as a hard rejection. The verified bytes are
 ///    then the only bytes that could have produced this object.
-fn parse_single<T: Deserializable>(bytes: &[u8]) -> Result<T, &'static str> {
-    // Strict packet scan — no lenient filtering. Collect every packet, failing
-    // closed on anything `filter_parsed_packet_results` would otherwise drop.
+fn parse_single<T: Deserializable + Serialize>(bytes: &[u8]) -> Result<T, &'static str> {
+    // (Checklist item 2 — stop filtering.) Drive the low-level `PacketParser`
+    // directly so we bypass `filter_parsed_packet_results`, which silently drops
+    // Marker, Padding, `Unsupported`, `InvalidPacketContent(Unsupported|
+    // EllipticCurve)`, and `PacketIncomplete` packets. We reject every one of
+    // those instead of skipping it: any packet-parse error, and any Marker or
+    // Padding packet, fails closed here.
     let mut parser = PacketParser::new(Cursor::new(bytes));
     let mut packets: Vec<Packet> = Vec::new();
     for parsed in parser.by_ref() {
         match parsed {
-            // Marker and Padding carry no proof material; the lenient path drops
-            // them, so they are a free vector for appending non-canonical bytes.
             Ok(Packet::Marker(_)) | Ok(Packet::Padding(_)) => return Err("disallowed packet"),
             Ok(pkt) => packets.push(pkt),
-            // Unsupported / incomplete / malformed packets: reject, never skip.
             Err(_) => return Err("malformed packet"),
         }
     }
-    // The parser stops at a clean EOF. If it halted before the end of the slice
-    // (e.g. a truncated trailing header it could not begin to parse), bytes
-    // remain unconsumed — reject rather than silently discard the tail.
-    if parser.into_inner().position() as usize != bytes.len() {
-        return Err("trailing bytes");
-    }
 
     // Build composed objects from the strictly-parsed packets, requiring exactly
-    // one (TEAO1-172).
+    // one (TEAO1-172 — a second appended object must not be silently ignored).
     let mut iter = T::from_packets(packets.into_iter().map(Ok).peekable());
     let first = match iter.next() {
         Some(Ok(obj)) => obj,
@@ -143,6 +139,20 @@ fn parse_single<T: Deserializable>(bytes: &[u8]) -> Result<T, &'static str> {
     };
     if iter.next().is_some() {
         return Err("trailing object");
+    }
+
+    // (Checklist items 1 & 3 — full consumption via canonical re-encoding.)
+    // `PacketParser` swallows an *incomplete trailing header* as a clean EOF: it
+    // consumes the stray byte(s) while trying to read the header, then returns
+    // `None`, so a cursor-position check alone misses a single appended byte
+    // such as 0x80/0xFF/0xCA. Reserialize the parsed object and require the
+    // caller-supplied bytes to equal that canonical encoding exactly. This
+    // rejects *any* trailing or dropped bytes — the verified bytes are then
+    // precisely the object's canonical encoding and nothing else. (All shipped
+    // GPG fixtures round-trip byte-for-byte, so legitimate input is unaffected.)
+    let canonical = first.to_bytes().map_err(|_| "reserialize failed")?;
+    if canonical != bytes {
+        return Err("non-canonical encoding");
     }
     Ok(first)
 }
@@ -833,6 +843,53 @@ mod tests {
             ),
             "truncated packet tail on signature must be rejected"
         );
+    }
+
+    /// TEAO1-196 regression: an *incomplete trailing packet header* is the
+    /// subtlest variant — `PacketParser` consumes the stray byte(s) while trying
+    /// to read a header, then reports a clean EOF, so a cursor-position check
+    /// alone would accept it. Each of these single/partial-header tails appended
+    /// to either blob must be rejected by the canonical re-encoding gate. Every
+    /// tail is also verified to change the raw bytes (so the test can't silently
+    /// pass on a no-op mutation).
+    #[test]
+    fn test_gpg_verify_rejects_partial_trailing_header_bytes() {
+        // 0x80 / 0xFF / 0xCA / 0xC2 / 0xD2 all begin an OpenPGP packet header but
+        // supply no (or an incomplete) body; 0xCA is a marker tag with no length.
+        const PARTIAL_TAILS: &[&[u8]] =
+            &[&[0x80], &[0xFF], &[0xCA], &[0xC2], &[0xD2], &[0xC2, 0x05]];
+
+        let input = hex_decode(ED25519_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+
+        for tail in PARTIAL_TAILS {
+            // On the public key blob.
+            let mut pk = decoded.public_key.clone();
+            pk.extend_from_slice(tail);
+            assert_ne!(pk, decoded.public_key, "tail must change the bytes");
+            let atk_pk =
+                encode_gpg_verify_input(&decoded.message, &decoded.key_id, &pk, &decoded.signature);
+            assert!(
+                matches!(
+                    gpg_verify_run(&atk_pk, required_gas(&atk_pk)),
+                    PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))
+                ),
+                "partial trailing header {tail:02x?} on public key must be rejected"
+            );
+
+            // On the signature blob.
+            let mut sig = decoded.signature.clone();
+            sig.extend_from_slice(tail);
+            let atk_sig =
+                encode_gpg_verify_input(&decoded.message, &decoded.key_id, &decoded.public_key, &sig);
+            assert!(
+                matches!(
+                    gpg_verify_run(&atk_sig, required_gas(&atk_sig)),
+                    PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))
+                ),
+                "partial trailing header {tail:02x?} on signature must be rejected"
+            );
+        }
     }
 
     /// Companion to the tail-rejection test: a Marker packet (tag 10) is also
