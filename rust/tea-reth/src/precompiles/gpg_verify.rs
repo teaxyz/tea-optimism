@@ -36,7 +36,7 @@
 
 use alloy_primitives::{Address, Bytes, address};
 use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey, SignedPublicSubKey};
-use pgp::packet::SignatureType;
+use pgp::packet::{Packet, PacketParser, SignatureType};
 use pgp::types::KeyDetails;
 use revm::precompile::{Precompile, PrecompileId, PrecompileOutput, PrecompileResult};
 use std::io::Cursor;
@@ -89,16 +89,54 @@ fn fingerprint_to_key_id(fp: &pgp::types::Fingerprint) -> [u8; 8] {
     id
 }
 
-/// Parse exactly one OpenPGP object from `bytes`, rejecting empty or
+/// Parse exactly one OpenPGP object from `bytes`, requiring the *entire* slice
+/// to be consumed by well-formed, supported packets and rejecting empty or
 /// multi-object streams.
 ///
-/// `Deserializable::from_bytes` silently returns only the *first* object in a
-/// stream, so an attacker can append additional key or signature objects to a
-/// blob and have them ignored — producing multiple distinct byte strings that
-/// all verify identically (TEAO1-172). Requiring exactly one object removes that
-/// ambiguity: the verified bytes are the only bytes.
+/// Two distinct ambiguities are closed here, both of which let distinct raw
+/// byte strings verify as the same logical proof:
+///
+/// 1. **Trailing objects (TEAO1-172).** `Deserializable::from_bytes` silently
+///    returns only the *first* object in a stream, so an attacker can append
+///    additional key or signature objects and have them ignored. We require
+///    exactly one composed object.
+///
+/// 2. **Dropped packets (TEAO1-196).** `Deserializable::from_bytes_many`
+///    routes every packet through `filter_parsed_packet_results`, which
+///    *silently discards* Marker packets, Padding packets, `Unsupported`
+///    packets, nested `InvalidPacketContent(Unsupported|EllipticCurve)`, and
+///    `PacketIncomplete` packets. An attacker can therefore append an
+///    unsupported or truncated packet tail to an otherwise-valid blob and have
+///    it ignored — the higher-level object iterator never even sees it. We
+///    refuse to filter: we drive the low-level [`PacketParser`] ourselves and
+///    treat *any* packet error, *any* Marker/Padding packet, or *any* trailing
+///    byte the parser stops short of as a hard rejection. The verified bytes are
+///    then the only bytes that could have produced this object.
 fn parse_single<T: Deserializable>(bytes: &[u8]) -> Result<T, &'static str> {
-    let mut iter = T::from_bytes_many(Cursor::new(bytes)).map_err(|_| "parse error")?;
+    // Strict packet scan — no lenient filtering. Collect every packet, failing
+    // closed on anything `filter_parsed_packet_results` would otherwise drop.
+    let mut parser = PacketParser::new(Cursor::new(bytes));
+    let mut packets: Vec<Packet> = Vec::new();
+    for parsed in parser.by_ref() {
+        match parsed {
+            // Marker and Padding carry no proof material; the lenient path drops
+            // them, so they are a free vector for appending non-canonical bytes.
+            Ok(Packet::Marker(_)) | Ok(Packet::Padding(_)) => return Err("disallowed packet"),
+            Ok(pkt) => packets.push(pkt),
+            // Unsupported / incomplete / malformed packets: reject, never skip.
+            Err(_) => return Err("malformed packet"),
+        }
+    }
+    // The parser stops at a clean EOF. If it halted before the end of the slice
+    // (e.g. a truncated trailing header it could not begin to parse), bytes
+    // remain unconsumed — reject rather than silently discard the tail.
+    if parser.into_inner().position() as usize != bytes.len() {
+        return Err("trailing bytes");
+    }
+
+    // Build composed objects from the strictly-parsed packets, requiring exactly
+    // one (TEAO1-172).
+    let mut iter = T::from_packets(packets.into_iter().map(Ok).peekable());
     let first = match iter.next() {
         Some(Ok(obj)) => obj,
         _ => return Err("no parseable object"),
@@ -741,6 +779,83 @@ mod tests {
         assert!(
             matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))),
             "concatenated signature objects must be rejected, got: {result:?}"
+        );
+    }
+
+    /// TEAO1-196 (truncated/unsupported OpenPGP packet tails): the `pgp`
+    /// 0.19 reader silently *discards* Unsupported, Incomplete, Marker and
+    /// Padding packets, so appending such a tail to a valid blob yields distinct
+    /// raw bytes that still verify. Both an unsupported experimental packet on
+    /// the public key and a truncated signature packet on the signature must now
+    /// be rejected.
+    #[test]
+    fn test_gpg_verify_rejects_unsupported_and_truncated_packet_tails() {
+        // 0xFC -> new-format experimental packet tag 60 (Unsupported);
+        // 0xC2,0x05,0x00 -> new-format signature packet (tag 2) declaring a
+        // 5-byte body but supplying only 1 (PacketIncomplete).
+        const UNSUPPORTED_PACKET_TAIL: &[u8] = &[0xFC, 0x00];
+        const TRUNCATED_PACKET_TAIL: &[u8] = &[0xC2, 0x05, 0x00];
+
+        let input = hex_decode(ED25519_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+
+        // Baseline: the unmodified blob verifies.
+        let base = encode_gpg_verify_input(
+            &decoded.message,
+            &decoded.key_id,
+            &decoded.public_key,
+            &decoded.signature,
+        );
+        assert_precompile_ok(&gpg_verify_run(&base, required_gas(&base)), required_gas(&base), SUCCESS_HEX);
+
+        // Unsupported experimental tail appended to the public key must reject.
+        let mut pub_key_tail = decoded.public_key.clone();
+        pub_key_tail.extend_from_slice(UNSUPPORTED_PACKET_TAIL);
+        let attack_key =
+            encode_gpg_verify_input(&decoded.message, &decoded.key_id, &pub_key_tail, &decoded.signature);
+        assert!(
+            matches!(
+                gpg_verify_run(&attack_key, required_gas(&attack_key)),
+                PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))
+            ),
+            "unsupported packet tail on public key must be rejected"
+        );
+
+        // Truncated/incomplete tail appended to the signature must reject.
+        let mut sig_tail = decoded.signature.clone();
+        sig_tail.extend_from_slice(TRUNCATED_PACKET_TAIL);
+        let attack_sig =
+            encode_gpg_verify_input(&decoded.message, &decoded.key_id, &decoded.public_key, &sig_tail);
+        assert!(
+            matches!(
+                gpg_verify_run(&attack_sig, required_gas(&attack_sig)),
+                PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))
+            ),
+            "truncated packet tail on signature must be rejected"
+        );
+    }
+
+    /// Companion to the tail-rejection test: a Marker packet (tag 10) is also
+    /// silently dropped by the lenient reader. The strict scan must reject any
+    /// blob carrying one.
+    #[test]
+    fn test_gpg_verify_rejects_marker_packet_tail() {
+        // New-format Marker packet: tag 10, 3-byte body "PGP" (0x50 0x47 0x50).
+        const MARKER_PACKET: &[u8] = &[0xCA, 0x03, 0x50, 0x47, 0x50];
+
+        let input = hex_decode(ED25519_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+
+        let mut pub_key_marker = decoded.public_key.clone();
+        pub_key_marker.extend_from_slice(MARKER_PACKET);
+        let attack =
+            encode_gpg_verify_input(&decoded.message, &decoded.key_id, &pub_key_marker, &decoded.signature);
+        assert!(
+            matches!(
+                gpg_verify_run(&attack, required_gas(&attack)),
+                PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))
+            ),
+            "marker packet on public key must be rejected"
         );
     }
 
