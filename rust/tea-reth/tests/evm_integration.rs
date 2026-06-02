@@ -41,7 +41,7 @@ fn test_gpg_precompile_registered_in_evm() {
     let mut evm = factory.create_evm(db, make_evm_env());
 
     // Load the ed25519 test input (same hex data used in unit tests).
-    let input_hex = include_str!("../src/precompiles/testdata_gpg_verify_ed25519.hex");
+    let input_hex = include_str!("../../tea-precompiles/src/testdata_gpg_verify_ed25519.hex");
     let input = hex::decode(input_hex.trim()).expect("valid hex");
 
     let result = evm.transact_system_call(CALLER, GPG_VERIFY_ADDR, Bytes::from(input));
@@ -113,7 +113,7 @@ fn test_gpg_wrong_message_returns_zero_through_evm() {
     let mut evm = factory.create_evm(db, make_evm_env());
 
     // Load the ed25519 test input and corrupt the message hash.
-    let input_hex = include_str!("../src/precompiles/testdata_gpg_verify_ed25519.hex");
+    let input_hex = include_str!("../../tea-precompiles/src/testdata_gpg_verify_ed25519.hex");
     let mut input = hex::decode(input_hex.trim()).expect("valid hex");
 
     // Corrupt the first byte of the message hash (bytes 0..32 in ABI encoding).
@@ -140,7 +140,7 @@ fn test_ssh_precompile_registered_in_evm() {
     let db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
     let mut evm = factory.create_evm(db, make_evm_env());
 
-    let input_hex = include_str!("../src/precompiles/testdata_ssh_verify_ed25519.hex");
+    let input_hex = include_str!("../../tea-precompiles/src/testdata_ssh_verify_ed25519.hex");
     let input = hex::decode(input_hex.trim()).expect("valid hex");
 
     let result = evm.transact_system_call(CALLER, SSH_VERIFY_ADDR, Bytes::from(input));
@@ -158,7 +158,7 @@ fn test_ssh_rsa_precompile_through_evm() {
     let db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
     let mut evm = factory.create_evm(db, make_evm_env());
 
-    let input_hex = include_str!("../src/precompiles/testdata_ssh_verify_rsa.hex");
+    let input_hex = include_str!("../../tea-precompiles/src/testdata_ssh_verify_rsa.hex");
     let input = hex::decode(input_hex.trim()).expect("valid hex");
 
     let result = evm.transact_system_call(CALLER, SSH_VERIFY_ADDR, Bytes::from(input));
@@ -176,7 +176,7 @@ fn test_ssh_wrong_message_returns_zero_through_evm() {
     let db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
     let mut evm = factory.create_evm(db, make_evm_env());
 
-    let input_hex = include_str!("../src/precompiles/testdata_ssh_verify_ed25519.hex");
+    let input_hex = include_str!("../../tea-precompiles/src/testdata_ssh_verify_ed25519.hex");
     let mut input = hex::decode(input_hex.trim()).expect("valid hex");
     input[0] ^= 0xFF;
 
@@ -199,7 +199,7 @@ fn test_both_precompiles_coexist() {
     let mut evm = factory.create_evm(db, make_evm_env());
 
     // Call GPG precompile
-    let gpg_input_hex = include_str!("../src/precompiles/testdata_gpg_verify_ed25519.hex");
+    let gpg_input_hex = include_str!("../../tea-precompiles/src/testdata_gpg_verify_ed25519.hex");
     let gpg_input = hex::decode(gpg_input_hex.trim()).expect("valid hex");
     let gpg_result = evm.transact_system_call(CALLER, GPG_VERIFY_ADDR, Bytes::from(gpg_input));
     let gpg_result = gpg_result.expect("GPG transact should succeed");
@@ -210,7 +210,7 @@ fn test_both_precompiles_coexist() {
     );
 
     // Call SSH precompile on the same EVM instance
-    let ssh_input_hex = include_str!("../src/precompiles/testdata_ssh_verify_ed25519.hex");
+    let ssh_input_hex = include_str!("../../tea-precompiles/src/testdata_ssh_verify_ed25519.hex");
     let ssh_input = hex::decode(ssh_input_hex.trim()).expect("valid hex");
     let ssh_result = evm.transact_system_call(CALLER, SSH_VERIFY_ADDR, Bytes::from(ssh_input));
     let ssh_result = ssh_result.expect("SSH transact should succeed");
