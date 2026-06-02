@@ -189,6 +189,24 @@ contract GasPriceOracleEcotone_Test is GasPriceOracle_Test {
         gasPriceOracle.setEcotone();
     }
 
+    /// @dev SECURITY REGRESSION GUARD — write access to the cached price slot.
+    ///      The cached TEA/ETH price (used to scale L1 fees) is only writable via
+    ///      updateGasTokenPriceRatio(), gated to the L1Block attributes predeploy
+    ///      (the system depositor path). A non-system caller MUST revert AND MUST
+    ///      NOT mutate the cached price slot. If this ever fails, the price slot has
+    ///      become attacker-writable — a critical fee-manipulation hole.
+    function test_updateGasTokenPriceRatio_wrongCaller_reverts() external {
+        (uint96 tsBefore, uint160 priceBefore) = gasPriceOracle.getLatestPrice();
+
+        vm.prank(makeAddr("attacker"));
+        vm.expectRevert("GasPriceOracle: only L1_BLOCK_ATTRIBUTES can update");
+        gasPriceOracle.updateGasTokenPriceRatio();
+
+        (uint96 tsAfter, uint160 priceAfter) = gasPriceOracle.getLatestPrice();
+        assertEq(tsAfter, tsBefore, "timestamp must be unchanged by a rejected caller");
+        assertEq(priceAfter, priceBefore, "cached price must be unchanged by a rejected caller");
+    }
+
     /// @dev Tests that `gasPrice` is set correctly.
     function test_gasPrice_succeeds() external {
         vm.fee(100);
@@ -383,6 +401,34 @@ contract GasPriceOracleFjordActive_Test is GasPriceOracle_Test {
     function test_getOperatorFee_succeeds() external view {
         assertEq(gasPriceOracle.isIsthmus(), false);
         assertEq(gasPriceOracle.getOperatorFee(10), 0);
+    }
+
+    /// @dev TEAO1-165: when the cached price slot was never written (e.g. a
+    ///      non-CGT deployment whose plain L1Block never calls
+    ///      updateGasTokenPriceRatio), getL1Fee / getL1FeeUpperBound must fall
+    ///      back to the backup rate instead of quoting zero.
+    function test_getL1Fee_emptyCachedSlot_usesBackup() external {
+        GasPriceOracle gpo = GasPriceOracle(address(gasPriceOracle));
+        bytes memory data = hex"0000010203";
+        bytes32 priceSlot = gpo.CUSTOM_GAS_TOKEN_PRICE_SLOT();
+        uint160 backup = gpo.getFallbackPrice();
+        assertGt(backup, 0);
+
+        // Empty (never-written) cached slot — the non-CGT deployment case.
+        vm.store(address(gpo), priceSlot, bytes32(0));
+        (, uint160 cached) = gpo.getLatestPrice();
+        assertEq(cached, 0, "cached slot is empty");
+
+        uint256 feeEmpty = gpo.getL1Fee(data);
+        uint256 upperEmpty = gpo.getL1FeeUpperBound(data.length);
+        assertGt(feeEmpty, 0, "getL1Fee must not quote zero on an empty cached slot");
+        assertGt(upperEmpty, 0, "getL1FeeUpperBound must not quote zero on an empty cached slot");
+
+        // Writing the backup rate into the slot yields the identical fee — i.e.
+        // the empty slot transparently falls back to the backup rate.
+        vm.store(address(gpo), priceSlot, bytes32(uint256(backup)));
+        assertEq(gpo.getL1Fee(data), feeEmpty, "empty slot must equal backup-rate fee");
+        assertEq(gpo.getL1FeeUpperBound(data.length), upperEmpty, "empty upper must equal backup-rate upper");
     }
 }
 
