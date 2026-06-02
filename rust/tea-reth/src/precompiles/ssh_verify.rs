@@ -594,6 +594,41 @@ mod tests {
         assert_precompile_ok(&result, SSH_VERIFY_BASE_GAS, FAILURE_HEX);
     }
 
+    /// Encoding-malleability guard (sibling of the GPG truncated-tail finding):
+    /// the SSH wire-format parsers must consume the *entire* pubkey and signature
+    /// blobs, so appending any trailing byte to an otherwise-valid blob must flip
+    /// the result to failure. Unlike the `pgp` crate, `ssh_common` has no lenient
+    /// packet filter that could silently drop the tail; this test pins that.
+    #[test]
+    fn test_ssh_verify_rejects_trailing_bytes_on_blobs() {
+        let input = hex_decode(ED25519_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+
+        // Baseline: the unmodified blobs verify.
+        let base = encode_ssh_verify_input(&decoded.message, &decoded.public_key, &decoded.signature);
+        assert_precompile_ok(&ssh_verify_run(&base, required_gas(&base)), required_gas(&base), SUCCESS_HEX);
+
+        // One trailing byte on the public key blob must be rejected.
+        let mut pk_tail = decoded.public_key.clone();
+        pk_tail.push(0x00);
+        let attack_pk = encode_ssh_verify_input(&decoded.message, &pk_tail, &decoded.signature);
+        assert_precompile_ok(
+            &ssh_verify_run(&attack_pk, required_gas(&attack_pk)),
+            required_gas(&attack_pk),
+            FAILURE_HEX,
+        );
+
+        // One trailing byte on the signature blob must be rejected.
+        let mut sig_tail = decoded.signature.clone();
+        sig_tail.push(0x00);
+        let attack_sig = encode_ssh_verify_input(&decoded.message, &decoded.public_key, &sig_tail);
+        assert_precompile_ok(
+            &ssh_verify_run(&attack_sig, required_gas(&attack_sig)),
+            required_gas(&attack_sig),
+            FAILURE_HEX,
+        );
+    }
+
     #[test]
     fn test_ssh_verify_unsupported_algo() {
         // Build an input with key type "ssh-dss" (unsupported)

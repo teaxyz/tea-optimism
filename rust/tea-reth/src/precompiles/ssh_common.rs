@@ -367,6 +367,21 @@ pub fn verify_ssh_ecdsa(
     }
 }
 
+/// SSH ECDSA public keys MUST use the uncompressed SEC1 point encoding
+/// (`0x04 || X || Y`). RFC 5656 §3.1 specifies the uncompressed form and OpenSSH
+/// only ever emits it. `p256/p384/p521::VerifyingKey::from_sec1_bytes` is more
+/// permissive — it also accepts the compressed (`0x02`/`0x03`, `1 + field_bytes`)
+/// and hybrid (`0x06`/`0x07`) forms, which encode the *same* public key under a
+/// different, shorter byte string. Accepting those would give one key multiple
+/// distinct `publicKey` blobs that all verify the same signature — the exact
+/// encoding-malleability / identity-derivation footgun the trailing-byte and
+/// mpint-pad canonicalization checks close elsewhere (TEAO1-168 / TEAO1-183).
+/// Pin the canonical uncompressed form: prefix `0x04` and exactly
+/// `1 + 2*field_bytes` bytes.
+fn is_canonical_uncompressed_point(q_bytes: &[u8], field_bytes: usize) -> bool {
+    q_bytes.len() == 1 + 2 * field_bytes && q_bytes[0] == 0x04
+}
+
 /// Pack `r_unpadded` / `s_unpadded` into a fixed-width big-endian buffer of
 /// `field_bytes` per scalar, left-padding with zeros. ECDSA `Signature::from_scalars`
 /// expects exactly `field_bytes`-wide inputs; mpint stripping leaves a value
@@ -391,6 +406,10 @@ fn pad_scalars(
 /// Verify ECDSA on P-256 with SHA-256.
 fn verify_ecdsa_p256(q_bytes: &[u8], message: &[u8], r: &[u8], s: &[u8]) -> bool {
     use p256::ecdsa::{Signature, VerifyingKey};
+    // Reject compressed/hybrid point encodings — SSH requires uncompressed.
+    if !is_canonical_uncompressed_point(q_bytes, 32) {
+        return false;
+    }
     let verifying_key = match VerifyingKey::from_sec1_bytes(q_bytes) {
         Ok(k) => k,
         Err(_) => return false,
@@ -419,6 +438,10 @@ fn verify_ecdsa_p256(q_bytes: &[u8], message: &[u8], r: &[u8], s: &[u8]) -> bool
 /// Verify ECDSA on P-384 with SHA-384.
 fn verify_ecdsa_p384(q_bytes: &[u8], message: &[u8], r: &[u8], s: &[u8]) -> bool {
     use p384::ecdsa::{Signature, VerifyingKey};
+    // Reject compressed/hybrid point encodings — SSH requires uncompressed.
+    if !is_canonical_uncompressed_point(q_bytes, 48) {
+        return false;
+    }
     let verifying_key = match VerifyingKey::from_sec1_bytes(q_bytes) {
         Ok(k) => k,
         Err(_) => return false,
@@ -447,6 +470,11 @@ fn verify_ecdsa_p384(q_bytes: &[u8], message: &[u8], r: &[u8], s: &[u8]) -> bool
 /// `[0, 66]` bytes — `pad_scalars` handles the left-pad to exactly 66.
 fn verify_ecdsa_p521(q_bytes: &[u8], message: &[u8], r: &[u8], s: &[u8]) -> bool {
     use p521::ecdsa::{Signature, VerifyingKey};
+    // Reject compressed/hybrid point encodings — SSH requires uncompressed.
+    // P-521 field is 66 bytes, so the canonical uncompressed point is 133 bytes.
+    if !is_canonical_uncompressed_point(q_bytes, 66) {
+        return false;
+    }
     let verifying_key = match VerifyingKey::from_sec1_bytes(q_bytes) {
         Ok(k) => k,
         Err(_) => return false,
@@ -1107,6 +1135,41 @@ mod tests {
             b"ecdsa-sha2-nistp256",
             &sig_blob,
         ));
+    }
+
+    /// Encoding-malleability regression (sibling of the GPG truncated-tail
+    /// finding): SSH ECDSA keys MUST be uncompressed SEC1 points. The same key
+    /// re-encoded in the compressed form is a *distinct* `publicKey` byte string
+    /// that — absent the `is_canonical_uncompressed_point` gate — verifies the
+    /// same signature, aliasing one key across two encodings. The compressed
+    /// form must now be rejected while the canonical uncompressed form verifies.
+    #[test]
+    fn verify_ssh_ecdsa_rejects_compressed_point() {
+        use signature::Signer as EcdsaSigner;
+        use p256::ecdsa::{Signature, SigningKey};
+        let msg = b"compressed-point-malleability-probe";
+        let mut rng = rand_08::rngs::StdRng::from_seed_helper();
+        let signing_key = SigningKey::random(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        let q_compressed = verifying_key.to_encoded_point(true).as_bytes().to_vec();
+        let q_uncompressed = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+        assert_eq!(q_compressed.len(), 33, "control: compressed P-256 point is 33 bytes");
+        assert_eq!(q_uncompressed.len(), 65, "control: uncompressed P-256 point is 65 bytes");
+
+        let signature: Signature = signing_key.sign(msg);
+        let signature = signature.normalize_s().unwrap_or(signature);
+        let (r, s) = signature.split_bytes();
+        let sig_blob = build_ecdsa_sig_blob(&r, &s);
+
+        let verify = |q: &[u8]| {
+            let pub_blob = build_ecdsa_pubkey_blob(b"ecdsa-sha2-nistp256", b"nistp256", q);
+            let mut o = 0usize;
+            let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
+            verify_ssh_ecdsa(b"ecdsa-sha2-nistp256", &pub_blob, o, msg, b"ecdsa-sha2-nistp256", &sig_blob)
+        };
+
+        assert!(verify(&q_uncompressed), "canonical uncompressed point must verify");
+        assert!(!verify(&q_compressed), "compressed point must be rejected (encoding malleability)");
     }
 
     #[test]

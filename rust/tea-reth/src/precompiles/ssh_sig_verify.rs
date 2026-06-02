@@ -673,6 +673,39 @@ mod tests {
         assert_eq!(envelope.len(), 96);
     }
 
+    /// Encoding-malleability guard (sibling of the GPG truncated-tail finding):
+    /// the SSHSIG wire-format parsers must consume the *entire* pubkey and
+    /// signature blobs. Appending any trailing byte to an otherwise-valid blob
+    /// must flip the result to failure — there is no lenient filter (as `pgp`
+    /// has) that could silently drop the tail. `verify_ssh_*` enforces full
+    /// consumption of the pubkey blob and `run_verification` enforces it on the
+    /// signature blob.
+    #[test]
+    fn rejects_trailing_bytes_on_blobs() {
+        let payload = b"hello sshsig precompile";
+        let namespace = b"file";
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ED25519_SEED);
+        let verifying_key = signing_key.verifying_key();
+        let envelope = build_sshsig_envelope(payload, namespace);
+        let sig = signing_key.sign(&envelope);
+
+        let pub_key_blob = build_ed25519_pubkey_blob(verifying_key.as_bytes());
+        let sig_blob = build_signature_blob(b"ssh-ed25519", &sig.to_bytes());
+
+        // Baseline: the unmodified blobs verify.
+        assert_precompile_ok(&run(&encode_input(payload, namespace, &pub_key_blob, &sig_blob)), SUCCESS_HEX);
+
+        // One trailing byte on the pubkey blob must be rejected.
+        let mut pk_tail = pub_key_blob.clone();
+        pk_tail.push(0x00);
+        assert_precompile_ok(&run(&encode_input(payload, namespace, &pk_tail, &sig_blob)), FAILURE_HEX);
+
+        // One trailing byte on the signature blob must be rejected.
+        let mut sig_tail = sig_blob.clone();
+        sig_tail.push(0x00);
+        assert_precompile_ok(&run(&encode_input(payload, namespace, &pub_key_blob, &sig_tail)), FAILURE_HEX);
+    }
+
     // ─────────────────────── Real `ssh-keygen -Y sign` fixtures
     //
     // These are the load-bearing tests: they consume bytes produced by the
