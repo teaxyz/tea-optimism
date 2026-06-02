@@ -76,10 +76,12 @@ func TestValidateStandardValues(t *testing.T) {
 		{
 			"CustomGasToken",
 			func(intent *Intent) {
+				bridge := common.HexToAddress("0x1234")
 				intent.Chains[0].CustomGasToken = CustomGasToken{
 					Name:             "Custom Gas Token",
 					Symbol:           "CGT",
 					InitialLiquidity: (*hexutil.Big)(big.NewInt(1000)),
+					L1CGTBridge:      &bridge,
 				}
 			},
 			ErrNonStandardValue,
@@ -222,6 +224,30 @@ func TestValidateCustomValues(t *testing.T) {
 			},
 			ErrIncompatibleValue,
 		},
+		{
+			// TEAO1-139: a bridge-only intent must be rejected, not silently
+			// treated as a non-CGT chain (which would strand bridged deposits).
+			"L1CGTBridge set without name/symbol is rejected",
+			func(intent *Intent) {
+				bridge := common.HexToAddress("0x1234")
+				intent.Chains[0].CustomGasToken = CustomGasToken{
+					L1CGTBridge: &bridge,
+				}
+			},
+			ErrIncompatibleValue,
+		},
+		{
+			// TEAO1-139: a CGT intent (name+symbol) without a bridge must be
+			// rejected — deploying CGT with no L2CGTBridge predeploy strands deposits.
+			"custom gas token without L1CGTBridge is rejected",
+			func(intent *Intent) {
+				intent.Chains[0].CustomGasToken = CustomGasToken{
+					Name:   "Custom Gas Token",
+					Symbol: "CGT",
+				}
+			},
+			ErrIncompatibleValue,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -303,9 +329,14 @@ func setCustomGasToken(intent *Intent) {
 	amount := new(big.Int)
 	amount.SetString("1000000000000000000000", 10)
 
+	// L1CGTBridge is mandatory in CGT mode (TEAO1-139); a CGT intent without it
+	// is rejected by Check().
+	bridge := common.HexToAddress("0x1234")
+
 	intent.Chains[0].CustomGasToken = CustomGasToken{
 		Name:             "Custom Gas Token",
 		Symbol:           "CGT",
 		InitialLiquidity: (*hexutil.Big)(amount),
+		L1CGTBridge:      &bridge,
 	}
 }
