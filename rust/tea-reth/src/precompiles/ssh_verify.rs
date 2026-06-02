@@ -797,7 +797,6 @@ mod tests {
         use rand_08::SeedableRng;
         use signature::Signer;
         use p256::ecdsa::{Signature, SigningKey};
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
         let signing_key = SigningKey::random(&mut rng);
@@ -823,7 +822,6 @@ mod tests {
         use rand_08::SeedableRng;
         use signature::Signer;
         use p384::ecdsa::{Signature, SigningKey};
-        use p384::elliptic_curve::sec1::ToEncodedPoint;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
         let signing_key = SigningKey::random(&mut rng);
@@ -849,7 +847,6 @@ mod tests {
         use rand_08::SeedableRng;
         use signature::Signer;
         use p521::ecdsa::{Signature, SigningKey, VerifyingKey};
-        use p521::elliptic_curve::sec1::ToEncodedPoint;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
         let signing_key = SigningKey::random(&mut rng);
@@ -875,7 +872,6 @@ mod tests {
         use rand_08::SeedableRng;
         use signature::Signer;
         use p256::ecdsa::{Signature, SigningKey};
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
         let signing_key = SigningKey::random(&mut rng);
