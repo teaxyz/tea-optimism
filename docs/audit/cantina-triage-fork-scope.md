@@ -147,7 +147,7 @@ Findings are grouped so each PR touches **one coherent file set / subsystem**, l
 | **P9** | Go fault-proof (op-program) Tea semantics + chain-gate | fork/patch `op-program/client/*` | 184, 187 |
 | **P10** | op-reth txpool affordability with Tea multiplier | fork `op-reth/crates/txpool/src/validator.rs` (+ maintain.rs) | 175, 186, 151, 167 |
 | **P11** | op-reth RPC simulate/trace block-fee context | fork `op-reth/crates/rpc/**` | 164, 178 |
-| **P12** | tea-reth proof-history wiring | refactor `op-reth/.../proof_history.rs` or fail-closed in `main.rs` | 152 |
+| **P12** | tea-reth proof-history wiring | ✅ Addressed (#21): fail-closed in `main.rs` (`ensure_proofs_history_unsupported`) — Tea does not serve proof history, so the flag is rejected rather than wiring the unused `OpProofsExEx` stack | 152 |
 | **P13** | CGT deployer mode-immutability across retries | fork `op-deployer/.../init.go`/`apply.go` or guard in `chain_intent.go` | 171 |
 | **P14** | op-node Tea-aware hardfork upgrade bytecode | bake Tea-aware upgrade payloads for `GasPriceOracle` (136) + `L1BlockCGT` (140) in `op-node/rollup/derive/` | 136, 140 |
 | **P15** | Kona registry / host-config trust for Tea | ship Tea's rollup config in Kona's registry / reproducible custom-config prestate | 181 |
