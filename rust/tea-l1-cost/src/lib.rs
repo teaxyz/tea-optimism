@@ -106,6 +106,34 @@ pub fn multiplier_from_oracle_value(raw: U256) -> (U256, U256) {
     (rate, WAD)
 }
 
+/// Compute the op-revm `l1_cost_multiplier` value `(numerator, denominator)`
+/// from on-chain state, gated to Tea chains.
+///
+/// This is the single source of truth for the whole sequence — the [`is_tea`]
+/// gate, the GasPriceOracle slot read, and [`multiplier_from_oracle_value`] —
+/// shared verbatim by the execution layer (`tea_reth::evm::factory`) and the
+/// fault-proof VM (`kona::fpvm_evm::factory`). Both EVM factories' optimistic /
+/// canonical replay paths call this, so the gate + read + extraction cannot
+/// drift between them (TEAO1-143, TEAO1-132).
+///
+/// `read_slot` reads a single storage slot — callers pass their revm
+/// `Database::storage`. Keeping the trait at the call site lets this crate stay
+/// `no_std` + revm-free.
+///
+/// Returns `None` — interpreted downstream by the patched op-revm L1-cost path
+/// as "no scaling" (multiplier = 1) — when the chain is not a Tea chain or the
+/// storage read fails (e.g. the GasPriceOracle account does not exist).
+pub fn l1_cost_multiplier_from_storage<E>(
+    chain_id: u64,
+    read_slot: impl FnOnce(Address, U256) -> Result<U256, E>,
+) -> Option<(U256, U256)> {
+    if !is_tea(chain_id) {
+        return None;
+    }
+    let raw = read_slot(GAS_PRICE_ORACLE_ADDR, LATEST_PRICE_RATIO_SLOT_U256).ok()?;
+    Some(multiplier_from_oracle_value(raw))
+}
+
 #[cfg(test)]
 mod tests {
     //! Tests ported from tea-geth commit 46ec0efe:
@@ -420,5 +448,47 @@ mod tests {
         let from_b256 = extract_price_from_slot(B256::from(one_slot));
         let from_u256 = extract_price_from_u256(U256::from_be_bytes(one_slot));
         assert_eq!(from_b256, from_u256, "price = 1 should match");
+    }
+
+    // ─────────────────────────── l1_cost_multiplier_from_storage
+    //
+    // The shared gate + read + extract sequence consumed verbatim by both the
+    // EL (`tea_reth::evm::factory`) and the FPVM (`kona::fpvm_evm::factory`).
+    // These lock its three branches at the crate where the logic now lives;
+    // the factory-level tests on both sides ride on top of it (TEAO1-143).
+
+    /// Off-Tea chains never receive the multiplier (TEAO1-132), even when the
+    /// oracle slot read would succeed with a non-zero price.
+    #[test]
+    fn multiplier_from_storage_off_tea_is_none() {
+        let m = l1_cost_multiplier_from_storage::<()>(10, |_, _| Ok(U256::from(999u64) * WAD));
+        assert_eq!(m, None, "non-Tea chain must not receive the TEA multiplier");
+    }
+
+    /// On a Tea chain, a successful read flows through `multiplier_from_oracle_value`.
+    #[test]
+    fn multiplier_from_storage_reads_tea_oracle() {
+        let rate = U256::from(42u64) * WAD;
+        let m = l1_cost_multiplier_from_storage::<()>(TEA_CHAIN_ID, |addr, slot| {
+            assert_eq!(addr, GAS_PRICE_ORACLE_ADDR);
+            assert_eq!(slot, LATEST_PRICE_RATIO_SLOT_U256);
+            Ok(rate)
+        });
+        assert_eq!(m, Some((rate, WAD)));
+    }
+
+    /// A failing storage read on a Tea chain propagates as `None` (downstream
+    /// "no scaling"), matching a missing GasPriceOracle account.
+    #[test]
+    fn multiplier_from_storage_read_error_is_none() {
+        let m = l1_cost_multiplier_from_storage::<&str>(TEA_CHAIN_ID, |_, _| Err("offline"));
+        assert_eq!(m, None, "storage read error must propagate as None");
+    }
+
+    /// Tea chain + zero oracle slot → backup-rate fallback (not None).
+    #[test]
+    fn multiplier_from_storage_zero_uses_backup() {
+        let m = l1_cost_multiplier_from_storage::<()>(TEA_CHAIN_ID, |_, _| Ok(U256::ZERO));
+        assert_eq!(m, Some((U256::from(BACKUP_TEA_PER_ETH) * WAD, WAD)));
     }
 }

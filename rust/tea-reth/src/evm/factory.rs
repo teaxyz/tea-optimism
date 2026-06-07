@@ -56,22 +56,18 @@ impl TeaPrecompiles {
 pub struct TeaEvmFactory;
 
 /// Read the TEA/ETH exchange rate from the GasPriceOracle and return the
-/// L1 cost multiplier as `(numerator, denominator)`. The pure-math part —
-/// extracting the 160-bit price from a packed slot and applying the
-/// backup-rate fallback — lives in `tea_l1_cost::multiplier_from_oracle_value`
-/// so the FPVM side in `kona::fpvm_evm::factory` consumes the same logic
-/// and cannot drift on a one-sided refactor.
+/// L1 cost multiplier as `(numerator, denominator)`.
+///
+/// The entire sequence — the Tea-chain gate (off-Tea chains must never receive
+/// the multiplier or the 1,500,000× backup fallback, or generic OP replay would
+/// diverge from canonical Optimism, TEAO1-132), the GasPriceOracle slot read,
+/// and the 160-bit price extraction + backup fallback — lives in
+/// `tea_l1_cost::l1_cost_multiplier_from_storage`, the crate shared with the
+/// FPVM (`kona::fpvm_evm::factory`). Both factories call it, so EL and FPVM
+/// cannot drift on a one-sided refactor. `None` means "no scaling" downstream
+/// in the patched op-revm L1-cost path.
 fn tea_l1_cost_multiplier<DB: Database>(db: &mut DB, chain_id: u64) -> Option<(U256, U256)> {
-    // Off-Tea chains must never receive the TEA/ETH multiplier or the
-    // 1,500,000× backup-rate fallback — applying it would diverge generic OP
-    // replay from canonical Optimism (TEAO1-132). `None` means "no scaling"
-    // downstream in the patched op-revm L1-cost path.
-    if !crate::chainspec::is_tea(chain_id) {
-        return None;
-    }
-    let raw =
-        db.storage(l1_cost::GAS_PRICE_ORACLE_ADDR, l1_cost::LATEST_PRICE_RATIO_SLOT_U256).ok()?;
-    Some(l1_cost::multiplier_from_oracle_value(raw))
+    l1_cost::l1_cost_multiplier_from_storage(chain_id, |addr, slot| db.storage(addr, slot))
 }
 
 impl EvmFactory for TeaEvmFactory {

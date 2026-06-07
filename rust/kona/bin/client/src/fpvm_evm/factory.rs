@@ -17,29 +17,19 @@ use revm::{
 };
 
 /// Reads the TEA/ETH exchange rate from the on-chain GasPriceOracle and
-/// returns the L1 cost multiplier as `(numerator, denominator)`. Mirror
-/// of `tea_reth::evm::factory::tea_l1_cost_multiplier`. The pure-math part
-/// — masking the 160-bit price out of the packed oracle slot and applying
-/// the backup-rate fallback — lives in `tea_l1_cost::multiplier_from_oracle_value`
-/// so EL and FPVM consume the same code path and cannot drift on a
-/// one-sided refactor.
+/// returns the L1 cost multiplier as `(numerator, denominator)`.
 ///
-/// Returns `None` if the storage read fails (e.g. account does not exist).
-/// op-revm's patched L1-cost path treats `None` as multiplier=1, matching
-/// the EL behavior on chains without the Tea oracle.
+/// The entire sequence — the Tea-chain gate, the GasPriceOracle slot read, and
+/// the 160-bit price extraction + backup-rate fallback — lives in
+/// `tea_l1_cost::l1_cost_multiplier_from_storage`, the crate shared with the EL
+/// (`tea_reth::evm::factory`). Both factories call it, so EL and FPVM cannot
+/// drift on a one-sided refactor.
 ///
-/// Off-Tea chains return `None` unconditionally (TEAO1-132): the multiplier and
-/// its 1,500,000× backup fallback must apply only on Tea chains, or generic OP
-/// replay in this FPVM would diverge from canonical Optimism. The `is_tea` gate
-/// is shared with the EL via `tea_l1_cost` so the two cannot drift.
+/// Returns `None` (interpreted by op-revm's patched L1-cost path as
+/// multiplier = 1) on a non-Tea chain (TEAO1-132) or when the storage read
+/// fails (e.g. the GasPriceOracle account does not exist) — matching the EL.
 fn tea_l1_cost_multiplier<DB: Database>(db: &mut DB, chain_id: u64) -> Option<(U256, U256)> {
-    if !tea_l1_cost::is_tea(chain_id) {
-        return None;
-    }
-    let raw = db
-        .storage(tea_l1_cost::GAS_PRICE_ORACLE_ADDR, tea_l1_cost::LATEST_PRICE_RATIO_SLOT_U256)
-        .ok()?;
-    Some(tea_l1_cost::multiplier_from_oracle_value(raw))
+    tea_l1_cost::l1_cost_multiplier_from_storage(chain_id, |addr, slot| db.storage(addr, slot))
 }
 
 /// Factory producing [`OpEvm`]s with FPVM-accelerated precompile overrides enabled.
@@ -70,6 +60,28 @@ where
     pub fn oracle_reader(&self) -> &O {
         &self.oracle_reader
     }
+}
+
+/// The single selection point for the fault-proof EVM factory, shared by every
+/// fault-proof execution path: the interop client replay
+/// ([`kona_client::interop::run`]), the single-chain client
+/// ([`kona_client::single::run`]), and the interop **host**'s optimistic-block
+/// re-execution (`kona-host`'s `L2BlockData` handler).
+///
+/// Routing all of them through this one constructor is what keeps the host's
+/// witness-collection re-execution byte-identical to the client replay it must
+/// reproduce. TEAO1-143 was exactly the drift this guards against: the host
+/// hand-rolled `alloy_op_evm::OpEvmFactory::default()`, which leaves
+/// `ctx.chain.l1_cost_multiplier` unset, so it charged raw OP L1 fees and
+/// derived a different header than the [`FpvmOpEvmFactory`] client path. Any
+/// future change to fault-proof EVM construction (Tea config, precompiles)
+/// lands here once and cannot diverge between host and client.
+pub fn fpvm_op_evm_factory<H, O>(hint_writer: H, oracle_reader: O) -> FpvmOpEvmFactory<H, O>
+where
+    H: HintWriterClient + Clone + Send + Sync,
+    O: PreimageOracleClient + Clone + Send + Sync,
+{
+    FpvmOpEvmFactory::new(hint_writer, oracle_reader)
 }
 
 impl<H, O> EvmFactory for FpvmOpEvmFactory<H, O>
