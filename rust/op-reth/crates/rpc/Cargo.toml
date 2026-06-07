@@ -92,6 +92,13 @@ metrics.workspace = true
 # enum
 strum.workspace = true
 
+# tea (TEAO1-178): record the block-start (parent-state) GasPriceOracle ratio
+# on trace/replay paths and hand it to the Tea EVM factory so a traced tx is
+# charged the same L1 multiplier the chain charged. `tea-l1-cost` is the shared
+# EL/FPVM constants + exchange-rate arithmetic.
+tea-l1-cost.workspace = true
+tea-trace-ctx.workspace = true
+
 [dev-dependencies]
 reth-optimism-chainspec.workspace = true
 alloy-op-hardforks.workspace = true
