@@ -11890,6 +11890,7 @@ dependencies = [
  "revm",
  "serde",
  "serde_json",
+ "tea-l1-cost",
  "tokio",
  "tracing",
  "url",
