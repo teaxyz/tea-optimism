@@ -1043,6 +1043,7 @@ where
             ctx.task_executor().spawn_critical_task(
                 "Op txpool conditional maintenance task",
                 reth_optimism_txpool::maintain::maintain_transaction_pool_conditional_future(
+                    ctx.provider().clone(),
                     transaction_pool.clone(),
                     chain_events,
                 ),

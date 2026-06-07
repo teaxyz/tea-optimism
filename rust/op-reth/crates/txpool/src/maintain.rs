@@ -9,13 +9,13 @@ const MAX_SUPERVISOR_QUERIES: usize = 10;
 
 use crate::{
     OpPooledTx,
-    conditional::MaybeConditionalTransaction,
+    conditional::{MaybeConditionalTransaction, first_known_account_violation},
     interop::{MaybeInteropTransaction, is_stale_interop, is_valid_interop},
     supervisor::SupervisorClient,
     validator::scale_l1_cost_by_oracle,
 };
 use alloy_consensus::{BlockHeader, conditional::BlockConditionalAttributes};
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, StorageKey, U256};
 use futures_util::{FutureExt, Stream, StreamExt, future::BoxFuture};
 use metrics::{Gauge, Histogram};
 use reth_chain_state::CanonStateNotification;
@@ -34,14 +34,22 @@ use tracing::{debug, warn};
 #[metrics(scope = "transaction_pool")]
 struct MaintainPoolConditionalMetrics {
     /// Counter indicating the number of conditional transactions removed from
-    /// the pool because of exceeded block attributes.
+    /// the pool because of exceeded block attributes or stale `knownAccounts`.
     removed_tx_conditional: Counter,
+    /// Subset of the above removed specifically because their `knownAccounts`
+    /// predicates no longer match the new head's state (TEAO1-167).
+    removed_tx_conditional_known_accounts: Counter,
 }
 
 impl MaintainPoolConditionalMetrics {
     #[inline]
     fn inc_removed_tx_conditional(&self, count: usize) {
         self.removed_tx_conditional.increment(count as u64);
+    }
+
+    #[inline]
+    fn inc_removed_tx_conditional_known_accounts(&self, count: usize) {
+        self.removed_tx_conditional_known_accounts.increment(count as u64);
     }
 }
 
@@ -85,18 +93,20 @@ impl MaintainPoolInteropMetrics {
 }
 /// Returns a spawnable future for maintaining the state of the conditional txs in the transaction
 /// pool.
-pub fn maintain_transaction_pool_conditional_future<N, Pool, St>(
+pub fn maintain_transaction_pool_conditional_future<N, Client, Pool, St>(
+    client: Client,
     pool: Pool,
     events: St,
 ) -> BoxFuture<'static, ()>
 where
     N: NodePrimitives,
+    Client: StateProviderFactory + Send + Sync + 'static,
     Pool: TransactionPool + 'static,
     Pool::Transaction: MaybeConditionalTransaction,
     St: Stream<Item = CanonStateNotification<N>> + Send + Unpin + 'static,
 {
     async move {
-        maintain_transaction_pool_conditional(pool, events).await;
+        maintain_transaction_pool_conditional(client, pool, events).await;
     }
     .boxed()
 }
@@ -104,11 +114,28 @@ where
 /// Maintains the state of the conditional tx in the transaction pool by handling new blocks and
 /// reorgs.
 ///
-/// This listens for any new blocks and reorgs and updates the conditional txs in the
-/// transaction pool's state accordingly
-pub async fn maintain_transaction_pool_conditional<N, Pool, St>(pool: Pool, mut events: St)
-where
+/// On every new canonical head this evicts a pooled conditional transaction when
+/// either:
+/// - its block-number / timestamp ceilings have been exceeded (the condition can
+///   never be met again), or
+/// - its `knownAccounts` predicates no longer match the new head's state
+///   (TEAO1-167) — otherwise a transaction conditioned on, say, the
+///   `GasPriceOracle` price-ratio slot would linger in the pool and could be
+///   included under a different value than it required.
+///
+/// The `knownAccounts` re-check is **fail-open**: any state-read failure leaves
+/// the transaction in place (we never evict on a bad read). It is also defence in
+/// depth for the *cross-block* case — the same-block case, where the head's
+/// L1-attributes transaction refreshes the watched slot before a later conditional
+/// transaction in that very block, is closed in the payload builder, which
+/// re-checks `knownAccounts` against the actual pending execution state.
+pub async fn maintain_transaction_pool_conditional<N, Client, Pool, St>(
+    client: Client,
+    pool: Pool,
+    mut events: St,
+) where
     N: NodePrimitives,
+    Client: StateProviderFactory + Send + Sync,
     Pool: TransactionPool,
     Pool::Transaction: MaybeConditionalTransaction,
     St: Stream<Item = CanonStateNotification<N>> + Send + Unpin + 'static,
@@ -121,15 +148,45 @@ where
                 number: new.tip().number(),
                 timestamp: new.tip().timestamp(),
             };
+
+            // Post-head state for re-checking `knownAccounts` predicates. Fail-open:
+            // if it is unavailable we only apply the block-attribute ceilings this
+            // round and never evict on a bad read.
+            let state = client.latest().ok();
+
             let mut to_remove = Vec::new();
+            let mut known_accounts_evicted = 0usize;
             for tx in &pool.pooled_transactions() {
                 if tx.transaction.has_exceeded_block_attributes(&block_attr) {
                     to_remove.push(*tx.hash());
+                    continue;
+                }
+
+                // TEAO1-167: evict conditionals whose watched `knownAccounts` no
+                // longer hold against the new head.
+                if let (Some(state), Some(cond)) = (state.as_ref(), tx.transaction.conditional()) &&
+                    matches!(
+                        first_known_account_violation(
+                            cond,
+                            |address, slot| state
+                                .storage(address, StorageKey::from(slot))
+                                .map(|v| v.unwrap_or_default()),
+                            |address| state.storage_root(address, Default::default()).map(Some),
+                        ),
+                        Ok(Some(_))
+                    )
+                {
+                    to_remove.push(*tx.hash());
+                    known_accounts_evicted += 1;
                 }
             }
+
             if !to_remove.is_empty() {
                 let removed = pool.remove_transactions(to_remove);
                 metrics.inc_removed_tx_conditional(removed.len());
+            }
+            if known_accounts_evicted > 0 {
+                metrics.inc_removed_tx_conditional_known_accounts(known_accounts_evicted);
             }
         }
     }
