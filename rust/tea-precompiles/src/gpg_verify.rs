@@ -855,12 +855,15 @@ mod tests {
         );
     }
 
-    /// Build a valid **non-signing** `SubkeyBinding` self-signature for `ssk`'s
-    /// first subkey, stamped at `created_secs`. The empty `KeyFlags` clears the
-    /// sign capability, so no embedded primary-key-binding back-signature is
-    /// required and `verify_bindings` still accepts it.
-    fn non_signing_binding_at(
+    /// Build a valid self-signature of `typ` (`SubkeyBinding` or
+    /// `SubkeyRevocation`) for `ssk`'s first subkey, stamped at `created_secs`,
+    /// with empty `KeyFlags`. With no sign capability advertised, no embedded
+    /// primary-key-binding back-signature is required and `verify_bindings`
+    /// still accepts it. (`sign_subkey_binding` hashes the primary+subkey data
+    /// the same way for both types, so a revocation validates identically.)
+    fn subkey_self_sig_at(
         ssk: &pgp::composed::SignedSecretKey,
+        typ: SignatureType,
         created_secs: u32,
     ) -> Signature {
         use pgp::packet::{KeyFlags, SignatureConfig, Subpacket, SubpacketData};
@@ -868,9 +871,8 @@ mod tests {
         use rand_08::SeedableRng;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([0x55; 32]);
-        let mut config =
-            SignatureConfig::from_key(&mut rng, &ssk.primary_key, SignatureType::SubkeyBinding)
-                .expect("binding config");
+        let mut config = SignatureConfig::from_key(&mut rng, &ssk.primary_key, typ)
+            .expect("self-sig config");
         config.hashed_subpackets = vec![
             Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::from_secs(
                 created_secs,
@@ -893,7 +895,7 @@ mod tests {
                 &Password::empty(),
                 ssk.secret_subkeys[0].key.public_key(),
             )
-            .expect("sign non-signing binding")
+            .expect("sign subkey self-signature")
     }
 
     /// TEAO1-193: subkey eligibility must honor the **effective** (latest)
@@ -951,7 +953,8 @@ mod tests {
 
         // Effective binding is the LATER non-signing one — ineligible, even
         // though a valid older signing binding is retained.
-        let later_non_signing = non_signing_binding_at(&ssk, signing_created.as_secs() + 1);
+        let later_non_signing =
+            subkey_self_sig_at(&ssk, SignatureType::SubkeyBinding, signing_created.as_secs() + 1);
         assert!(!later_non_signing.key_flags().sign(), "control: later binding clears the sign flag");
         let mixed = SignedPublicSubKey::new(
             subkey.key.clone(),
@@ -974,10 +977,33 @@ mod tests {
             "the effective non-signing binding is ineligible",
         );
 
+        // A later REVOCATION is likewise the effective packet — the subkey is
+        // ineligible even with the older signing binding still retained.
+        let later_revocation =
+            subkey_self_sig_at(&ssk, SignatureType::SubkeyRevocation, signing_created.as_secs() + 2);
+        assert_eq!(
+            later_revocation.typ(),
+            Some(SignatureType::SubkeyRevocation),
+            "control: the revocation carries the revocation signature type",
+        );
+        let revoked = SignedPublicSubKey::new(
+            subkey.key.clone(),
+            vec![signing_binding.clone(), later_revocation],
+        );
+        assert!(
+            revoked.verify_bindings(&full_pub.primary_key).is_ok(),
+            "control: the revocation is a cryptographically valid self-signature",
+        );
+        assert!(
+            run(revoked).iter().all(|&b| b == 0),
+            "a later revocation must override an older signing binding (TEAO1-193)",
+        );
+
         // Positive control: when the signing binding is the EFFECTIVE (latest)
         // one, the subkey verifies — the fix honors recency, it is not a blanket
         // rejection of multi-binding subkeys.
-        let earlier_non_signing = non_signing_binding_at(&ssk, signing_created.as_secs() - 1);
+        let earlier_non_signing =
+            subkey_self_sig_at(&ssk, SignatureType::SubkeyBinding, signing_created.as_secs() - 1);
         let signing_latest = SignedPublicSubKey::new(
             subkey.key.clone(),
             vec![earlier_non_signing, signing_binding.clone()],
