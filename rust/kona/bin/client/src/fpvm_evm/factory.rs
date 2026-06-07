@@ -64,6 +64,28 @@ where
     }
 }
 
+/// The single selection point for the fault-proof EVM factory, shared by every
+/// fault-proof execution path: the interop client replay
+/// ([`kona_client::interop::run`]), the single-chain client
+/// ([`kona_client::single::run`]), and the interop **host**'s optimistic-block
+/// re-execution (`kona-host`'s `L2BlockData` handler).
+///
+/// Routing all of them through this one constructor is what keeps the host's
+/// witness-collection re-execution byte-identical to the client replay it must
+/// reproduce. TEAO1-143 was exactly the drift this guards against: the host
+/// hand-rolled `alloy_op_evm::OpEvmFactory::default()`, which leaves
+/// `ctx.chain.l1_cost_multiplier` unset, so it charged raw OP L1 fees and
+/// derived a different header than the [`FpvmOpEvmFactory`] client path. Any
+/// future change to fault-proof EVM construction (Tea config, precompiles)
+/// lands here once and cannot diverge between host and client.
+pub fn fpvm_op_evm_factory<H, O>(hint_writer: H, oracle_reader: O) -> FpvmOpEvmFactory<H, O>
+where
+    H: HintWriterClient + Clone + Send + Sync,
+    O: PreimageOracleClient + Clone + Send + Sync,
+{
+    FpvmOpEvmFactory::new(hint_writer, oracle_reader)
+}
+
 impl<H, O> EvmFactory for FpvmOpEvmFactory<H, O>
 where
     H: HintWriterClient + Clone + Send + Sync + 'static,
