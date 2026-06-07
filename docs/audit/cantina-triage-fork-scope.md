@@ -145,14 +145,15 @@ Findings are grouped so each PR touches **one coherent file set / subsystem**, l
 |----|-------|-----------------|----------|
 | **P8** | Kona FPVM parity (precompiles + Tea-aware host factory) | fork `kona/.../fpvm_evm/precompiles/provider.rs` + `bin/host/src/interop/*` | 174, 143 |
 | **P9** | Go fault-proof (op-program) Tea semantics + chain-gate | fork/patch `op-program/client/*` | 184, 187 |
-| **P10** | op-reth txpool affordability with Tea multiplier | fork `op-reth/crates/txpool/src/validator.rs` (+ maintain.rs) | 175, 186, 151, 167 |
+| **P10** | op-reth txpool affordability with Tea multiplier | fork `op-reth/crates/txpool/src/validator.rs` (+ maintain.rs) | 175, 186, 151 |
+| **P10b** | op-reth conditional-tx `knownAccounts` revalidation at inclusion *(split from P10 — a storage-predicate re-check, not L1-fee affordability)* | ✅ Addressed (#21 via #34): shared `txpool/conditional.rs` evaluator wired into `payload/builder.rs` (re-check `Slots` vs pending build state, pre-execution — the load-bearing leg), head eviction in `txpool/maintain.rs`, admission in `rpc/eth/ext.rs` | 167 |
 | **P11** | op-reth RPC simulate/trace block-fee context | fork `op-reth/crates/rpc/**` | 164, 178 |
 | **P12** | tea-reth proof-history wiring | ✅ Addressed (#21): fail-closed in `main.rs` (`ensure_proofs_history_unsupported`) — Tea does not serve proof history, so the flag is rejected rather than wiring the unused `OpProofsExEx` stack | 152 |
 | **P13** | CGT deployer mode-immutability across retries | fork `op-deployer/.../init.go`/`apply.go` or guard in `chain_intent.go` | 171 |
 | **P14** | op-node Tea-aware hardfork upgrade bytecode | bake Tea-aware upgrade payloads for `GasPriceOracle` (136) + `L1BlockCGT` (140) in `op-node/rollup/derive/` | 136, 140 |
 | **P15** | Kona registry / host-config trust for Tea | ship Tea's rollup config in Kona's registry / reproducible custom-config prestate | 181 |
 
-> Net: **the 24 KEEP findings collapse into 7 PRs (P1–P7)**; the 15 BORDERLINE findings into 8 decision-gated PRs (P8–P15). 176 spans two KEEP PRs (execution leg in P3, receipt leg in P7) — land P3 first, then P7, to reconcile all three fee surfaces.
+> Net: **the 24 KEEP findings collapse into 7 PRs (P1–P7)**; the 15 BORDERLINE findings into 9 decision-gated PRs (P8–P15, with 167 split out of P10 as P10b). 176 spans two KEEP PRs (execution leg in P3, receipt leg in P7) — land P3 first, then P7, to reconcile all three fee surfaces.
 
 ## Notes for manual review
 
