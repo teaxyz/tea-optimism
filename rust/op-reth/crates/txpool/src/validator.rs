@@ -360,7 +360,10 @@ impl OpForkTracker {
 /// unit-testable; mirrors the EVM's `l1_cost_multiplier`, where
 /// [`tea_l1_cost::multiplier_from_oracle_value`] yields `(rate, WAD)` and the
 /// scaled cost is `raw * rate / WAD`.
-fn scale_l1_cost_by_oracle(
+///
+/// Shared with the head-driven eviction task (`crate::maintain`) so admission and
+/// eviction scale the L1 cost by the exact same math (TEAO1-151).
+pub(crate) fn scale_l1_cost_by_oracle(
     raw_l1_cost: alloy_primitives::U256,
     oracle_slot: alloy_primitives::U256,
 ) -> alloy_primitives::U256 {
