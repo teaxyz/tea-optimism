@@ -36,10 +36,11 @@
 
 use alloy_primitives::Bytes;
 use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey, SignedPublicSubKey};
-use pgp::packet::{Packet, PacketParser, SignatureType};
+use pgp::packet::{Packet, PacketParser, Signature, SignatureType};
 use pgp::ser::Serialize;
 use pgp::types::KeyDetails;
 use revm::precompile::{Precompile, PrecompileId, PrecompileOutput, PrecompileResult};
+use std::cmp::Ordering;
 use std::io::Cursor;
 
 /// Address + gas schedule live in the no_std [`crate::gas`] module so the FPVM
@@ -144,13 +145,66 @@ fn parse_single<T: Deserializable + Serialize>(bytes: &[u8]) -> Result<T, &'stat
     Ok(first)
 }
 
-/// Whether a subkey advertises signing capability in any of its binding
-/// signatures. An encryption-only subkey must never be elevated into a signing
-/// authority (TEAO1-160). The binding signatures consulted here are the same
-/// ones validated by [`SignedPublicSubKey::verify_bindings`], so a forged flag
-/// cannot pass without also forging the primary's binding signature.
+/// Whether a subkey's **effective** self-signature authorizes signing.
+///
+/// A subkey's capability is governed by its single most recent self-signature
+/// — the latest valid `SubkeyBinding` or `SubkeyRevocation` packet — not by the
+/// union of every binding it has ever carried. The previous `any()` form
+/// unioned the `sign` flag across all retained bindings, so a stale
+/// signing-capable binding kept a subkey eligible even after a later valid
+/// non-signing re-binding or a revocation (TEAO1-193). We instead resolve the
+/// effective packet and honor only it: an encryption-only subkey (TEAO1-160), a
+/// re-bound non-signing subkey, or a revoked subkey is rejected.
+///
+/// The packets consulted here are the same `SubkeyBinding`/`SubkeyRevocation`
+/// self-signatures that [`SignedPublicSubKey::verify_bindings`] has already
+/// cryptographically validated against the primary key, so a forged flag or
+/// timestamp cannot pass without also forging the primary's signature.
 fn subkey_can_sign(sk: &SignedPublicSubKey) -> bool {
-    sk.signatures.iter().any(|sig| sig.key_flags().sign())
+    // Restrictiveness rank used only to break creation-time ties. Lower = more
+    // restrictive and therefore "wins" an equal-timestamp tie so we fail closed:
+    // a revocation beats a binding, and a non-signing binding beats a signing
+    // one. (`new()` retains only Binding/Revocation packets, so the catch-all is
+    // unreachable; it ranks as most-restrictive defensively.)
+    fn rank(sig: &Signature) -> u8 {
+        match (sig.typ(), sig.key_flags().sign()) {
+            (Some(SignatureType::SubkeyRevocation), _) => 0,
+            (Some(SignatureType::SubkeyBinding), false) => 1,
+            (Some(SignatureType::SubkeyBinding), true) => 2,
+            _ => 0,
+        }
+    }
+
+    // The effective self-signature is the one with the latest creation time.
+    // Packets lacking a creation-time subpacket are malformed self-signatures
+    // and cannot establish recency, so they are ignored for selection — a
+    // signing binding with no timestamp therefore fails closed rather than
+    // silently outranking a later non-signing binding.
+    let effective = sk
+        .signatures
+        .iter()
+        .filter(|sig| {
+            matches!(
+                sig.typ(),
+                Some(SignatureType::SubkeyBinding) | Some(SignatureType::SubkeyRevocation)
+            ) && sig.created().is_some()
+        })
+        .max_by(|a, b| {
+            // Both `created()` are `Some` (filtered above); `Timestamp` is a
+            // `u32` newtype so `partial_cmp` never returns `None`.
+            let by_time = a
+                .created()
+                .partial_cmp(&b.created())
+                .unwrap_or(Ordering::Equal);
+            // On equal creation time, treat the more restrictive packet (lower
+            // rank) as the greater one so `max_by` selects it.
+            by_time.then_with(|| rank(b).cmp(&rank(a)))
+        });
+
+    matches!(
+        effective.map(|sig| (sig.typ(), sig.key_flags().sign())),
+        Some((Some(SignatureType::SubkeyBinding), true))
+    )
 }
 
 /// Decoded GPG verify precompile input.
@@ -970,6 +1024,139 @@ mod tests {
         assert!(
             pub_key.public_subkeys.iter().any(subkey_can_sign),
             "fixture should contain a signing subkey (retained)"
+        );
+    }
+
+    /// Build a valid **non-signing** `SubkeyBinding` self-signature for `ssk`'s
+    /// first subkey, stamped at `created_secs`. The empty `KeyFlags` clears the
+    /// sign capability, so no embedded primary-key-binding back-signature is
+    /// required and `verify_bindings` still accepts it.
+    fn non_signing_binding_at(
+        ssk: &pgp::composed::SignedSecretKey,
+        created_secs: u32,
+    ) -> Signature {
+        use pgp::packet::{KeyFlags, SignatureConfig, Subpacket, SubpacketData};
+        use pgp::types::{KeyVersion, Password, Timestamp};
+        use rand_08::SeedableRng;
+
+        let mut rng = rand_08::rngs::StdRng::from_seed([0x55; 32]);
+        let mut config =
+            SignatureConfig::from_key(&mut rng, &ssk.primary_key, SignatureType::SubkeyBinding)
+                .expect("binding config");
+        config.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::from_secs(
+                created_secs,
+            )))
+            .unwrap(),
+            Subpacket::regular(SubpacketData::KeyFlags(KeyFlags::default())).unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(ssk.primary_key.fingerprint()))
+                .unwrap(),
+        ];
+        if ssk.primary_key.version() <= KeyVersion::V4 {
+            config.unhashed_subpackets = vec![Subpacket::regular(SubpacketData::IssuerKeyId(
+                ssk.primary_key.legacy_key_id(),
+            ))
+            .unwrap()];
+        }
+        config
+            .sign_subkey_binding(
+                &ssk.primary_key,
+                ssk.primary_key.public_key(),
+                &Password::empty(),
+                ssk.secret_subkeys[0].key.public_key(),
+            )
+            .expect("sign non-signing binding")
+    }
+
+    /// TEAO1-193: subkey eligibility must honor the **effective** (latest)
+    /// binding, not union `sign()` across every retained binding. A subkey that
+    /// carries a stale signing-capable binding alongside a later valid
+    /// non-signing re-binding must be ineligible; only when the signing binding
+    /// is itself the latest may the subkey verify.
+    #[test]
+    fn test_subkey_effective_binding_overrides_stale_signing() {
+        use pgp::crypto::hash::HashAlgorithm;
+        use pgp::types::Password;
+        use rand_08::SeedableRng;
+
+        // A key whose only subkey carries a genuine signing binding (with the
+        // embedded back-signature that `verify_bindings` requires).
+        let ssk = gen_ed25519(7, true);
+        let full_pub = ssk.to_public_key();
+        assert_eq!(full_pub.public_subkeys.len(), 1, "expected one signing subkey");
+        let subkey = full_pub.public_subkeys[0].clone();
+        let signing_binding = subkey.signatures[0].clone();
+        assert!(signing_binding.key_flags().sign(), "control: original binding advertises signing");
+        let signing_created = signing_binding.created().expect("binding has a creation time");
+
+        // The same subkey material signs the message we will verify.
+        let message = [0x42u8; 32];
+        let mut rng = rand_08::rngs::StdRng::from_seed([0x11; 32]);
+        let sig = DetachedSignature::sign_binary_data(
+            &mut rng,
+            &ssk.secret_subkeys[0].key,
+            &Password::empty(),
+            HashAlgorithm::Sha256,
+            &message[..],
+        )
+        .expect("subkey signs message");
+        let subkey_id = fingerprint_to_key_id(&subkey.fingerprint());
+        let sig_bytes = sig.to_bytes().expect("sig bytes");
+
+        // Run the precompile against a certificate carrying exactly `sub`.
+        let run = |sub: SignedPublicSubKey| -> Vec<u8> {
+            let pubkey = SignedPublicKey::new(
+                full_pub.primary_key.clone(),
+                full_pub.details.clone(),
+                vec![sub],
+            );
+            let input = encode_gpg_verify_input(
+                &message,
+                &subkey_id,
+                &pubkey.to_bytes().expect("pub bytes"),
+                &sig_bytes,
+            );
+            let gas = required_gas(&input);
+            gpg_verify_run(&input, gas).as_ref().expect("Ok result").bytes.to_vec()
+        };
+
+        // Effective binding is the LATER non-signing one — ineligible, even
+        // though a valid older signing binding is retained.
+        let later_non_signing = non_signing_binding_at(&ssk, signing_created.as_secs() + 1);
+        assert!(!later_non_signing.key_flags().sign(), "control: later binding clears the sign flag");
+        let mixed = SignedPublicSubKey::new(
+            subkey.key.clone(),
+            vec![signing_binding.clone(), later_non_signing.clone()],
+        );
+        assert!(
+            mixed.verify_bindings(&full_pub.primary_key).is_ok(),
+            "control: both retained bindings are individually valid",
+        );
+        assert!(
+            run(mixed).iter().all(|&b| b == 0),
+            "a stale signing binding must not re-enable a re-bound non-signing subkey (TEAO1-193)",
+        );
+
+        // Only the later non-signing binding retained — also ineligible.
+        let current_only =
+            SignedPublicSubKey::new(subkey.key.clone(), vec![later_non_signing.clone()]);
+        assert!(
+            run(current_only).iter().all(|&b| b == 0),
+            "the effective non-signing binding is ineligible",
+        );
+
+        // Positive control: when the signing binding is the EFFECTIVE (latest)
+        // one, the subkey verifies — the fix honors recency, it is not a blanket
+        // rejection of multi-binding subkeys.
+        let earlier_non_signing = non_signing_binding_at(&ssk, signing_created.as_secs() - 1);
+        let signing_latest = SignedPublicSubKey::new(
+            subkey.key.clone(),
+            vec![earlier_non_signing, signing_binding.clone()],
+        );
+        assert_eq!(
+            alloy_primitives::hex::encode(run(signing_latest)),
+            SUCCESS_HEX,
+            "a subkey whose effective (latest) binding advertises signing must verify",
         );
     }
 
