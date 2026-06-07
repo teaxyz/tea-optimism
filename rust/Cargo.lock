@@ -12028,6 +12028,8 @@ dependencies = [
  "serde",
  "serde_json",
  "strum",
+ "tea-l1-cost",
+ "tea-trace-ctx",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -14781,7 +14783,15 @@ dependencies = [
  "sha2",
  "signature",
  "tea-l1-cost",
+ "tea-trace-ctx",
  "tracing",
+]
+
+[[package]]
+name = "tea-trace-ctx"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
 ]
 
 [[package]]

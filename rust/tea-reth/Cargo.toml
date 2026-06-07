@@ -36,6 +36,10 @@ op-alloy-network.workspace = true
 # arithmetic in one place so EL and FPVM cannot drift)
 tea-l1-cost.workspace = true
 
+# tea (TEAO1-178): per-thread handoff so trace/replay charges the block-start
+# (parent-state) oracle multiplier instead of the post-replay slot value
+tea-trace-ctx.workspace = true
+
 # pgp
 pgp = "0.19"
 
