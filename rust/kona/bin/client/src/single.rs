@@ -1,6 +1,6 @@
 //! Single-chain fault proof program entrypoint.
 
-use crate::fpvm_evm::FpvmOpEvmFactory;
+use crate::fpvm_evm::fpvm_op_evm_factory;
 use alloc::sync::Arc;
 use alloy_consensus::Sealed;
 use alloy_primitives::B256;
@@ -110,7 +110,7 @@ where
     })?;
     l2_provider.set_cursor(cursor.clone());
 
-    let evm_factory = FpvmOpEvmFactory::new(hint_client, oracle_client);
+    let evm_factory = fpvm_op_evm_factory(hint_client, oracle_client);
     let da_provider =
         EthereumDataSource::new_from_parts(l1_provider.clone(), beacon, &rollup_config);
     let pipeline = OraclePipeline::new(

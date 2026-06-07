@@ -5,4 +5,4 @@
 mod precompiles;
 
 mod factory;
-pub use factory::FpvmOpEvmFactory;
+pub use factory::{FpvmOpEvmFactory, fpvm_op_evm_factory};
