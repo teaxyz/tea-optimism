@@ -36,20 +36,37 @@ pub const MIN_RSA_MODULUS_BYTES: usize = 256;
 /// `BigUint::from_bytes_be` silently absorb the remaining zeros — defeating
 /// the 2048-bit floor entirely.
 pub fn strip_mpint_pad(bytes: &[u8]) -> Result<&[u8], &'static str> {
-    if bytes.len() >= 2 && bytes[0] == 0x00 {
-        if bytes[1] & 0x80 == 0 {
+    // RFC 4251 §5 canonical mpint, for the positive-only consumers here (RSA
+    // n/e, ECDSA r/s). The goal is a *bijection*: every integer has exactly one
+    // accepted byte encoding, so no value can be aliased across two distinct
+    // publicKey / sig_blob byte strings (TEAO1-168 / TEAO1-183).
+
+    // Empty string is the RFC 4251 §5 canonical encoding of zero — the unique
+    // representation of 0. Returned as-is; a zero RSA modulus/exponent or ECDSA
+    // scalar is then rejected downstream (RsaPublicKey::new / scalar validation).
+    if bytes.is_empty() {
+        return Ok(bytes);
+    }
+
+    if bytes[0] == 0x00 {
+        // A leading 0x00 is canonical only as the *single* sign pad for a value
+        // whose next byte has the high bit set. Reject the two non-canonical
+        // shapes early:
+        //   - a lone 0x00 (len == 1): zero must be the empty string, not 0x00;
+        //   - an unneeded pad (next byte high bit clear, incl. multi-zero runs).
+        if bytes.len() == 1 || bytes[1] & 0x80 == 0 {
             return Err("non-canonical mpint pad");
         }
         return Ok(&bytes[1..]);
     }
-    // RFC 4251 §5: a positive mpint whose most-significant byte has the high
-    // bit set MUST carry the leading `0x00` sign pad. A signless high-bit value
-    // is non-canonical — reject it, otherwise `0x00||x` and `x` decode to the
-    // same RSA modulus / ECDSA scalar, aliasing one key or signature across two
-    // distinct publicKey / sig_blob byte strings (TEAO1-168 / TEAO1-183).
-    if bytes.first().is_some_and(|b| b & 0x80 != 0) {
+
+    // A positive mpint whose most-significant byte has the high bit set MUST
+    // carry the leading 0x00 sign pad. A signless high-bit value is
+    // non-canonical — otherwise `0x00||x` and `x` decode to the same integer.
+    if bytes[0] & 0x80 != 0 {
         return Err("missing mpint sign pad");
     }
+
     Ok(bytes)
 }
 
@@ -544,13 +561,26 @@ mod tests {
 
     #[test]
     fn strip_mpint_pad_empty_input() {
+        // Empty string is the RFC 4251 §5 canonical encoding of zero — the
+        // unique representation of 0, accepted as-is.
         assert_eq!(strip_mpint_pad(&[]).unwrap(), &[] as &[u8]);
     }
 
     #[test]
-    fn strip_mpint_pad_lone_zero() {
-        // Single 0x00 is the RFC 4251 §5 encoding of zero — valid, not stripped.
-        assert_eq!(strip_mpint_pad(&[0x00]).unwrap(), &[0x00]);
+    fn strip_mpint_pad_rejects_lone_zero() {
+        // A single 0x00 is a non-canonical zero — zero MUST be the empty string,
+        // so 0x00 and `[]` cannot both alias the integer 0. Reject it (TEAO1-168).
+        assert!(strip_mpint_pad(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn strip_mpint_pad_accepts_small_positive_single_byte() {
+        // A single low byte (high bit clear) is a valid canonical small positive
+        // integer — e.g. an RSA exponent of 3. It is NOT an "obviously false"
+        // case and must be returned unchanged.
+        assert_eq!(strip_mpint_pad(&[0x03]).unwrap(), &[0x03]);
+        assert_eq!(strip_mpint_pad(&[0x01]).unwrap(), &[0x01]);
+        assert_eq!(strip_mpint_pad(&[0x7F]).unwrap(), &[0x7F]);
     }
 
     // ─────────────────────────────────────────── read_ssh_string
@@ -821,6 +851,71 @@ mod tests {
             !accepted,
             "VULN: real 1024-bit signature accepted via non-canonical mpint — \
              2048-bit floor is bypassable"
+        );
+    }
+
+    /// TEAO1-168: the SSH RSA key-aliasing PoC, at the `verify_ssh_rsa` level.
+    /// A 2048-bit modulus has its most-significant bit set, so its canonical SSH
+    /// mpint carries a leading `0x00` sign pad. The same authority can be
+    /// re-encoded *without* that pad (a signless high-bit mpint). Pre-fix both
+    /// `publicKey` byte strings decoded to the same `(n, e)` and verified the
+    /// same signature — aliasing one RSA authority across two distinct blobs
+    /// (and two distinct `keccak256(publicKey)` identities). Post-fix the
+    /// canonical blob still verifies while the signless alias is rejected by
+    /// `strip_mpint_pad` before any `BigUint` conversion. This mirrors
+    /// `verify_ssh_ecdsa_rejects_signless_r_scalar` (TEAO1-183) on the RSA path.
+    #[test]
+    fn verify_ssh_rsa_rejects_signless_modulus_alias() {
+        use rand_08::SeedableRng;
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::traits::PublicKeyParts;
+        use signature::{SignatureEncoding, Signer};
+
+        let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
+        let priv_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("RSA-2048 keygen");
+        let pub_key = rsa::RsaPublicKey::from(&priv_key);
+        let n_raw = pub_key.n().to_bytes_be();
+        let e_raw = pub_key.e().to_bytes_be();
+        // A 2048-bit modulus' MSB is always set, so its canonical mpint needs a
+        // sign pad — exactly the PoC's precondition.
+        assert_eq!(n_raw.len(), 256);
+        assert!(
+            n_raw[0] & 0x80 != 0,
+            "expected a high-bit modulus whose canonical mpint needs a sign pad"
+        );
+
+        let message = b"teao1-168 rsa aliasing demo".as_slice();
+        let signing_key: SigningKey<Sha256> = SigningKey::new(priv_key);
+        let sig_bytes = signing_key.sign(message).to_bytes();
+
+        // Canonical publicKey: write_ssh_mpint prepends the 0x00 sign pad on n.
+        let mut canonical = Vec::new();
+        write_ssh_string(&mut canonical, b"ssh-rsa");
+        write_ssh_mpint(&mut canonical, &e_raw);
+        write_ssh_mpint(&mut canonical, &n_raw);
+
+        // Signless alias publicKey: n framed as a raw SSH string with NO sign pad.
+        let mut alias = Vec::new();
+        write_ssh_string(&mut alias, b"ssh-rsa");
+        write_ssh_mpint(&mut alias, &e_raw);
+        write_ssh_string(&mut alias, &n_raw); // <- the aliasing encoding
+
+        // The two publicKey byte strings differ by exactly the one sign-pad byte.
+        assert_ne!(canonical, alias);
+        assert_eq!(canonical.len(), alias.len() + 1);
+
+        let mut co = 0usize;
+        let _ = read_ssh_string(&canonical, &mut co).unwrap();
+        let mut ao = 0usize;
+        let _ = read_ssh_string(&alias, &mut ao).unwrap();
+
+        assert!(
+            verify_ssh_rsa(&canonical, co, message, b"rsa-sha2-256", &sig_bytes),
+            "canonical SSH RSA key must verify"
+        );
+        assert!(
+            !verify_ssh_rsa(&alias, ao, message, b"rsa-sha2-256", &sig_bytes),
+            "signless high-bit modulus alias must be rejected (TEAO1-168)"
         );
     }
 
