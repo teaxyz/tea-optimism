@@ -7,7 +7,8 @@ use alloy_primitives::{B256, Bytes, StorageKey};
 use alloy_rpc_types_eth::erc4337::TransactionConditional;
 use jsonrpsee_core::RpcResult;
 use reth_optimism_txpool::conditional::{
-    KnownAccountViolation, MaybeConditionalTransaction, first_known_account_violation,
+    KnownAccountViolation, MaybeConditionalTransaction, conditional_has_root_hash,
+    first_known_account_violation,
 };
 use reth_rpc_eth_api::L2EthApiExtServer;
 use reth_rpc_eth_types::utils::recover_raw_transaction;
@@ -137,6 +138,18 @@ where
             condition.has_exceeded_timestamp(header.header().timestamp())
         {
             return Err(TxConditionalErr::InvalidCondition.into());
+        }
+
+        // Reject `knownAccounts` storage-root (`RootHash`) predicates at admission.
+        // The payload builder runs against a bare revm `Database` with no storage
+        // trie, so it cannot compute a pending storage root and can never honor a
+        // RootHash predicate at inclusion time (it passes `read_root => None`, which
+        // skips them in `first_known_account_violation`). Rather than accept a mode
+        // the builder cannot enforce, refuse it here before it reaches the pool or is
+        // forwarded to the sequencer (TEAO1-167 follow-up). Slots predicates are
+        // unaffected and remain re-checked at inclusion.
+        if conditional_has_root_hash(&condition) {
+            return Err(TxConditionalErr::RootHashUnsupported.into());
         }
 
         // Validate Account

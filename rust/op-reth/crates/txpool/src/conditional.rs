@@ -106,6 +106,17 @@ where
     Ok(None)
 }
 
+/// Returns true if `cond` contains any `AccountStorage::RootHash` predicate.
+///
+/// Such predicates cannot be honored at inclusion time by the payload builder
+/// (which runs against a bare revm `Database` with no storage trie, so it passes
+/// `read_root => Ok(None)` and [`first_known_account_violation`] skips them), so
+/// they are rejected at RPC admission rather than silently bypassing
+/// inclusion-time enforcement (TEAO1-167 follow-up).
+pub fn conditional_has_root_hash(cond: &TransactionConditional) -> bool {
+    cond.known_accounts.values().any(|s| matches!(s, AccountStorage::RootHash(_)))
+}
+
 #[cfg(test)]
 mod known_accounts_tests {
     //! Tests for [`first_known_account_violation`] — the single decision shared by
@@ -320,5 +331,30 @@ mod known_accounts_tests {
         assert_eq!(err, Err("boom"));
         // Fail-open: eviction/build do not act on a read error.
         assert!(!matches!(err, Ok(Some(_))));
+    }
+
+    // ── Admission gate: RootHash conditionals are rejected at RPC admission ───────
+    //
+    // The builder cannot compute a pending storage root from its bare revm `Database`
+    // (`read_root => None`), so it can never honor a `RootHash` predicate at inclusion
+    // time. Rather than accept a mode the builder cannot enforce, admission detects
+    // and rejects any conditional carrying a `RootHash` predicate up front.
+    #[test]
+    fn conditional_has_root_hash_detects_root_predicates() {
+        let a = addr(1);
+        let b = addr(2);
+
+        // Slots-only conditional => no RootHash => allowed.
+        let slots_only = cond_slots(a, &[(U256::from(1), B256::with_last_byte(7))]);
+        assert!(!conditional_has_root_hash(&slots_only));
+
+        // Pure RootHash conditional => rejected.
+        let root_only = cond_root(a, B256::with_last_byte(42));
+        assert!(conditional_has_root_hash(&root_only));
+
+        // Mixed Slots + RootHash => rejected (any RootHash entry trips the gate).
+        let mut mixed = cond_slots(a, &[(U256::from(1), B256::with_last_byte(7))]);
+        mixed.known_accounts.insert(b, AccountStorage::RootHash(B256::with_last_byte(42)));
+        assert!(conditional_has_root_hash(&mixed));
     }
 }
