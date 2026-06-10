@@ -3,7 +3,7 @@ use crate::{
     OpAttributes, OpPayloadBuilderAttributes, OpPayloadPrimitives, config::OpBuilderConfig,
     error::OpPayloadBuilderError, payload::OpBuiltPayload,
 };
-use alloy_consensus::{BlockHeader, Transaction, Typed2718};
+use alloy_consensus::{BlockHeader, Transaction, Typed2718, conditional::BlockConditionalAttributes};
 use alloy_evm::Evm as AlloyEvm;
 use alloy_primitives::{B256, U256};
 use alloy_rpc_types_debug::ExecutionWitness;
@@ -740,6 +740,27 @@ where
             // check if the job was cancelled, if so we can exit early
             if self.cancel.is_cancelled() {
                 return Ok(Some(()));
+            }
+
+            // Re-check the conditional's block-attribute ceilings (`blockNumberMax`
+            // / `timestampMax`) against the candidate block being built, immediately
+            // before inclusion. The maintenance task only evicts expired conditionals
+            // on a post-commit `Commit` notification, so there is a window where the
+            // next block is built (e.g. at T+2) before any eviction fires for a tx
+            // whose `timestampMax`/`blockNumberMax` already expired (e.g. T+1). Use
+            // the values of the block BEING BUILT — not the parent head — which is the
+            // whole point of the finding. (Companion to the TEAO1-167 re-check below.)
+            if let Some(cond) = &conditional {
+                let block = builder.evm_mut().block();
+                let block_attr = BlockConditionalAttributes {
+                    number: block.number().saturating_to(),
+                    timestamp: block.timestamp().saturating_to(),
+                };
+                if cond.has_exceeded_block_attributes(&block_attr) {
+                    trace!(target: "payload_builder", ?tx, "skipping conditional tx whose blockNumberMax/timestampMax expired for the candidate block");
+                    best_txs.mark_invalid(tx.signer(), tx.nonce());
+                    continue;
+                }
             }
 
             // TEAO1-167: re-validate the conditional's `knownAccounts` against the
