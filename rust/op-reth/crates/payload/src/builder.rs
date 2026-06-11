@@ -1113,6 +1113,92 @@ mod root_hash_overlay_tests {
         );
     }
 
+    /// Merge-vs-replace fidelity against a **non-empty committed trie** (TEAO1-206).
+    /// The whole fix rests on `overlay_root` being an OVERLAY (parent trie + this
+    /// block's writes), not a REPLACE: an in-block write to one slot must leave the
+    /// account's other committed slots in the recomputed root. The other DB-backed
+    /// test overlays onto an empty parent and can't show this. Here the parent commits
+    /// `{s1:a, s2:b}`; only `s1` is rewritten in-block (s2 is never touched, so it is
+    /// absent from the executor cache / overlay), and we assert the recomputed root
+    /// still contains `s2:b`.
+    #[test]
+    fn pending_root_retains_untouched_committed_slots_through_overlay() {
+        use reth_db_api::{tables, transaction::{DbTx, DbTxMut}};
+        use reth_primitives_traits::StorageEntry;
+
+        let factory = create_test_provider_factory();
+        let addr = Address::with_last_byte(0x55);
+        let s1 = U256::from(1);
+        let s2 = U256::from(2);
+        let a = U256::from(11); // committed s1
+        let b = U256::from(22); // committed s2 — never written in-block
+        let a_drift = U256::from(99); // s1 rewritten inside the block
+
+        // Commit parent storage {s1: a, s2: b} into the hashed trie.
+        {
+            let tx = factory.provider_rw().expect("rw").into_tx();
+            let ha = keccak256(addr);
+            tx.put::<tables::HashedStorages>(
+                ha,
+                StorageEntry { key: keccak256(B256::from(s1)), value: a },
+            )
+            .expect("put s1");
+            tx.put::<tables::HashedStorages>(
+                ha,
+                StorageEntry { key: keccak256(B256::from(s2)), value: b },
+            )
+            .expect("put s2");
+            tx.commit().expect("commit");
+        }
+        let db = factory.provider().expect("provider");
+        let provider = LatestStateProviderRef::new(&db);
+
+        // Root the conditional was admitted against (empty overlay → committed root).
+        let committed_root = provider.storage_root(addr, HashedStorage::default()).expect("root");
+        let cond = cond_root(addr, committed_root);
+
+        // In-block rewrite of s1 only; s2 is untouched and absent from the cache.
+        let mut state = state_with_pending(addr, &[(s1, a_drift)]);
+        let pending = (&mut state).pending_storage_root(&provider, addr).expect("pending");
+
+        // It MUST equal a merge {s1:a_drift, s2:b} — s2:b retained from committed...
+        let merged_ref = provider
+            .storage_root(
+                addr,
+                HashedStorage::from_plain_storage(
+                    AccountStatus::Loaded,
+                    [(&s1, &a_drift), (&s2, &b)].into_iter(),
+                ),
+            )
+            .expect("merged ref");
+        assert_eq!(pending, merged_ref, "overlay must retain the untouched committed slot s2");
+
+        // ...and must NOT equal a replace {s1:a_drift} alone (computed on a fresh,
+        // storage-less account), proving s2 did not get dropped.
+        let fresh = Address::with_last_byte(0x56);
+        let replace_ref = provider
+            .storage_root(
+                fresh,
+                HashedStorage::from_plain_storage(AccountStatus::Loaded, [(&s1, &a_drift)].into_iter()),
+            )
+            .expect("replace ref");
+        assert_ne!(pending, replace_ref, "overlay must not drop the untouched committed slot");
+
+        // Drift is detected and the conditional excluded.
+        assert_ne!(pending, committed_root, "rewriting s1 must move the storage root");
+        assert_eq!(
+            builder_decision(&cond, pending),
+            Some(KnownAccountViolation::Root { address: addr }),
+        );
+
+        // Control: re-writing s1 with its SAME committed value reproduces the committed
+        // root (merge keeps s2:b and the unchanged s1:a) → conditional included.
+        let mut state_same = state_with_pending(addr, &[(s1, a)]);
+        let pending_same = (&mut state_same).pending_storage_root(&provider, addr).expect("same");
+        assert_eq!(pending_same, committed_root, "unchanged s1 + retained s2 == committed root");
+        assert_eq!(builder_decision(&cond, pending_same), None);
+    }
+
     fn cond_slots(addr: Address, slot: U256, expected: B256) -> TransactionConditional {
         let mut slots = alloy_primitives::map::HashMap::default();
         slots.insert(slot, expected);

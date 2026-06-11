@@ -59,3 +59,6 @@ either.workspace = true
 # DB-backed state provider for the TEAO1-206 inclusion-time RootHash test (real
 # `storage_root` trie computation, which the mock provider stubs out).
 reth-provider = { workspace = true, features = ["test-utils"] }
+# Seed committed hashed storage into the test DB so the overlay re-check is
+# exercised against a non-empty parent trie (merge-vs-replace fidelity).
+reth-db-api.workspace = true
