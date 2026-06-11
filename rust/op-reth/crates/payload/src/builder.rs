@@ -842,23 +842,42 @@ where
             // time decision point. `Slots` are read from the builder's pending DB;
             // `RootHash` predicates are honored here by recomputing the account's
             // storage root over the pending build state (parent trie + this block's
-            // writes) via the state provider. Fail-open on a read error — never drop
-            // an includable tx.
+            // writes) via the state provider.
+            //
+            // Read-error policy is split by predicate kind:
+            // - `RootHash` is **fail-closed** — this is the inclusion-time invariant
+            //   under audit (TEAO1-206), so if a watched account's storage root cannot
+            //   be recomputed we must NOT include the tx under an unverified predicate.
+            //   It is excluded and stays pooled for retry on the next block (no drop,
+            //   no admission rejection).
+            // - `Slots` stays **fail-open** — the established TEAO1-167 behavior; a
+            //   transient slot read never drops an otherwise-includable tx.
             if let Some(cond) = &conditional {
                 // Pre-compute pending storage roots for `RootHash`-watched accounts.
                 // This needs both the executor `State` (pending overlay) and the
                 // parent `state_provider`, so do it before the slot-reader closure
-                // borrows the DB. On a read error we omit the entry (fail-open): the
-                // predicate is then treated as satisfied rather than dropping the tx.
+                // borrows the DB.
                 let mut pending_roots: HashMap<Address, B256> = HashMap::new();
+                let mut root_unverifiable = false;
                 for (address, storage) in &cond.known_accounts {
                     if matches!(storage, AccountStorage::RootHash(_)) {
-                        if let Ok(root) =
-                            builder.evm_mut().db_mut().pending_storage_root(state_provider, *address)
+                        match builder.evm_mut().db_mut().pending_storage_root(state_provider, *address)
                         {
-                            pending_roots.insert(*address, root);
+                            Ok(root) => {
+                                pending_roots.insert(*address, root);
+                            }
+                            // Fail-closed: cannot prove the RootHash predicate → exclude.
+                            Err(err) => {
+                                trace!(target: "payload_builder", %err, ?tx, "excluding conditional tx whose RootHash predicate could not be re-verified (TEAO1-206)");
+                                root_unverifiable = true;
+                                break;
+                            }
                         }
                     }
+                }
+                if root_unverifiable {
+                    best_txs.mark_invalid(tx.signer(), tx.nonce());
+                    continue;
                 }
 
                 let db = builder.evm_mut().db_mut();
