@@ -129,12 +129,7 @@ fn main() {
             // served, no error) — exactly the kind of mismatch TEAO1-152 is
             // about. A bare `--proofs-history` with no path still errors below.
             if should_install_proofs_history(&rollup_args) {
-                let path = rollup_args
-                    .proofs_history_storage_path
-                    .clone()
-                    .ok_or_else(|| {
-                        eyre::eyre!("--proofs-history requires --proofs-history.storage-path")
-                    })?;
+                let path = proofs_history_storage_path(&rollup_args)?;
                 info!(target: "tea_reth", "Using on-disk storage for proofs history");
                 let mdbx = std::sync::Arc::new(
                     MdbxProofsStorage::new(&path)
@@ -207,9 +202,23 @@ fn should_install_proofs_history(args: &RollupArgs) -> bool {
     args.proofs_history || args.proofs_history_storage_path.is_some()
 }
 
+/// Resolve the on-disk storage path for the proof-history stack.
+///
+/// Only meaningful when [`should_install_proofs_history`] is true. The proof
+/// storage is MDBX-backed and therefore needs an explicit path: requesting
+/// proof-history (e.g. a bare `--proofs-history`) without
+/// `--proofs-history.storage-path` is rejected with a clear error rather than
+/// panicking (op-reth's reference path `expect()`s here) or silently doing
+/// nothing.
+fn proofs_history_storage_path(args: &RollupArgs) -> eyre::Result<std::path::PathBuf> {
+    args.proofs_history_storage_path
+        .clone()
+        .ok_or_else(|| eyre::eyre!("--proofs-history requires --proofs-history.storage-path"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::should_install_proofs_history;
+    use super::{proofs_history_storage_path, should_install_proofs_history};
     use clap::Parser;
     use reth_op::node::args::RollupArgs;
 
@@ -240,13 +249,39 @@ mod tests {
         assert!(should_install_proofs_history(&parsed.r), "storage-path sub-flag must trigger the install gate");
     }
 
-    /// The bare `--proofs-history` flag also fires the gate (and errors later
-    /// at launch if no storage path is supplied — covered in `main`).
+    /// The bare `--proofs-history` flag also fires the gate.
     #[test]
     fn proofs_history_bare_flag_enables_install_gate() {
         let parsed = T::parse_from(["x", "--proofs-history"]);
         assert!(parsed.r.proofs_history);
         assert!(should_install_proofs_history(&parsed.r));
+    }
+
+    /// TEAO1-152 error case: a bare `--proofs-history` with NO storage path is
+    /// rejected with a clear error (the MDBX proof store needs an explicit path),
+    /// rather than panicking or silently installing nothing.
+    #[test]
+    fn proofs_history_without_storage_path_errors() {
+        let parsed = T::parse_from(["x", "--proofs-history"]);
+        // Gate fires (so `main` enters the install branch)...
+        assert!(should_install_proofs_history(&parsed.r));
+        // ...but path resolution fails closed with a descriptive error.
+        let err = proofs_history_storage_path(&parsed.r)
+            .expect_err("bare --proofs-history without a storage path must error");
+        assert!(
+            err.to_string().contains("--proofs-history.storage-path"),
+            "error must name the missing flag, got: {err}"
+        );
+    }
+
+    /// Success case: when a storage path is supplied, resolution returns it.
+    #[test]
+    fn proofs_history_with_storage_path_resolves() {
+        let parsed = T::parse_from(["x", "--proofs-history", "--proofs-history.storage-path", "/tmp/ph"]);
+        assert_eq!(
+            proofs_history_storage_path(&parsed.r).expect("path should resolve"),
+            std::path::PathBuf::from("/tmp/ph"),
+        );
     }
 
     /// With no proofs-history flags the gate stays closed: no ExEx / RPC
