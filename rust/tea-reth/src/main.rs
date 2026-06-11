@@ -38,7 +38,7 @@ use reth_optimism_rpc::{
     debug::{DebugApiExt, DebugApiOverrideServer},
     eth::proofs::{EthApiExt, EthApiOverrideServer},
 };
-use reth_optimism_trie::{OpProofsStorage, db::MdbxProofsStorage};
+use reth_optimism_trie::{OpProofsStorage, OpProofsStore, db::MdbxProofsStorage};
 use tea_reth::evm::TeaEvmFactory;
 use tracing::info;
 
@@ -137,6 +137,26 @@ fn main() {
                 );
                 let storage: OpProofsStorage<std::sync::Arc<MdbxProofsStorage>> =
                     mdbx.clone().into();
+
+                // Preflight: the proofs-history ExEx requires the MDBX store to be
+                // pre-initialized (backfilled from current chain state by
+                // `tea-reth proofs init`). Without it the ExEx panics mid-launch with
+                // an op-reth-centric message ("run 'op-reth initialize-op-proofs …'").
+                // Surface a clean, tea-reth-correct error here instead.
+                if storage
+                    .get_earliest_block_number()
+                    .map_err(|e| eyre::eyre!("failed to read proofs-history storage: {e}"))?
+                    .is_none()
+                {
+                    eyre::bail!(
+                        "proofs-history storage at {path} is not initialized; run \
+                         `tea-reth proofs init --proofs-history.storage-path {path}` \
+                         (with the same --chain/--datadir) before starting the node \
+                         with --proofs-history",
+                        path = path.display(),
+                    );
+                }
+
                 let storage_exec = storage.clone();
                 let window = rollup_args.proofs_history_window;
                 let prune_interval = rollup_args.proofs_history_prune_interval;
