@@ -11914,6 +11914,7 @@ dependencies = [
  "op-alloy-rpc-types-engine",
  "reth-basic-payload-builder",
  "reth-chainspec",
+ "reth-db-api",
  "reth-evm",
  "reth-execution-types",
  "reth-optimism-evm",
