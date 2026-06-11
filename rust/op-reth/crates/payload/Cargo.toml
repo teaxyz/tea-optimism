@@ -54,3 +54,8 @@ thiserror.workspace = true
 sha2.workspace = true
 serde.workspace = true
 either.workspace = true
+
+[dev-dependencies]
+# DB-backed state provider for the TEAO1-206 inclusion-time RootHash test (real
+# `storage_root` trie computation, which the mock provider stubs out).
+reth-provider = { workspace = true, features = ["test-utils"] }
