@@ -7,7 +7,7 @@ use alloy_consensus::{BlockHeader, Transaction, Typed2718, conditional::BlockCon
 use alloy_evm::Evm as AlloyEvm;
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_debug::ExecutionWitness;
-use alloy_rpc_types_eth::erc4337::AccountStorage;
+use alloy_rpc_types_eth::erc4337::{AccountStorage, TransactionConditional};
 use alloy_rpc_types_engine::PayloadId;
 use reth_basic_payload_builder::*;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
@@ -101,6 +101,44 @@ impl<DB> PendingStorageRoot for &mut State<DB> {
     ) -> Result<B256, ProviderError> {
         provider.storage_root(address, account_pending_overlay(self, address))
     }
+}
+
+/// Outcome of recomputing pending storage roots for a conditional's `RootHash`
+/// predicates at inclusion time (TEAO1-206).
+#[derive(Debug, PartialEq, Eq)]
+enum RootHashRecheck {
+    /// Every `RootHash`-watched account's pending storage root was recomputed.
+    Roots(HashMap<Address, B256>),
+    /// At least one watched account's storage root could not be recomputed.
+    /// Fail-closed: the transaction must be excluded rather than included under a
+    /// `RootHash` predicate we could not verify.
+    Unverifiable,
+}
+
+/// Recompute the pending storage root of every `RootHash`-watched account in
+/// `cond` via `compute`, returning them keyed by address.
+///
+/// `Slots` predicates are ignored here — they are checked by the slot reader. The
+/// policy is **fail-closed** (TEAO1-206): the first `compute` error returns
+/// [`RootHashRecheck::Unverifiable`] so the caller excludes the transaction
+/// instead of including it under an unverifiable predicate. (`Slots` keeps the
+/// established TEAO1-167 fail-open behavior, applied separately by the caller.)
+fn recompute_root_hash_roots<E>(
+    cond: &TransactionConditional,
+    mut compute: impl FnMut(Address) -> Result<B256, E>,
+) -> RootHashRecheck {
+    let mut roots = HashMap::new();
+    for (address, storage) in &cond.known_accounts {
+        if matches!(storage, AccountStorage::RootHash(_)) {
+            match compute(*address) {
+                Ok(root) => {
+                    roots.insert(*address, root);
+                }
+                Err(_) => return RootHashRecheck::Unverifiable,
+            }
+        }
+    }
+    RootHashRecheck::Roots(roots)
 }
 
 /// Optimism's payload builder
@@ -853,32 +891,21 @@ where
             // - `Slots` stays **fail-open** — the established TEAO1-167 behavior; a
             //   transient slot read never drops an otherwise-includable tx.
             if let Some(cond) = &conditional {
-                // Pre-compute pending storage roots for `RootHash`-watched accounts.
-                // This needs both the executor `State` (pending overlay) and the
-                // parent `state_provider`, so do it before the slot-reader closure
-                // borrows the DB.
-                let mut pending_roots: HashMap<Address, B256> = HashMap::new();
-                let mut root_unverifiable = false;
-                for (address, storage) in &cond.known_accounts {
-                    if matches!(storage, AccountStorage::RootHash(_)) {
-                        match builder.evm_mut().db_mut().pending_storage_root(state_provider, *address)
-                        {
-                            Ok(root) => {
-                                pending_roots.insert(*address, root);
-                            }
-                            // Fail-closed: cannot prove the RootHash predicate → exclude.
-                            Err(err) => {
-                                trace!(target: "payload_builder", %err, ?tx, "excluding conditional tx whose RootHash predicate could not be re-verified (TEAO1-206)");
-                                root_unverifiable = true;
-                                break;
-                            }
-                        }
+                // Recompute pending storage roots for `RootHash`-watched accounts
+                // against the pending build state. This needs both the executor
+                // `State` (pending overlay) and the parent `state_provider`, so do it
+                // before the slot-reader closure borrows the DB. Fail-closed: if any
+                // watched root cannot be recomputed, exclude the tx (TEAO1-206).
+                let pending_roots = match recompute_root_hash_roots(cond, |address| {
+                    builder.evm_mut().db_mut().pending_storage_root(state_provider, address)
+                }) {
+                    RootHashRecheck::Roots(roots) => roots,
+                    RootHashRecheck::Unverifiable => {
+                        trace!(target: "payload_builder", ?tx, "excluding conditional tx whose RootHash predicate could not be re-verified (TEAO1-206)");
+                        best_txs.mark_invalid(tx.signer(), tx.nonce());
+                        continue;
                     }
-                }
-                if root_unverifiable {
-                    best_txs.mark_invalid(tx.signer(), tx.nonce());
-                    continue;
-                }
+                };
 
                 let db = builder.evm_mut().db_mut();
                 let violated = matches!(
@@ -945,7 +972,6 @@ mod root_hash_overlay_tests {
     //! `RootHash` predicate is enforced at inclusion rather than skipped.
     use super::*;
     use alloy_primitives::keccak256;
-    use alloy_rpc_types_eth::erc4337::TransactionConditional;
     use reth_optimism_txpool::conditional::KnownAccountViolation;
     use reth_provider::{providers::LatestStateProviderRef, test_utils::create_test_provider_factory};
     use reth_revm::db::{EmptyDB, states::CacheAccount, states::AccountStatus};
@@ -1084,6 +1110,75 @@ mod root_hash_overlay_tests {
             builder_decision(&cond, root_drift),
             Some(KnownAccountViolation::Root { address: addr }),
             "drifted root must be excluded at inclusion time"
+        );
+    }
+
+    fn cond_slots(addr: Address, slot: U256, expected: B256) -> TransactionConditional {
+        let mut slots = alloy_primitives::map::HashMap::default();
+        slots.insert(slot, expected);
+        let mut tc = TransactionConditional::default();
+        tc.known_accounts.insert(addr, AccountStorage::Slots(slots));
+        tc
+    }
+
+    // ── Fail-closed decision (TEAO1-206), unit-tested via the extracted
+    //    `recompute_root_hash_roots` so the read-error branch is covered without a
+    //    bespoke erroring `StateProvider`. ────────────────────────────────────────
+
+    #[test]
+    fn recompute_excludes_when_a_root_is_unverifiable() {
+        // Fail-closed: a compute (storage_root) error for a RootHash-watched account
+        // must yield `Unverifiable`, which the builder turns into `mark_invalid`.
+        let a = Address::with_last_byte(1);
+        let cond = cond_root(a, B256::with_last_byte(42));
+        assert_eq!(
+            recompute_root_hash_roots(&cond, |_| Err::<B256, ()>(())),
+            RootHashRecheck::Unverifiable,
+        );
+    }
+
+    #[test]
+    fn recompute_collects_roots_when_all_ok() {
+        let a = Address::with_last_byte(1);
+        let cond = cond_root(a, B256::with_last_byte(42));
+        let root = B256::with_last_byte(7);
+        match recompute_root_hash_roots(&cond, |_| Ok::<B256, ()>(root)) {
+            RootHashRecheck::Roots(roots) => {
+                assert_eq!(roots.len(), 1);
+                assert_eq!(roots.get(&a), Some(&root));
+            }
+            RootHashRecheck::Unverifiable => panic!("expected Roots"),
+        }
+    }
+
+    #[test]
+    fn recompute_ignores_slots_predicates() {
+        // `Slots` predicates are handled by the slot reader; the root recompute must
+        // not call `compute` for them and must not fail-close on them.
+        let a = Address::with_last_byte(1);
+        let cond = cond_slots(a, U256::from(1), B256::with_last_byte(7));
+        let mut called = false;
+        let res = recompute_root_hash_roots(&cond, |_| {
+            called = true;
+            Ok::<B256, ()>(B256::ZERO)
+        });
+        assert!(!called, "compute must not run for Slots predicates");
+        assert_eq!(res, RootHashRecheck::Roots(HashMap::new()));
+    }
+
+    #[test]
+    fn recompute_fail_closes_on_first_root_error_even_with_a_good_one() {
+        // A mixed conditional: one RootHash resolves, another errors. Fail-closed
+        // wins — the whole tx is excluded, never partially trusted.
+        let good = Address::with_last_byte(1);
+        let bad = Address::with_last_byte(2);
+        let mut cond = cond_root(good, B256::with_last_byte(1));
+        cond.known_accounts.insert(bad, AccountStorage::RootHash(B256::with_last_byte(2)));
+        assert_eq!(
+            recompute_root_hash_roots(&cond, |address| {
+                if address == bad { Err::<B256, ()>(()) } else { Ok(B256::with_last_byte(9)) }
+            }),
+            RootHashRecheck::Unverifiable,
         );
     }
 }
