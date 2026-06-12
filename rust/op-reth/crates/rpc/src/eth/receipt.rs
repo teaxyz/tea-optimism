@@ -2,6 +2,7 @@
 
 use crate::{OpEthApi, OpEthApiError, eth::RpcNodeCore};
 use alloy_consensus::{BlockHeader, Receipt, ReceiptWithBloom, TxReceipt};
+use alloy_primitives::U256;
 use alloy_eips::eip2718::Encodable2718;
 use alloy_rpc_types_eth::{Log, TransactionReceipt};
 use op_alloy_consensus::{OpReceipt, OpTransaction};
@@ -20,6 +21,23 @@ use reth_rpc_eth_api::{
 use reth_rpc_eth_types::{EthApiError, receipt::build_receipt};
 use reth_storage_api::{BlockReader, StateProvider, StateProviderFactory};
 use std::fmt::Debug;
+
+/// Derive the TEA L1-cost multiplier for a receipt from a parent-block
+/// `GasPriceOracle` ratio-slot read, preserving execution's failure semantics
+/// (TEAO1-6).
+///
+/// A read **error propagates** — it is never silently turned into a fee. Execution
+/// fails on a bad oracle read, so the receipt must too, rather than reporting the
+/// backup-rate fee (a failed `state.storage`) or the raw OP fee (a failed historical
+/// provider). Only a **successful** read of an unset slot (`Ok(None)` -> `0`) yields
+/// the documented backup rate, exactly as [`tea_l1_cost::multiplier_from_oracle_value`]
+/// defines for a zero ratio.
+fn receipt_l1_cost_multiplier<E>(
+    oracle_read: Result<Option<U256>, E>,
+) -> Result<(U256, U256), E> {
+    let raw = oracle_read?.unwrap_or_default();
+    Ok(tea_l1_cost::multiplier_from_oracle_value(raw))
+}
 
 impl<N, Rpc> LoadReceipt for OpEthApi<N, Rpc>
 where
@@ -101,22 +119,32 @@ where
         // block, so charging must read the pool's settled (parent-block) state,
         // never an intermediate same-block value (Cantina TEAO1-147 — Won't-fix,
         // by design). Reading that same state here keeps the receipt faithful to
-        // the deduction. Off-Tea chains (and missing state) leave the multiplier
-        // `None` -> raw OP fee, identical to upstream.
+        // the deduction. Off-Tea chains leave the multiplier `None` -> raw OP fee,
+        // identical to upstream.
+        //
+        // TEAO1-6: preserve execution's failure semantics on the oracle read. A
+        // failed historical provider or a failed slot read must PROPAGATE as an
+        // error, never be silently turned into a fee — otherwise the receipt would
+        // report the raw OP fee (missing provider) or the backup-rate fee (a failed
+        // `state.storage`, which `.ok().flatten().unwrap_or_default()` collapsed to
+        // a zero ratio) instead of the TEA fee actually charged. Execution itself
+        // fails on a bad oracle read; only a *successful* read of an unset slot
+        // (`Ok(None)` -> 0) is the documented backup rate (handled inside
+        // `multiplier_from_oracle_value`).
         if tea_l1_cost::is_tea(self.provider.chain_spec().chain().id()) {
             if let Some(parent) = block.header().number().checked_sub(1) {
-                if let Ok(state) = self.provider.history_by_block_number(parent) {
-                    let raw = state
-                        .storage(
-                            tea_l1_cost::GAS_PRICE_ORACLE_ADDR,
-                            tea_l1_cost::LATEST_PRICE_RATIO_SLOT,
-                        )
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default();
-                    l1_block_info.l1_cost_multiplier =
-                        Some(tea_l1_cost::multiplier_from_oracle_value(raw));
-                }
+                let state = self
+                    .provider
+                    .history_by_block_number(parent)
+                    .map_err(|_| OpEthApiError::L1BlockFeeError)?;
+                let oracle_read = state.storage(
+                    tea_l1_cost::GAS_PRICE_ORACLE_ADDR,
+                    tea_l1_cost::LATEST_PRICE_RATIO_SLOT,
+                );
+                l1_block_info.l1_cost_multiplier = Some(
+                    receipt_l1_cost_multiplier(oracle_read)
+                        .map_err(|_| OpEthApiError::L1BlockFeeError)?,
+                );
             }
         }
 
@@ -376,6 +404,45 @@ impl OpReceiptBuilder {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    // ── TEAO1-6: failure semantics of the receipt-side oracle read ──────────────
+    // `receipt_l1_cost_multiplier` is the decision the converter installs into
+    // `l1_block_info.l1_cost_multiplier`. The fix is that a *read error* propagates
+    // instead of being collapsed to a zero ratio (which the old
+    // `.ok().flatten().unwrap_or_default()` did, silently yielding the backup-rate
+    // fee). A successfully-read unset slot stays the documented backup rate.
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ReadErr;
+
+    #[test]
+    fn receipt_multiplier_propagates_read_error() {
+        // A failed `state.storage` read must ERROR — NOT become the backup rate.
+        assert_eq!(receipt_l1_cost_multiplier(Err(ReadErr)), Err(ReadErr));
+    }
+
+    #[test]
+    fn receipt_multiplier_unset_slot_is_backup_rate_not_an_error() {
+        // A successful read of an unset slot (None) or an explicit zero ratio is the
+        // documented backup rate — distinct from a read error.
+        let backup = tea_l1_cost::multiplier_from_oracle_value(U256::ZERO);
+        assert_eq!(receipt_l1_cost_multiplier::<ReadErr>(Ok(None)), Ok(backup));
+        assert_eq!(receipt_l1_cost_multiplier::<ReadErr>(Ok(Some(U256::ZERO))), Ok(backup));
+        // The backup rate is the large multiplier, never a silent 1x pass-through.
+        assert_ne!(backup, (tea_l1_cost::WAD, tea_l1_cost::WAD));
+    }
+
+    #[test]
+    fn receipt_multiplier_uses_the_oracle_ratio_when_set() {
+        // A set slot yields the price-derived multiplier execution charged with —
+        // the same source `multiplier_from_oracle_value` derives from.
+        let raw = U256::from(2u64) * tea_l1_cost::WAD;
+        assert_eq!(
+            receipt_l1_cost_multiplier::<ReadErr>(Ok(Some(raw))),
+            Ok(tea_l1_cost::multiplier_from_oracle_value(raw)),
+        );
+    }
+
     use alloy_consensus::{Block, BlockBody, Eip658Value, TxEip7702, transaction::TransactionMeta};
     use alloy_op_hardforks::{
         OP_MAINNET_ISTHMUS_TIMESTAMP, OP_MAINNET_JOVIAN_TIMESTAMP, OpChainHardforks,
