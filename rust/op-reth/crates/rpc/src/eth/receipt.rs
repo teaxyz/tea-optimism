@@ -22,21 +22,35 @@ use reth_rpc_eth_types::{EthApiError, receipt::build_receipt};
 use reth_storage_api::{BlockReader, StateProvider, StateProviderFactory};
 use std::fmt::Debug;
 
-/// Derive the TEA L1-cost multiplier for a receipt from a parent-block
-/// `GasPriceOracle` ratio-slot read, preserving execution's failure semantics
-/// (TEAO1-6).
+/// Outcome of reading the parent-block `GasPriceOracle` ratio for a receipt
+/// (TEAO1-6 / TEAO1-211).
+#[derive(Debug, PartialEq, Eq)]
+enum TeaReceiptFee {
+    /// The ratio was read; install this `l1_cost_multiplier` so the receipt's
+    /// `l1Fee` matches the TEA-scaled amount execution charged. A successfully-read
+    /// unset slot (`Ok(None)` -> `0`) yields the documented backup rate.
+    Multiplier((U256, U256)),
+    /// The parent oracle state was unreadable (e.g. a pruned node, where the historical
+    /// ratio is genuinely unrecoverable — it has no non-pruned copy: no event, not in
+    /// calldata). We must neither report the raw OP fee / backup rate (a wrong number,
+    /// TEAO1-6 / b64be295) nor fail the whole receipt RPC (TEAO1-211). The caller omits
+    /// `l1Fee` from this block's receipts instead.
+    OmitL1Fee,
+}
+
+/// Decide how to set a receipt's L1 fee from the parent oracle ratio read.
 ///
-/// A read **error propagates** — it is never silently turned into a fee. Execution
-/// fails on a bad oracle read, so the receipt must too, rather than reporting the
-/// backup-rate fee (a failed `state.storage`) or the raw OP fee (a failed historical
-/// provider). Only a **successful** read of an unset slot (`Ok(None)` -> `0`) yields
-/// the documented backup rate, exactly as [`tea_l1_cost::multiplier_from_oracle_value`]
-/// defines for a zero ratio.
-fn receipt_l1_cost_multiplier<E>(
-    oracle_read: Result<Option<U256>, E>,
-) -> Result<(U256, U256), E> {
-    let raw = oracle_read?.unwrap_or_default();
-    Ok(tea_l1_cost::multiplier_from_oracle_value(raw))
+/// `Ok(_)` installs the multiplier (an unset slot is the backup rate, per
+/// [`tea_l1_cost::multiplier_from_oracle_value`]); `Err(_)` — the historical state is
+/// unreadable — degrades to [`TeaReceiptFee::OmitL1Fee`] rather than erroring or
+/// substituting a wrong fee.
+fn tea_receipt_fee<E>(oracle_read: Result<Option<U256>, E>) -> TeaReceiptFee {
+    match oracle_read {
+        Ok(raw) => TeaReceiptFee::Multiplier(tea_l1_cost::multiplier_from_oracle_value(
+            raw.unwrap_or_default(),
+        )),
+        Err(_) => TeaReceiptFee::OmitL1Fee,
+    }
 }
 
 impl<N, Rpc> LoadReceipt for OpEthApi<N, Rpc>
@@ -122,29 +136,33 @@ where
         // the deduction. Off-Tea chains leave the multiplier `None` -> raw OP fee,
         // identical to upstream.
         //
-        // TEAO1-6: preserve execution's failure semantics on the oracle read. A
-        // failed historical provider or a failed slot read must PROPAGATE as an
-        // error, never be silently turned into a fee — otherwise the receipt would
-        // report the raw OP fee (missing provider) or the backup-rate fee (a failed
-        // `state.storage`, which `.ok().flatten().unwrap_or_default()` collapsed to
-        // a zero ratio) instead of the TEA fee actually charged. Execution itself
-        // fails on a bad oracle read; only a *successful* read of an unset slot
-        // (`Ok(None)` -> 0) is the documented backup rate (handled inside
-        // `multiplier_from_oracle_value`).
+        // TEAO1-6 / TEAO1-211: handle the oracle read without ever reporting a wrong
+        // fee AND without failing the receipt RPC. A failed slot read must NOT be
+        // collapsed to a zero ratio (the old `.ok().flatten().unwrap_or_default()`
+        // turned it into the backup rate) nor become the raw OP fee. But it must also
+        // NOT error the whole receipt: on a pruned node the historical parent state is
+        // gone and the ratio that charged the block is genuinely unrecoverable (it has
+        // no non-pruned copy — `_setLatestPrice` emits no event and the ratio isn't in
+        // calldata). So on an unreadable read we OMIT `l1Fee` (set it `None` after the
+        // receipts are built) rather than report a wrong number or fail the call.
+        // Archive nodes (which serve Tea RPC) read the slot successfully and install
+        // the exact multiplier execution charged; a successfully-read unset slot
+        // (`Ok(None)` -> 0) is the documented backup rate.
+        let mut omit_l1_fee = false;
         if tea_l1_cost::is_tea(self.provider.chain_spec().chain().id()) {
             if let Some(parent) = block.header().number().checked_sub(1) {
-                let state = self
-                    .provider
-                    .history_by_block_number(parent)
-                    .map_err(|_| OpEthApiError::L1BlockFeeError)?;
-                let oracle_read = state.storage(
-                    tea_l1_cost::GAS_PRICE_ORACLE_ADDR,
-                    tea_l1_cost::LATEST_PRICE_RATIO_SLOT,
-                );
-                l1_block_info.l1_cost_multiplier = Some(
-                    receipt_l1_cost_multiplier(oracle_read)
-                        .map_err(|_| OpEthApiError::L1BlockFeeError)?,
-                );
+                let oracle_read = self.provider.history_by_block_number(parent).and_then(|state| {
+                    state.storage(
+                        tea_l1_cost::GAS_PRICE_ORACLE_ADDR,
+                        tea_l1_cost::LATEST_PRICE_RATIO_SLOT,
+                    )
+                });
+                match tea_receipt_fee(oracle_read) {
+                    TeaReceiptFee::Multiplier(multiplier) => {
+                        l1_block_info.l1_cost_multiplier = Some(multiplier);
+                    }
+                    TeaReceiptFee::OmitL1Fee => omit_l1_fee = true,
+                }
             }
         }
 
@@ -160,6 +178,17 @@ where
                 OpReceiptBuilder::new(&self.provider.chain_spec(), input, &mut l1_block_info)?
                     .build(),
             );
+        }
+
+        // TEAO1-211: the parent oracle ratio was unreadable (pruned node), so the
+        // TEA-scaled `l1Fee` cannot be reproduced. The receipts were built without the
+        // multiplier (i.e. carry the raw OP fee), which would misreport the charged
+        // amount — omit `l1Fee` rather than expose a wrong value. The other L1 fields
+        // (gas price/used, from the block body) remain valid.
+        if omit_l1_fee {
+            for receipt in &mut receipts {
+                receipt.l1_block_info.l1_fee = None;
+            }
         }
 
         Ok(receipts)
@@ -405,41 +434,46 @@ impl OpReceiptBuilder {
 mod test {
     use super::*;
 
-    // ── TEAO1-6: failure semantics of the receipt-side oracle read ──────────────
-    // `receipt_l1_cost_multiplier` is the decision the converter installs into
-    // `l1_block_info.l1_cost_multiplier`. The fix is that a *read error* propagates
-    // instead of being collapsed to a zero ratio (which the old
+    // ── TEAO1-6 / TEAO1-211: the receipt-side oracle-read decision ───────────────
+    // `tea_receipt_fee` is the decision the converter acts on: install the multiplier
+    // (so the receipt's l1Fee matches the deduction) or omit l1Fee. A read *error*
+    // must NOT be collapsed to a zero ratio (the old
     // `.ok().flatten().unwrap_or_default()` did, silently yielding the backup-rate
-    // fee). A successfully-read unset slot stays the documented backup rate.
+    // fee — TEAO1-6) and must NOT fail the whole RPC (TEAO1-211); it degrades to
+    // OmitL1Fee. A successfully-read unset slot stays the documented backup rate.
 
     #[derive(Debug, PartialEq, Eq)]
     struct ReadErr;
 
     #[test]
-    fn receipt_multiplier_propagates_read_error() {
-        // A failed `state.storage` read must ERROR — NOT become the backup rate.
-        assert_eq!(receipt_l1_cost_multiplier(Err(ReadErr)), Err(ReadErr));
+    fn tea_receipt_fee_omits_l1fee_on_read_error() {
+        // TEAO1-211: an unreadable historical oracle slot (e.g. pruned node) must omit
+        // l1Fee — NOT become the backup rate (TEAO1-6) and NOT error the receipt.
+        assert_eq!(tea_receipt_fee(Err(ReadErr)), TeaReceiptFee::OmitL1Fee);
     }
 
     #[test]
-    fn receipt_multiplier_unset_slot_is_backup_rate_not_an_error() {
+    fn tea_receipt_fee_unset_slot_is_backup_rate_not_omit() {
         // A successful read of an unset slot (None) or an explicit zero ratio is the
-        // documented backup rate — distinct from a read error.
+        // documented backup rate — distinct from an unreadable read (which omits).
         let backup = tea_l1_cost::multiplier_from_oracle_value(U256::ZERO);
-        assert_eq!(receipt_l1_cost_multiplier::<ReadErr>(Ok(None)), Ok(backup));
-        assert_eq!(receipt_l1_cost_multiplier::<ReadErr>(Ok(Some(U256::ZERO))), Ok(backup));
+        assert_eq!(tea_receipt_fee::<ReadErr>(Ok(None)), TeaReceiptFee::Multiplier(backup));
+        assert_eq!(
+            tea_receipt_fee::<ReadErr>(Ok(Some(U256::ZERO))),
+            TeaReceiptFee::Multiplier(backup)
+        );
         // The backup rate is the large multiplier, never a silent 1x pass-through.
         assert_ne!(backup, (tea_l1_cost::WAD, tea_l1_cost::WAD));
     }
 
     #[test]
-    fn receipt_multiplier_uses_the_oracle_ratio_when_set() {
+    fn tea_receipt_fee_uses_the_oracle_ratio_when_set() {
         // A set slot yields the price-derived multiplier execution charged with —
         // the same source `multiplier_from_oracle_value` derives from.
         let raw = U256::from(2u64) * tea_l1_cost::WAD;
         assert_eq!(
-            receipt_l1_cost_multiplier::<ReadErr>(Ok(Some(raw))),
-            Ok(tea_l1_cost::multiplier_from_oracle_value(raw)),
+            tea_receipt_fee::<ReadErr>(Ok(Some(raw))),
+            TeaReceiptFee::Multiplier(tea_l1_cost::multiplier_from_oracle_value(raw)),
         );
     }
 
