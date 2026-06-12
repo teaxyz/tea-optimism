@@ -98,6 +98,20 @@ strum.workspace = true
 [dev-dependencies]
 reth-optimism-chainspec.workspace = true
 alloy-op-hardforks.workspace = true
+# TEAO1-211 regression test: a `PrunedHistory` provider returning
+# `StateAtBlockPruned` from `history_by_block_number`, driving the real receipt
+# converter to prove pruned Tea receipts degrade (omit l1Fee) instead of failing.
+reth-storage-api.workspace = true
+reth-storage-errors.workspace = true
+reth-db-models.workspace = true
+reth-primitives-traits = { workspace = true, features = ["op"] }
+reth-rpc-eth-api = { workspace = true, features = ["op"] }
+reth-optimism-primitives = { workspace = true, features = ["serde"] }
+reth-chainspec.workspace = true
+op-alloy-consensus.workspace = true
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-primitives.workspace = true
 
 [features]
 client = [
