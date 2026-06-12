@@ -17,13 +17,10 @@ reth-op = { workspace = true, features = ["node", "rpc"] }
 reth-optimism-cli.workspace = true
 reth-optimism-forks.workspace = true
 reth-optimism-chainspec.workspace = true
-# TEAO1-152: proofs-history stack (ExEx + eth_getProof/debug_* RPC overrides +
-# on-disk MDBX proofs storage). `metrics` feature enables `report_metrics()`.
-reth-optimism-exex = { workspace = true, features = ["metrics"] }
-reth-optimism-rpc.workspace = true
-reth-optimism-trie = { workspace = true, features = ["metrics"] }
-# DatabaseMetrics trait — provides MdbxProofsStorage::report_metrics().
-reth-db = { workspace = true, features = ["op"] }
+# TEAO1-152: shared proofs-history launcher (gate + path + preflight init-check +
+# OpProofsExEx / eth_getProof / debug_* RPC install) lives here; tea-reth hands
+# it the TeaExecutorBuilder-configured node builder.
+reth-optimism-node.workspace = true
 
 # revm
 revm.workspace = true
@@ -64,10 +61,6 @@ p521 = { version = "0.13", default-features = false, features = ["std", "ecdsa",
 clap = { workspace = true, features = ["derive", "env"] }
 eyre.workspace = true
 tracing.workspace = true
-# TEAO1-152: proofs-history install needs FutureExt::boxed + tokio time sleep
-# for the storage-metrics task.
-futures-util.workspace = true
-tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 alloy-primitives = { workspace = true, features = ["std"] }
