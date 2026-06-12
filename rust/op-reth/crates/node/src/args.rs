@@ -103,10 +103,16 @@ pub struct RollupArgs {
     /// The window to span blocks for proofs history. Value is the number of blocks.
     /// Default is 1 month of blocks based on 2 seconds block time.
     /// 30 * 24 * 60 * 60 / 2 = `1_296_000`
+    // TEAO1-152: a tuning flag only has effect when proof-history is actually
+    // installed, which requires a storage path. Without this `requires`, a
+    // standalone `--proofs-history.window N` was silently ignored (the install gate
+    // never fired) — an accept-but-ignore no-op. `requires` makes clap fail closed
+    // at parse time, and only fires when the flag is user-supplied (not its default).
     #[arg(
         long = "proofs-history.window",
         default_value_t = 1_296_000,
-        value_name = "PROOFS_HISTORY_WINDOW"
+        value_name = "PROOFS_HISTORY_WINDOW",
+        requires = "proofs_history_storage_path"
     )]
     pub proofs_history_window: u64,
 
@@ -126,7 +132,8 @@ pub struct RollupArgs {
         long = "proofs-history.prune-interval",
         value_name = "PROOFS_HISTORY_PRUNE_INTERVAL",
         default_value = "15s",
-        value_parser = humantime::parse_duration
+        value_parser = humantime::parse_duration,
+        requires = "proofs_history_storage_path"
     )]
     pub proofs_history_prune_interval: Duration,
     /// Verification interval: perform full block execution every N blocks for data integrity.
@@ -141,7 +148,8 @@ pub struct RollupArgs {
     #[arg(
         long = "proofs-history.verification-interval",
         value_name = "PROOFS_HISTORY_VERIFICATION_INTERVAL",
-        default_value_t = 0
+        default_value_t = 0,
+        requires = "proofs_history_storage_path"
     )]
     pub proofs_history_verification_interval: u64,
 }

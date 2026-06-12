@@ -196,4 +196,52 @@ mod tests {
         assert!(parsed.r.proofs_history_storage_path.is_none());
         assert!(!should_install_proofs_history(&parsed.r), "no flags must leave the install gate closed");
     }
+
+    /// TEAO1-152 (re-scan): each standalone proofs-history TUNING flag must FAIL
+    /// CLOSED at parse — `requires = proofs_history_storage_path` — instead of
+    /// being silently ignored (the install gate never fires for them, so a plain
+    /// launch would otherwise drop the accepted flag). This closes the remaining
+    /// accept-but-ignore surface beyond `--proofs-history` / `.storage-path`.
+    #[test]
+    fn standalone_tuning_flags_fail_closed_at_parse() {
+        for arg in [
+            "--proofs-history.window=7",
+            "--proofs-history.prune-interval=30s",
+            "--proofs-history.verification-interval=9",
+        ] {
+            let res = T::try_parse_from(["x", arg]);
+            assert!(res.is_err(), "`{arg}` alone must fail closed (requires storage-path)");
+            // The error must name the missing storage-path requirement.
+            let msg = res.err().unwrap().to_string();
+            assert!(
+                msg.contains("proofs-history.storage-path"),
+                "`{arg}` error must point at the missing storage path, got: {msg}"
+            );
+        }
+    }
+
+    /// A tuning flag accompanied by a storage path satisfies the requirement and
+    /// parses (and the tuning value is honored downstream).
+    #[test]
+    fn tuning_flag_with_storage_path_parses() {
+        let parsed = T::try_parse_from([
+            "x",
+            "--proofs-history.storage-path",
+            "/tmp/ph",
+            "--proofs-history.window",
+            "7",
+        ])
+        .expect("tuning flag with a storage path must parse");
+        assert_eq!(parsed.r.proofs_history_window, 7);
+        assert!(should_install_proofs_history(&parsed.r));
+    }
+
+    /// Defaulted tuning flags must NOT trigger `requires` — a plain launch with no
+    /// proofs-history flags parses normally (clap only enforces `requires` for
+    /// user-supplied args, not defaults; verified at runtime too).
+    #[test]
+    fn defaulted_tuning_flags_do_not_require_storage_path() {
+        let parsed = T::try_parse_from(["x"]).expect("plain launch must parse");
+        assert!(!should_install_proofs_history(&parsed.r));
+    }
 }
