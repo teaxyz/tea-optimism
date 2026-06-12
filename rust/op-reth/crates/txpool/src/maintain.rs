@@ -622,4 +622,52 @@ mod l1_fee_eviction_tests {
     fn saturating_add_never_wraps_to_affordable() {
         assert!(is_unaffordable_at_l1_fee(U256::MAX - U256::from(1u64), U256::MAX, U256::MAX));
     }
+
+    // ── Finding PoC, replayed end-to-end through the policy the loop applies. ───
+    //
+    // Apex PoC: "Submit a transaction that is affordable under head N. After the
+    // next canonical head refreshes L1BlockInfo and raises the effective OP
+    // execution add-on, the transaction can remain in the executable pool because
+    // existing pooled entries are still classified by generic raw-cost…"
+    //
+    // The maintenance loop runs `should_evict(origin, balance, vtx.cost(), raw_l1,
+    // oracle_slot)` per pooled tx on every Commit, where `raw_l1` is recomputed
+    // from the NEW head's `L1BlockInfo` and `oracle_slot` is re-read post-head.
+    // These two tests replay the PoC by feeding the head-N then head-(N+1) inputs
+    // for the SAME pooled tx/balance and asserting the verdict flips kept→evicted.
+    // The finding's title is "OP *or* Tea fee state changes", so both axes are
+    // covered independently: a pure OP L1-base-fee rise, and a pure Tea-multiplier
+    // rise — neither moves the tx's static `cost`, both flip the eviction verdict.
+
+    /// PoC axis 1 — pure OP add-on rise: the head raises the raw OP L1 data fee
+    /// (e.g. L1 base fee up) while the Tea multiplier (oracle ratio) is unchanged.
+    /// The pooled tx is affordable at head N and evicted after head N+1.
+    #[test]
+    fn poc_pooled_tx_evicted_when_head_raises_op_l1_fee() {
+        let balance = wei(1_000);
+        let tx_cost = wei(900); // static pool `cost`; never changes across heads.
+        let ratio = unit(); // Tea multiplier held constant at 1× across both heads.
+
+        // Head N: raw OP L1 fee 50 -> 900 + 50 = 950 <= 1000 -> affordable, kept.
+        assert!(!should_evict(EXTERNAL, balance, tx_cost, wei(50), ratio));
+        // Head N+1 refreshes L1BlockInfo; raw OP L1 fee climbs to 150 -> 900 + 150
+        // = 1050 > 1000 -> evicted. The generic pool, blind to this dimension,
+        // would have kept it (static cost 900 still <= 1000); the task does not.
+        assert!(should_evict(EXTERNAL, balance, tx_cost, wei(150), ratio));
+    }
+
+    /// PoC axis 2 — pure Tea state rise: the raw OP L1 fee is unchanged but the
+    /// GasPriceOracle TEA/ETH ratio jumps, scaling the same raw fee past the
+    /// sender's headroom. Same scaling path the validator uses at admission.
+    #[test]
+    fn poc_pooled_tx_evicted_when_head_raises_tea_multiplier() {
+        let balance = wei(1_000);
+        let tx_cost = wei(900);
+        let raw_l1 = wei(50); // OP L1 data fee held constant across both heads.
+
+        // Head N: 1× ratio -> scaled 50 -> 950 <= 1000 -> kept.
+        assert!(!should_evict(EXTERNAL, balance, tx_cost, raw_l1, unit()));
+        // Head N+1: oracle ratio rises to 3× -> scaled 150 -> 1050 > 1000 -> evicted.
+        assert!(should_evict(EXTERNAL, balance, tx_cost, raw_l1, U256::from(3u64) * unit()));
+    }
 }
