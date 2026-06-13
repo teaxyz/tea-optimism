@@ -16,11 +16,11 @@ import { IL1Block } from "interfaces/L2/IL1Block.sol";
 /// @title GasPriceOracleStandard
 /// @notice The standard OP-Stack GasPriceOracle: computes the L1 portion of the fee charged on
 ///         L2 with NO custom-gas-token (TEA) price machinery. It is installed on non-CGT
-///         ("standard") chains, where the L1 fee is denominated in ETH (TEAO1-165). The Tea
-///         `GasPriceOracle` derives from this contract and overrides only `getL1Fee` /
-///         `getL1FeeUpperBound` to apply the TEA/ETH multiplier, so both oracles share identical
-///         fee math and storage layout while the cached-price slot, `updateGasTokenPriceRatio`,
-///         and the multiplier exist only on the CGT variant.
+///         ("standard") chains by the L2Genesis deploy-time gate, where the L1 fee is denominated
+///         in ETH (TEAO1-165). This is a fully self-contained contract; the Tea `GasPriceOracle`
+///         is a separate, independent contract (it does NOT inherit from this one) so that each
+///         oracle owns its own storage layout — the Tea predeploy proxy is never reinterpreted by
+///         a different implementation's layout.
 ///
 ///         The contract exposes an API that is useful for knowing how large the L1 portion of the
 ///         transaction fee will be. The following events were deprecated with Bedrock:
@@ -33,9 +33,7 @@ contract GasPriceOracleStandard is ISemver {
 
     /// @notice Semantic version.
     /// @custom:semver 1.6.0
-    function version() external view virtual returns (string memory) {
-        return "1.6.0";
-    }
+    string public constant version = "1.6.0";
 
     /// @notice This is the intercept value for the linear regression used to estimate the final size of the
     ///         compressed transaction.
@@ -65,15 +63,7 @@ contract GasPriceOracleStandard is ISemver {
     ///         transaction, the current L1 base fee, and the various dynamic parameters.
     /// @param _data Unsigned fully RLP-encoded transaction to get the L1 fee for.
     /// @return L1 fee that should be paid for the tx
-    function getL1Fee(bytes memory _data) external view virtual returns (uint256) {
-        return _rawL1Fee(_data);
-    }
-
-    /// @notice The raw, fork-appropriate L1 fee with no TEA multiplier applied. Factored out so the
-    ///         Tea `GasPriceOracle` override wraps the *identical* fee math (TEAO1-165).
-    /// @param _data Unsigned fully RLP-encoded transaction to get the L1 fee for.
-    /// @return L1 fee that should be paid for the tx
-    function _rawL1Fee(bytes memory _data) internal view returns (uint256) {
+    function getL1Fee(bytes memory _data) external view returns (uint256) {
         if (isFjord) {
             return _getL1FeeFjord(_data);
         } else if (isEcotone) {
@@ -88,15 +78,7 @@ contract GasPriceOracleStandard is ISemver {
     /// It assumes the worst case of fastlz upper-bound which covers %99.99 txs.
     /// @param _unsignedTxSize Unsigned fully RLP-encoded transaction size to get the L1 fee for.
     /// @return L1 estimated upper-bound fee that should be paid for the tx
-    function getL1FeeUpperBound(uint256 _unsignedTxSize) external view virtual returns (uint256) {
-        return _rawL1FeeUpperBound(_unsignedTxSize);
-    }
-
-    /// @notice The raw, fork-appropriate L1 fee upper bound with no TEA multiplier applied
-    ///         (TEAO1-165).
-    /// @param _unsignedTxSize Unsigned fully RLP-encoded transaction size to get the L1 fee for.
-    /// @return L1 estimated upper-bound fee that should be paid for the tx
-    function _rawL1FeeUpperBound(uint256 _unsignedTxSize) internal view returns (uint256) {
+    function getL1FeeUpperBound(uint256 _unsignedTxSize) external view returns (uint256) {
         require(isFjord, "GasPriceOracle: getL1FeeUpperBound only supports Fjord");
 
         // Add 68 to the size to account for unsigned tx:

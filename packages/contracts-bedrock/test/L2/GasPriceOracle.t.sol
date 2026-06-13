@@ -40,15 +40,19 @@ contract GasPriceOracle_Test is CommonTest {
     function setUp() public virtual override {
         super.setUp();
 
-        // TEAO1-165: the deploy-time gate installs the standard (non-CGT)
-        // GasPriceOracleStandard on the default test harness. Re-etch the Tea CGT
-        // oracle's code at the impl namespace so these tests exercise the
-        // cached-price path. The fork flags live in proxy storage at slot 0 — a
-        // layout shared by both oracles — so genesis fork activation carries over.
+        // TEAO1-165: the deploy-time gate installs the standalone GasPriceOracleStandard
+        // on the default (non-CGT) test harness. Re-etch the self-contained Tea CGT oracle
+        // at the impl namespace so these tests exercise the cached-price path.
         vm.etch(
             Predeploys.predeployToCodeNamespace(Predeploys.GAS_PRICE_ORACLE),
             vm.getDeployedCode("GasPriceOracle.sol:GasPriceOracle")
         );
+        // The two oracles are independent contracts with different slot-0 packing: genesis
+        // activated the forks on GasPriceOracleStandard (bytes 0..3), but the Tea oracle reads
+        // them at bytes 20..23 (its `owner` occupies bytes 0..19, per TEAO1-213). Shift the four
+        // fork-flag bytes into the Tea layout and leave `owner` zero (-> PROXY_ADMIN.owner()).
+        bytes32 s0 = vm.load(Predeploys.GAS_PRICE_ORACLE, bytes32(0));
+        vm.store(Predeploys.GAS_PRICE_ORACLE, bytes32(0), bytes32((uint256(s0) & 0xFFFFFFFF) << 160));
 
         depositor = l1Block.DEPOSITOR_ACCOUNT();
 

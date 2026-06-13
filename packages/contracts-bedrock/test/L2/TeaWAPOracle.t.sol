@@ -97,13 +97,17 @@ contract TeaWAPOracle_Test is CommonTest {
     function setUp() public override {
         super.setUp();
 
-        // TEAO1-165: the deploy-time gate installs the standard (non-CGT) oracle on
-        // the default harness; re-etch the Tea CGT oracle so these TeaWAP tests
-        // exercise the cached-price machinery.
+        // TEAO1-165: the deploy-time gate installs the standalone GasPriceOracleStandard on the
+        // default (non-CGT) harness; re-etch the self-contained Tea CGT oracle so these TeaWAP
+        // tests exercise the cached-price machinery, and migrate the genesis-activated fork flags
+        // from the standard layout (slot-0 bytes 0..3) into the Tea layout (bytes 20..23; `owner`
+        // occupies 0..19, per TEAO1-213).
         vm.etch(
             Predeploys.predeployToCodeNamespace(Predeploys.GAS_PRICE_ORACLE),
             vm.getDeployedCode("GasPriceOracle.sol:GasPriceOracle")
         );
+        bytes32 s0 = vm.load(Predeploys.GAS_PRICE_ORACLE, bytes32(0));
+        vm.store(Predeploys.GAS_PRICE_ORACLE, bytes32(0), bytes32((uint256(s0) & 0xFFFFFFFF) << 160));
 
         // Start at a reasonable timestamp.
         vm.warp(1737668792);

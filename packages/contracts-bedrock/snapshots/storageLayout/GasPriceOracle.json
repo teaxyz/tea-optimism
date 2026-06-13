@@ -26,12 +26,5 @@
     "offset": 3,
     "slot": "0",
     "type": "bool"
-  },
-  {
-    "bytes": "20",
-    "label": "owner",
-    "offset": 4,
-    "slot": "0",
-    "type": "address"
   }
 ]
