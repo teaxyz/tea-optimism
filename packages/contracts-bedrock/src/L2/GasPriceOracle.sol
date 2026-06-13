@@ -97,13 +97,23 @@ contract GasPriceOracle is TeaWAPOracle, ISemver {
         return latestPrice * _fjordL1Cost(flzUpperBound) / 1e18;
     }
 
-    /// @notice The cached TEA/ETH price, falling back to the backup rate when the
-    ///         cached slot has never been written. On non-CGT deployments the
-    ///         plain `L1Block` never calls `updateGasTokenPriceRatio`, so the slot
-    ///         stays empty and the fee helpers would otherwise quote zero — while
-    ///         the runtime fee logic and `teaPerETH()` use the backup rate. This
-    ///         keeps the view helpers consistent with settlement (TEAO1-165).
+    /// @notice The L1-fee multiplier the fee helpers apply, as a 1e18-scaled ratio.
+    ///         The cached TEA/ETH price machinery only applies on custom-gas-token
+    ///         (CGT) deployments, where the L1 fee is denominated in the custom gas
+    ///         token. On a plain (non-CGT) chain the L1-attributes predeploy is the
+    ///         upstream `L1Block`, which never forwards `updateGasTokenPriceRatio`,
+    ///         so `CUSTOM_GAS_TOKEN_PRICE_SLOT` is never written and a TEA-denominated
+    ///         backup would be meaningless. Gate the whole machinery on the L1Block
+    ///         CGT flag (TEAO1-165): off-CGT, return the identity multiplier (1e18)
+    ///         so `getL1Fee` / `getL1FeeUpperBound` reduce to the standard OP fee,
+    ///         independent of the (unwritable) slot — matching the EL, which only
+    ///         applies the multiplier on Tea (CGT) chains. On CGT, use the cached
+    ///         price, falling back to the backup rate while the slot is unwritten
+    ///         (genesis bootstrap) or during oracle downtime.
     function _cachedPriceOrBackup() internal view returns (uint160) {
+        if (!IL1Block(Predeploys.L1_BLOCK_ATTRIBUTES).isCustomGasToken()) {
+            return uint160(1e18);
+        }
         (, uint160 latestPrice) = getLatestPrice();
         if (latestPrice == 0) return getFallbackPrice();
         return latestPrice;
