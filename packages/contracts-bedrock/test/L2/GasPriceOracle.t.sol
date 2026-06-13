@@ -39,6 +39,17 @@ contract GasPriceOracle_Test is CommonTest {
     /// @dev Sets up the test suite.
     function setUp() public virtual override {
         super.setUp();
+
+        // TEAO1-165: the deploy-time gate installs the standard (non-CGT)
+        // GasPriceOracleStandard on the default test harness. Re-etch the Tea CGT
+        // oracle's code at the impl namespace so these tests exercise the
+        // cached-price path. The fork flags live in proxy storage at slot 0 — a
+        // layout shared by both oracles — so genesis fork activation carries over.
+        vm.etch(
+            Predeploys.predeployToCodeNamespace(Predeploys.GAS_PRICE_ORACLE),
+            vm.getDeployedCode("GasPriceOracle.sol:GasPriceOracle")
+        );
+
         depositor = l1Block.DEPOSITOR_ACCOUNT();
 
         // TEA. Set price 1 TEA = 1 ETH

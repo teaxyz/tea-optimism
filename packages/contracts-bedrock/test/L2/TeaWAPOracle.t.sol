@@ -97,6 +97,14 @@ contract TeaWAPOracle_Test is CommonTest {
     function setUp() public override {
         super.setUp();
 
+        // TEAO1-165: the deploy-time gate installs the standard (non-CGT) oracle on
+        // the default harness; re-etch the Tea CGT oracle so these TeaWAP tests
+        // exercise the cached-price machinery.
+        vm.etch(
+            Predeploys.predeployToCodeNamespace(Predeploys.GAS_PRICE_ORACLE),
+            vm.getDeployedCode("GasPriceOracle.sol:GasPriceOracle")
+        );
+
         // Start at a reasonable timestamp.
         vm.warp(1737668792);
 

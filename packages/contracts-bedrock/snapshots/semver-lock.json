@@ -76,16 +76,20 @@
     "sourceCodeHash": "0xdc50fe7643d26950527dac75d69ddbdebf0b5c4f061fe2938eada849e179a217"
   },
   "src/L2/GasPriceOracle.sol:GasPriceOracle": {
-    "initCodeHash": "0xf72c23d9c3775afd7b645fde429d09800622d329116feb5ff9829634655123ca",
-    "sourceCodeHash": "0xb4d1bf3669ba87bbeaf4373145c7e1490478c4a05ba4838a524aa6f0ce7348a6"
+    "initCodeHash": "0x694ab37a5e60046ec0dacaebc85c8829f1b444760e2d5121805f8f07197bfc47",
+    "sourceCodeHash": "0x9df78c99602fc81b2feb3cac6f354b8700bc9cf453e4bc6671a78c77688417a8"
+  },
+  "src/L2/GasPriceOracleStandard.sol:GasPriceOracleStandard": {
+    "initCodeHash": "0xaea69446a0bd177616490ed76d1f4ce981cdbeaf0f0df5b55ef9df6adab3eb4a",
+    "sourceCodeHash": "0x0e393c52d7c5473d488ef2f2ca9f330b66b54b5dca26e9b9d0aa4baa2b388c6c"
   },
   "src/L2/L1Block.sol:L1Block": {
     "initCodeHash": "0xa6dd2668435fc510161fb2085e2fd77ef0cd6735d3e96a3f839b10c064f00317",
-    "sourceCodeHash": "0x6551be49dcb0e2a80e9c1042e7964dc41f70bcb08f9ceefd0c0156de9c14cf2d"
+    "sourceCodeHash": "0xd31644bc6308f73b32b98b40348bee262e2ec02f0be3d6d580b44b951ab69573"
   },
   "src/L2/L1BlockCGT.sol:L1BlockCGT": {
-    "initCodeHash": "0x98094c7af5b4a370cdf5cb5f1501f4c4e7f51e38379c9791a865f34232a75d37",
-    "sourceCodeHash": "0x97b84b125df97ca4ad6fb1bd5c05998115970f37e71d7bccb5b902144fb8f8de"
+    "initCodeHash": "0x24b5268c57481d2141bc622b0720b2ec80b382e1422bcf083021da2a9a91d1bc",
+    "sourceCodeHash": "0xa5bd84b76f53a397708887be2a0ccd199b456494ccc3fd23601a102a9bf8db0e"
   },
   "src/L2/L1FeeVault.sol:L1FeeVault": {
     "initCodeHash": "0x838bbd7f381e84e21887f72bd1da605bfc4588b3c39aed96cbce67c09335b3ee",
