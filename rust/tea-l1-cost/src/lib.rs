@@ -27,6 +27,34 @@ pub const LATEST_PRICE_RATIO_SLOT: B256 = B256::new([
 /// `Database::storage()`.
 pub const LATEST_PRICE_RATIO_SLOT_U256: U256 = U256::from_be_bytes(LATEST_PRICE_RATIO_SLOT.0);
 
+/// L1Block attributes predeploy address (the L1-attributes contract, 0x42…0015).
+pub const L1_BLOCK_ATTRIBUTES_ADDR: Address = address!("0x4200000000000000000000000000000000000015");
+
+/// Storage slot for the L1Block `isCustomGasToken` flag —
+/// `bytes32(uint256(keccak256("l1block.isCustomGasToken")) - 1)`, identical to
+/// `L1BlockCGT.IS_CUSTOM_GAS_TOKEN_SLOT`.
+pub const IS_CUSTOM_GAS_TOKEN_SLOT: B256 = B256::new([
+    0xd2, 0xff, 0x82, 0xc9, 0xb4, 0x77, 0xff, 0x6a, 0x09, 0xf5, 0x30, 0xb1, 0xc6, 0x27, 0xff, 0xb4,
+    0xb0, 0xb8, 0x1e, 0x2a, 0xe2, 0xba, 0x42, 0x7f, 0x82, 0x41, 0x62, 0xe8, 0xda, 0xd0, 0x20, 0xaa,
+]);
+
+/// `IS_CUSTOM_GAS_TOKEN_SLOT` as U256 for direct use with `Database::storage()`.
+pub const IS_CUSTOM_GAS_TOKEN_SLOT_U256: U256 = U256::from_be_bytes(IS_CUSTOM_GAS_TOKEN_SLOT.0);
+
+/// Whether the L1Block `isCustomGasToken` slot value indicates custom-gas-token mode.
+///
+/// The TEA/ETH L1-cost multiplier (and its 1,500,000× backup) must apply ONLY on
+/// CGT chains, matching the contract side: non-CGT chains deploy the standard
+/// `GasPriceOracleStandard` (no multiplier) and the Tea `GasPriceOracle` returns
+/// the identity multiplier off-CGT (TEAO1-165). Gating the EL on the SAME flag the
+/// contract reads keeps execution and the oracle's quoted fee consistent — on a
+/// non-CGT chain the (never-written) price slot must NEVER become the backup
+/// multiplier. Shared by tea-reth and kona so the two gates cannot drift.
+#[inline]
+pub fn cgt_enabled(is_custom_gas_token_slot: U256) -> bool {
+    !is_custom_gas_token_slot.is_zero()
+}
+
 /// Backup TEA per ETH exchange rate (1,500,000 TEA per ETH).
 pub const BACKUP_TEA_PER_ETH: u64 = 1_500_000;
 
@@ -155,6 +183,26 @@ mod tests {
             "d0dd2c45a47f8f6c6a17d45eff20f1e85e013b0244793169bca59b0cad5e4e86"
         ));
         assert_eq!(LATEST_PRICE_RATIO_SLOT, expected);
+    }
+
+    #[test]
+    fn test_is_custom_gas_token_slot_matches_contract() {
+        // Must equal L1BlockCGT.IS_CUSTOM_GAS_TOKEN_SLOT =
+        // bytes32(uint256(keccak256("l1block.isCustomGasToken")) - 1).
+        let expected = B256::new(alloy_primitives::hex!(
+            "d2ff82c9b477ff6a09f530b1c627ffb4b0b81e2ae2ba427f824162e8dad020aa"
+        ));
+        assert_eq!(IS_CUSTOM_GAS_TOKEN_SLOT, expected);
+        assert_eq!(IS_CUSTOM_GAS_TOKEN_SLOT_U256, U256::from_be_bytes(expected.0));
+        // L1Block attributes predeploy.
+        assert_eq!(L1_BLOCK_ATTRIBUTES_ADDR, address!("0x4200000000000000000000000000000000000015"));
+    }
+
+    #[test]
+    fn test_cgt_enabled_gate() {
+        // Off-CGT (unwritten/zero slot) => no multiplier; CGT (nonzero) => multiplier.
+        assert!(!cgt_enabled(U256::ZERO));
+        assert!(cgt_enabled(U256::from(1u64)));
     }
 
     #[test]

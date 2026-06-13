@@ -73,6 +73,17 @@ fn tea_l1_cost_multiplier<DB: Database>(
     if !crate::chainspec::is_tea(chain_id) {
         return None;
     }
+    // TEAO1-165: gate on L1Block.isCustomGasToken — the SAME flag the
+    // GasPriceOracle reads — so the multiplier applies only on custom-gas-token
+    // chains, matching the contract. On a non-CGT chain the price slot is never
+    // written; it must NOT become the 1,500,000× backup. Return `None` (identity)
+    // so execution charges the standard ETH-denominated L1 fee, consistent with
+    // the standalone GasPriceOracleStandard installed on non-CGT chains.
+    let cgt =
+        db.storage(l1_cost::L1_BLOCK_ATTRIBUTES_ADDR, l1_cost::IS_CUSTOM_GAS_TOKEN_SLOT_U256).ok()?;
+    if !l1_cost::cgt_enabled(cgt) {
+        return None;
+    }
     // TEAO1-178: on transaction-level trace/replay paths the RPC layer replays
     // the block's earlier txs into `db` (mutating the GasPriceOracle slot on
     // blocks where tx0 updates it) and then builds this *fresh* target EVM. To
@@ -239,6 +250,11 @@ mod tests {
                 && index == l1_cost::LATEST_PRICE_RATIO_SLOT_U256
             {
                 Ok(self.slot_value)
+            } else if address == l1_cost::L1_BLOCK_ATTRIBUTES_ADDR
+                && index == l1_cost::IS_CUSTOM_GAS_TOKEN_SLOT_U256
+            {
+                // These tests model a Tea custom-gas-token chain (TEAO1-165 gate).
+                Ok(U256::from(1u64))
             } else {
                 Ok(U256::ZERO)
             }
@@ -294,6 +310,25 @@ mod tests {
         let evm = TeaEvmFactory
             .create_evm(OracleDb { slot_value: U256::from(42u64) * l1_cost::WAD }, env);
         assert_eq!(evm.ctx().chain.l1_cost_multiplier, None);
+    }
+
+    /// TEAO1-165: on a Tea chain whose L1Block reports `isCustomGasToken == false`
+    /// (the slot is unset → an empty DB reads 0), the EL must NOT apply the
+    /// multiplier or the 1,500,000× backup. It returns `None` (identity), so
+    /// execution charges the standard ETH-denominated L1 fee — matching the
+    /// standalone `GasPriceOracleStandard` the contract side installs on non-CGT
+    /// chains, instead of contradicting it.
+    #[test]
+    fn create_evm_leaves_multiplier_none_when_not_cgt() {
+        use revm::database::CacheDB;
+        use revm::database_interface::EmptyDBTyped;
+        let db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
+        let evm = TeaEvmFactory.create_evm(db, tea_env());
+        assert_eq!(
+            evm.ctx().chain.l1_cost_multiplier,
+            None,
+            "non-CGT chain must not receive the TEA multiplier/backup (TEAO1-165)"
+        );
     }
 
     // ── TEAO1-178 regression: trace/replay must charge the block-start ──────

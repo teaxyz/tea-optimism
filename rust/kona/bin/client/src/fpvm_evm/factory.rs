@@ -36,6 +36,17 @@ fn tea_l1_cost_multiplier<DB: Database>(db: &mut DB, chain_id: u64) -> Option<(U
     if !tea_l1_cost::is_tea(chain_id) {
         return None;
     }
+    // TEAO1-165: gate on L1Block.isCustomGasToken — the SAME flag the GasPriceOracle
+    // reads — so the FPVM applies the multiplier only on custom-gas-token chains,
+    // matching both the EL and the contract. On a non-CGT chain the price slot is
+    // never written and must NOT become the 1,500,000× backup; `None` (identity)
+    // keeps proof re-execution byte-identical to canonical, non-CGT execution.
+    let cgt = db
+        .storage(tea_l1_cost::L1_BLOCK_ATTRIBUTES_ADDR, tea_l1_cost::IS_CUSTOM_GAS_TOKEN_SLOT_U256)
+        .ok()?;
+    if !tea_l1_cost::cgt_enabled(cgt) {
+        return None;
+    }
     let raw = db
         .storage(tea_l1_cost::GAS_PRICE_ORACLE_ADDR, tea_l1_cost::LATEST_PRICE_RATIO_SLOT_U256)
         .ok()?;
@@ -189,6 +200,11 @@ mod tests {
                 && index == tea_l1_cost::LATEST_PRICE_RATIO_SLOT_U256
             {
                 Ok(self.slot_value)
+            } else if address == tea_l1_cost::L1_BLOCK_ATTRIBUTES_ADDR
+                && index == tea_l1_cost::IS_CUSTOM_GAS_TOKEN_SLOT_U256
+            {
+                // These tests model a Tea custom-gas-token chain (TEAO1-165 gate).
+                Ok(U256::from(1u64))
             } else {
                 Ok(U256::ZERO)
             }
