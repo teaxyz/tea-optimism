@@ -53,6 +53,10 @@ alloy-op-evm = { workspace = true, features = ["std"] }
 # Revm
 revm = { workspace = true, features = ["std", "c-kzg", "secp256k1", "portable", "blst"] }
 
+# Tea verification precompiles (0x0696-0x0698). The host re-runs these for the
+# FPVM via the accelerated-precompile path, so it links the full (std) crypto.
+tea-precompiles = { workspace = true, features = ["std"] }
+
 # General
 anyhow.workspace = true
 tracing.workspace = true

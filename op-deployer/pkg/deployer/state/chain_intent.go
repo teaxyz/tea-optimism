@@ -134,10 +134,17 @@ func (c *ChainIntent) Check() error {
 		return fmt.Errorf("%w: chainId=%s", ErrFeeVaultZeroAddress, c.ID)
 	}
 
-	// Validate CustomGasToken: if any field is set, both Name and Symbol must be present
+	// Validate CustomGasToken: if any field is set, the full tuple must be present.
+	// L1CGTBridge is included here (TEAO1-139): a bridge-only intent must NOT slip
+	// through as a non-CGT chain — that silently deploys an L2 with no L2CGTBridge
+	// predeploy while the live L1 bridge relays into dead code, permanently
+	// stranding deposits. Including it forces the consistency checks below.
 	hasName := c.CustomGasToken.Name != ""
 	hasSymbol := c.CustomGasToken.Symbol != ""
-	hasAnyCustomGasTokenField := hasName || hasSymbol || c.CustomGasToken.InitialLiquidity != nil || c.CustomGasToken.LiquidityControllerOwner != (common.Address{})
+	hasAnyCustomGasTokenField := hasName || hasSymbol ||
+		c.CustomGasToken.InitialLiquidity != nil ||
+		c.CustomGasToken.LiquidityControllerOwner != (common.Address{}) ||
+		c.CustomGasToken.L1CGTBridge != nil
 
 	if hasAnyCustomGasTokenField {
 		if !hasName {
