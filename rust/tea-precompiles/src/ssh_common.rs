@@ -36,20 +36,37 @@ pub const MIN_RSA_MODULUS_BYTES: usize = 256;
 /// `BigUint::from_bytes_be` silently absorb the remaining zeros — defeating
 /// the 2048-bit floor entirely.
 pub fn strip_mpint_pad(bytes: &[u8]) -> Result<&[u8], &'static str> {
-    if bytes.len() >= 2 && bytes[0] == 0x00 {
-        if bytes[1] & 0x80 == 0 {
+    // RFC 4251 §5 canonical mpint, for the positive-only consumers here (RSA
+    // n/e, ECDSA r/s). The goal is a *bijection*: every integer has exactly one
+    // accepted byte encoding, so no value can be aliased across two distinct
+    // publicKey / sig_blob byte strings (TEAO1-168 / TEAO1-183).
+
+    // Empty string is the RFC 4251 §5 canonical encoding of zero — the unique
+    // representation of 0. Returned as-is; a zero RSA modulus/exponent or ECDSA
+    // scalar is then rejected downstream (RsaPublicKey::new / scalar validation).
+    if bytes.is_empty() {
+        return Ok(bytes);
+    }
+
+    if bytes[0] == 0x00 {
+        // A leading 0x00 is canonical only as the *single* sign pad for a value
+        // whose next byte has the high bit set. Reject the two non-canonical
+        // shapes early:
+        //   - a lone 0x00 (len == 1): zero must be the empty string, not 0x00;
+        //   - an unneeded pad (next byte high bit clear, incl. multi-zero runs).
+        if bytes.len() == 1 || bytes[1] & 0x80 == 0 {
             return Err("non-canonical mpint pad");
         }
         return Ok(&bytes[1..]);
     }
-    // RFC 4251 §5: a positive mpint whose most-significant byte has the high
-    // bit set MUST carry the leading `0x00` sign pad. A signless high-bit value
-    // is non-canonical — reject it, otherwise `0x00||x` and `x` decode to the
-    // same RSA modulus / ECDSA scalar, aliasing one key or signature across two
-    // distinct publicKey / sig_blob byte strings (TEAO1-168 / TEAO1-183).
-    if bytes.first().is_some_and(|b| b & 0x80 != 0) {
+
+    // A positive mpint whose most-significant byte has the high bit set MUST
+    // carry the leading 0x00 sign pad. A signless high-bit value is
+    // non-canonical — otherwise `0x00||x` and `x` decode to the same integer.
+    if bytes[0] & 0x80 != 0 {
         return Err("missing mpint sign pad");
     }
+
     Ok(bytes)
 }
 
@@ -367,6 +384,21 @@ pub fn verify_ssh_ecdsa(
     }
 }
 
+/// SSH ECDSA public keys MUST use the uncompressed SEC1 point encoding
+/// (`0x04 || X || Y`). RFC 5656 §3.1 specifies the uncompressed form and OpenSSH
+/// only ever emits it. `p256/p384/p521::VerifyingKey::from_sec1_bytes` is more
+/// permissive — it also accepts the compressed (`0x02`/`0x03`, `1 + field_bytes`)
+/// and hybrid (`0x06`/`0x07`) forms, which encode the *same* public key under a
+/// different, shorter byte string. Accepting those would give one key multiple
+/// distinct `publicKey` blobs that all verify the same signature — the exact
+/// encoding-malleability / identity-derivation footgun the trailing-byte and
+/// mpint-pad canonicalization checks close elsewhere (TEAO1-168 / TEAO1-183).
+/// Pin the canonical uncompressed form: prefix `0x04` and exactly
+/// `1 + 2*field_bytes` bytes.
+fn is_canonical_uncompressed_point(q_bytes: &[u8], field_bytes: usize) -> bool {
+    q_bytes.len() == 1 + 2 * field_bytes && q_bytes[0] == 0x04
+}
+
 /// Pack `r_unpadded` / `s_unpadded` into a fixed-width big-endian buffer of
 /// `field_bytes` per scalar, left-padding with zeros. ECDSA `Signature::from_scalars`
 /// expects exactly `field_bytes`-wide inputs; mpint stripping leaves a value
@@ -388,19 +420,11 @@ fn pad_scalars(
     Some((r_padded, s_padded))
 }
 
-/// RFC 5656 §3.1 mandates the *uncompressed* SEC1 point (`0x04 ‖ X ‖ Y`).
-/// `VerifyingKey::from_sec1_bytes` would otherwise also accept compressed
-/// (`0x02`/`0x03`) encodings, letting two distinct `publicKey` blobs map to the
-/// same key — which breaks callers that hash the blob to derive an on-chain
-/// identity. `field_bytes` is the curve coordinate width (32/48/66).
-fn is_uncompressed_sec1(q_bytes: &[u8], field_bytes: usize) -> bool {
-    q_bytes.first() == Some(&0x04) && q_bytes.len() == 1 + 2 * field_bytes
-}
-
 /// Verify ECDSA on P-256 with SHA-256.
 fn verify_ecdsa_p256(q_bytes: &[u8], message: &[u8], r: &[u8], s: &[u8]) -> bool {
     use p256::ecdsa::{Signature, VerifyingKey};
-    if !is_uncompressed_sec1(q_bytes, 32) {
+    // Reject compressed/hybrid point encodings — SSH requires uncompressed.
+    if !is_canonical_uncompressed_point(q_bytes, 32) {
         return false;
     }
     let verifying_key = match VerifyingKey::from_sec1_bytes(q_bytes) {
@@ -431,7 +455,8 @@ fn verify_ecdsa_p256(q_bytes: &[u8], message: &[u8], r: &[u8], s: &[u8]) -> bool
 /// Verify ECDSA on P-384 with SHA-384.
 fn verify_ecdsa_p384(q_bytes: &[u8], message: &[u8], r: &[u8], s: &[u8]) -> bool {
     use p384::ecdsa::{Signature, VerifyingKey};
-    if !is_uncompressed_sec1(q_bytes, 48) {
+    // Reject compressed/hybrid point encodings — SSH requires uncompressed.
+    if !is_canonical_uncompressed_point(q_bytes, 48) {
         return false;
     }
     let verifying_key = match VerifyingKey::from_sec1_bytes(q_bytes) {
@@ -462,7 +487,9 @@ fn verify_ecdsa_p384(q_bytes: &[u8], message: &[u8], r: &[u8], s: &[u8]) -> bool
 /// `[0, 66]` bytes — `pad_scalars` handles the left-pad to exactly 66.
 fn verify_ecdsa_p521(q_bytes: &[u8], message: &[u8], r: &[u8], s: &[u8]) -> bool {
     use p521::ecdsa::{Signature, VerifyingKey};
-    if !is_uncompressed_sec1(q_bytes, 66) {
+    // Reject compressed/hybrid point encodings — SSH requires uncompressed.
+    // P-521 field is 66 bytes, so the canonical uncompressed point is 133 bytes.
+    if !is_canonical_uncompressed_point(q_bytes, 66) {
         return false;
     }
     let verifying_key = match VerifyingKey::from_sec1_bytes(q_bytes) {
@@ -534,13 +561,26 @@ mod tests {
 
     #[test]
     fn strip_mpint_pad_empty_input() {
+        // Empty string is the RFC 4251 §5 canonical encoding of zero — the
+        // unique representation of 0, accepted as-is.
         assert_eq!(strip_mpint_pad(&[]).unwrap(), &[] as &[u8]);
     }
 
     #[test]
-    fn strip_mpint_pad_lone_zero() {
-        // Single 0x00 is the RFC 4251 §5 encoding of zero — valid, not stripped.
-        assert_eq!(strip_mpint_pad(&[0x00]).unwrap(), &[0x00]);
+    fn strip_mpint_pad_rejects_lone_zero() {
+        // A single 0x00 is a non-canonical zero — zero MUST be the empty string,
+        // so 0x00 and `[]` cannot both alias the integer 0. Reject it (TEAO1-168).
+        assert!(strip_mpint_pad(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn strip_mpint_pad_accepts_small_positive_single_byte() {
+        // A single low byte (high bit clear) is a valid canonical small positive
+        // integer — e.g. an RSA exponent of 3. It is NOT an "obviously false"
+        // case and must be returned unchanged.
+        assert_eq!(strip_mpint_pad(&[0x03]).unwrap(), &[0x03]);
+        assert_eq!(strip_mpint_pad(&[0x01]).unwrap(), &[0x01]);
+        assert_eq!(strip_mpint_pad(&[0x7F]).unwrap(), &[0x7F]);
     }
 
     // ─────────────────────────────────────────── read_ssh_string
@@ -814,6 +854,71 @@ mod tests {
         );
     }
 
+    /// TEAO1-168: the SSH RSA key-aliasing PoC, at the `verify_ssh_rsa` level.
+    /// A 2048-bit modulus has its most-significant bit set, so its canonical SSH
+    /// mpint carries a leading `0x00` sign pad. The same authority can be
+    /// re-encoded *without* that pad (a signless high-bit mpint). Pre-fix both
+    /// `publicKey` byte strings decoded to the same `(n, e)` and verified the
+    /// same signature — aliasing one RSA authority across two distinct blobs
+    /// (and two distinct `keccak256(publicKey)` identities). Post-fix the
+    /// canonical blob still verifies while the signless alias is rejected by
+    /// `strip_mpint_pad` before any `BigUint` conversion. This mirrors
+    /// `verify_ssh_ecdsa_rejects_signless_r_scalar` (TEAO1-183) on the RSA path.
+    #[test]
+    fn verify_ssh_rsa_rejects_signless_modulus_alias() {
+        use rand_08::SeedableRng;
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::traits::PublicKeyParts;
+        use signature::{SignatureEncoding, Signer};
+
+        let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
+        let priv_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("RSA-2048 keygen");
+        let pub_key = rsa::RsaPublicKey::from(&priv_key);
+        let n_raw = pub_key.n().to_bytes_be();
+        let e_raw = pub_key.e().to_bytes_be();
+        // A 2048-bit modulus' MSB is always set, so its canonical mpint needs a
+        // sign pad — exactly the PoC's precondition.
+        assert_eq!(n_raw.len(), 256);
+        assert!(
+            n_raw[0] & 0x80 != 0,
+            "expected a high-bit modulus whose canonical mpint needs a sign pad"
+        );
+
+        let message = b"teao1-168 rsa aliasing demo".as_slice();
+        let signing_key: SigningKey<Sha256> = SigningKey::new(priv_key);
+        let sig_bytes = signing_key.sign(message).to_bytes();
+
+        // Canonical publicKey: write_ssh_mpint prepends the 0x00 sign pad on n.
+        let mut canonical = Vec::new();
+        write_ssh_string(&mut canonical, b"ssh-rsa");
+        write_ssh_mpint(&mut canonical, &e_raw);
+        write_ssh_mpint(&mut canonical, &n_raw);
+
+        // Signless alias publicKey: n framed as a raw SSH string with NO sign pad.
+        let mut alias = Vec::new();
+        write_ssh_string(&mut alias, b"ssh-rsa");
+        write_ssh_mpint(&mut alias, &e_raw);
+        write_ssh_string(&mut alias, &n_raw); // <- the aliasing encoding
+
+        // The two publicKey byte strings differ by exactly the one sign-pad byte.
+        assert_ne!(canonical, alias);
+        assert_eq!(canonical.len(), alias.len() + 1);
+
+        let mut co = 0usize;
+        let _ = read_ssh_string(&canonical, &mut co).unwrap();
+        let mut ao = 0usize;
+        let _ = read_ssh_string(&alias, &mut ao).unwrap();
+
+        assert!(
+            verify_ssh_rsa(&canonical, co, message, b"rsa-sha2-256", &sig_bytes),
+            "canonical SSH RSA key must verify"
+        );
+        assert!(
+            !verify_ssh_rsa(&alias, ao, message, b"rsa-sha2-256", &sig_bytes),
+            "signless high-bit modulus alias must be rejected (TEAO1-168)"
+        );
+    }
+
     // ─────────────────────────────────────────── verify_ssh_ed25519
 
     fn sign_ed25519(message: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
@@ -940,47 +1045,6 @@ mod tests {
             build_ecdsa_pubkey_blob(b"ecdsa-sha2-nistp256", b"nistp256", &q_bytes);
         let sig_blob = build_ecdsa_sig_blob(&r, &s);
         (pub_blob, b"ecdsa-sha2-nistp256".to_vec(), sig_blob)
-    }
-
-    #[test]
-    fn is_uncompressed_sec1_gate() {
-        // F-2: only `0x04 ‖ X ‖ Y` of the exact curve width is accepted.
-        assert!(!is_uncompressed_sec1(&[0x02; 33], 32)); // compressed p256
-        assert!(!is_uncompressed_sec1(&[0x03; 33], 32));
-        assert!(!is_uncompressed_sec1(&[0x04; 64], 32)); // wrong length
-        assert!(is_uncompressed_sec1(&[0x04; 65], 32)); // valid p256
-        assert!(!is_uncompressed_sec1(&[0x04; 65], 48)); // p384 width mismatch
-        assert!(is_uncompressed_sec1(&[0x04; 97], 48)); // valid p384
-        assert!(is_uncompressed_sec1(&[0x04; 133], 66)); // valid p521
-    }
-
-    #[test]
-    fn verify_ecdsa_p256_rejects_compressed_pubkey() {
-        // F-2 regression: the *compressed* encoding of a key whose uncompressed
-        // form verifies a signature must itself be rejected (RFC 5656 §3.1), so
-        // two distinct `publicKey` blobs cannot alias onto the same key.
-        use p256::ecdsa::{Signature, SigningKey};
-        use signature::Signer as EcdsaSigner;
-
-        let mut rng = rand_08::rngs::StdRng::from_seed_helper();
-        let signing_key = SigningKey::random(&mut rng);
-        let verifying_key = signing_key.verifying_key();
-        let message = b"f-2 regression message";
-        let signature: Signature = signing_key.sign(message);
-        let signature = signature.normalize_s().unwrap_or(signature);
-        let (r, s) = signature.split_bytes();
-
-        let q_uncompressed = verifying_key.to_encoded_point(false).as_bytes().to_vec();
-        let q_compressed = verifying_key.to_encoded_point(true).as_bytes().to_vec();
-
-        assert!(
-            verify_ecdsa_p256(&q_uncompressed, message, &r, &s),
-            "uncompressed key must still verify"
-        );
-        assert!(
-            !verify_ecdsa_p256(&q_compressed, message, &r, &s),
-            "compressed key must be rejected (F-2)"
-        );
     }
 
     fn sign_ecdsa_nistp384(message: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
@@ -1166,6 +1230,41 @@ mod tests {
             b"ecdsa-sha2-nistp256",
             &sig_blob,
         ));
+    }
+
+    /// Encoding-malleability regression (sibling of the GPG truncated-tail
+    /// finding): SSH ECDSA keys MUST be uncompressed SEC1 points. The same key
+    /// re-encoded in the compressed form is a *distinct* `publicKey` byte string
+    /// that — absent the `is_canonical_uncompressed_point` gate — verifies the
+    /// same signature, aliasing one key across two encodings. The compressed
+    /// form must now be rejected while the canonical uncompressed form verifies.
+    #[test]
+    fn verify_ssh_ecdsa_rejects_compressed_point() {
+        use signature::Signer as EcdsaSigner;
+        use p256::ecdsa::{Signature, SigningKey};
+        let msg = b"compressed-point-malleability-probe";
+        let mut rng = rand_08::rngs::StdRng::from_seed_helper();
+        let signing_key = SigningKey::random(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        let q_compressed = verifying_key.to_encoded_point(true).as_bytes().to_vec();
+        let q_uncompressed = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+        assert_eq!(q_compressed.len(), 33, "control: compressed P-256 point is 33 bytes");
+        assert_eq!(q_uncompressed.len(), 65, "control: uncompressed P-256 point is 65 bytes");
+
+        let signature: Signature = signing_key.sign(msg);
+        let signature = signature.normalize_s().unwrap_or(signature);
+        let (r, s) = signature.split_bytes();
+        let sig_blob = build_ecdsa_sig_blob(&r, &s);
+
+        let verify = |q: &[u8]| {
+            let pub_blob = build_ecdsa_pubkey_blob(b"ecdsa-sha2-nistp256", b"nistp256", q);
+            let mut o = 0usize;
+            let _ = read_ssh_string(&pub_blob, &mut o).unwrap();
+            verify_ssh_ecdsa(b"ecdsa-sha2-nistp256", &pub_blob, o, msg, b"ecdsa-sha2-nistp256", &sig_blob)
+        };
+
+        assert!(verify(&q_uncompressed), "canonical uncompressed point must verify");
+        assert!(!verify(&q_compressed), "compressed point must be rejected (encoding malleability)");
     }
 
     #[test]
