@@ -255,22 +255,32 @@ fn u256_to_usize(data: &[u8]) -> Result<usize, &'static str> {
     if data.len() != 32 {
         return Err("invalid uint256 length");
     }
-    // Only use the last 8 bytes (offsets shouldn't be > u64)
+    // F-1 (2026-05-19 audit): reject offsets whose upper 24 bytes are non-zero
+    // (definitionally beyond any practical input length) and use `usize::try_from`
+    // so a u64 > usize::MAX on a 32-bit target errors rather than silently
+    // truncating. Mirrors the hardened decoder in ssh_verify.rs.
+    if data[0..24].iter().any(|&b| b != 0) {
+        return Err("offset too large");
+    }
     let val = u64::from_be_bytes(data[24..32].try_into().map_err(|_| "conversion error")?);
-    Ok(val as usize)
+    usize::try_from(val).map_err(|_| "offset exceeds usize::MAX")
 }
 
 /// Read ABI-encoded dynamic bytes from a given offset.
 fn read_dynamic_bytes(input: &[u8], offset: usize) -> Result<Vec<u8>, &'static str> {
-    if offset + 32 > input.len() {
+    // F-1: `checked_add` throughout so an adversarial offset/length near
+    // usize::MAX cannot wrap into a valid slice index and panic at `&input[a..b]`
+    // when `a > b` — inside a precompile that is a consensus halt.
+    let header_end = offset.checked_add(32).ok_or("offset overflow")?;
+    if header_end > input.len() {
         return Err("offset out of bounds");
     }
-    let length = u256_to_usize(&input[offset..offset + 32])?;
-    let data_start = offset + 32;
-    if data_start + length > input.len() {
+    let length = u256_to_usize(&input[offset..header_end])?;
+    let data_end = header_end.checked_add(length).ok_or("length overflow")?;
+    if data_end > input.len() {
         return Err("data out of bounds");
     }
-    Ok(input[data_start..data_start + length].to_vec())
+    Ok(input[header_end..data_end].to_vec())
 }
 
 /// GPG verify precompile entry point.
@@ -1294,5 +1304,33 @@ mod tests {
         let mut out = [0u8; 32];
         out[24..32].copy_from_slice(&(val as u64).to_be_bytes());
         out
+    }
+
+    /// F-1 (2026-05-19 audit) regression: a crafted ABI offset must decode-error
+    /// cleanly, never panic. Pre-hardening, `pub_key_offset = u64::MAX` wrapped
+    /// past the bounds check and `&input[offset..offset + 32]` panicked.
+    #[test]
+    fn test_gpg_verify_crafted_offset_no_panic() {
+        let mut input = vec![0u8; 128];
+        // pub_key_offset slot [64..96]; low 8 bytes = u64::MAX → usize::MAX.
+        input[88..96].copy_from_slice(&u64::MAX.to_be_bytes());
+        let result = gpg_verify_run(&input, required_gas(&input));
+        assert!(
+            matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))),
+            "crafted offset must decode-error, got: {result:?}"
+        );
+    }
+
+    /// F-1 regression: an offset with any non-zero byte in its upper 24 bytes is
+    /// rejected (ABI offsets are bounded to u64).
+    #[test]
+    fn test_gpg_verify_offset_upper_bytes_rejected() {
+        let mut input = vec![0u8; 128];
+        input[64] = 0x01; // first byte of pub_key_offset slot → non-zero upper-24
+        let result = gpg_verify_run(&input, required_gas(&input));
+        assert!(
+            matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))),
+            "upper-byte offset must be rejected, got: {result:?}"
+        );
     }
 }
