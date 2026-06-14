@@ -30,6 +30,17 @@ fn make_evm_env() -> EvmEnv<OpSpecId> {
     }
 }
 
+/// Seed the L1Block `isCustomGasToken` flag so the TEAO1-165 CGT gate admits the
+/// TEA multiplier — these tests model a Tea custom-gas-token chain.
+fn seed_cgt(db: &mut CacheDB<EmptyDBTyped<core::convert::Infallible>>) {
+    db.insert_account_storage(
+        tea_reth::l1_cost::L1_BLOCK_ATTRIBUTES_ADDR,
+        tea_reth::l1_cost::IS_CUSTOM_GAS_TOKEN_SLOT_U256,
+        U256::from(1u64),
+    )
+    .expect("seed cgt flag");
+}
+
 // ========== GPG precompile tests ==========
 
 /// Verify the precompile is registered at 0x0696 by sending our ed25519 test
@@ -238,6 +249,7 @@ fn test_tea_l1_cost_multiplier_reads_oracle() {
         price,
     )
     .expect("insert storage");
+    seed_cgt(&mut db);
 
     let factory = tea_reth::evm::TeaEvmFactory;
     let evm = factory.create_evm(db, make_evm_env());
@@ -261,6 +273,7 @@ fn test_tea_l1_cost_multiplier_zero_oracle_uses_backup() {
         U256::ZERO,
     )
     .expect("insert storage");
+    seed_cgt(&mut db);
 
     let factory = tea_reth::evm::TeaEvmFactory;
     let evm = factory.create_evm(db, make_evm_env());
@@ -276,7 +289,9 @@ fn test_tea_l1_cost_multiplier_zero_oracle_uses_backup() {
 /// Empty DB (no oracle contract) → db.storage() returns U256::ZERO → backup rate.
 #[test]
 fn test_tea_l1_cost_multiplier_empty_db() {
-    let db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
+    let mut db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
+    // CGT chain (gate admits scaling), but the oracle slot is unseeded → backup rate.
+    seed_cgt(&mut db);
 
     let factory = tea_reth::evm::TeaEvmFactory;
     let evm = factory.create_evm(db, make_evm_env());
@@ -302,6 +317,7 @@ fn test_evm_factory_sets_multiplier_on_context() {
         custom_rate,
     )
     .expect("insert storage");
+    seed_cgt(&mut db);
 
     let factory = tea_reth::evm::TeaEvmFactory;
     let evm = factory.create_evm(db, make_evm_env());
@@ -331,6 +347,7 @@ fn test_evm_factory_packed_slot_with_timestamp() {
         packed,
     )
     .expect("insert storage");
+    seed_cgt(&mut db);
 
     let factory = tea_reth::evm::TeaEvmFactory;
     let evm = factory.create_evm(db, make_evm_env());
