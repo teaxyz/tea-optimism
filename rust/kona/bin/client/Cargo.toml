@@ -88,6 +88,9 @@ revm = { workspace = true, features = ["std"] }
 op-revm = { workspace = true, features = ["std"] }
 alloy-evm = { workspace = true, features = ["op"] }
 alloy-op-evm.workspace = true
+# TEAO1-143 PoC: builds an OpBlockExecutorFactory to run a real fee-paying tx
+# through both the stock host-side OpEvmFactory and the Tea-aware FpvmOpEvmFactory.
+alloy-op-hardforks.workspace = true
 
 [features]
 default = [ "client-tracing" ]
