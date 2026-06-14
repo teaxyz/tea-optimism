@@ -7,8 +7,7 @@ use alloy_primitives::{B256, Bytes, StorageKey};
 use alloy_rpc_types_eth::erc4337::TransactionConditional;
 use jsonrpsee_core::RpcResult;
 use reth_optimism_txpool::conditional::{
-    KnownAccountViolation, MaybeConditionalTransaction, conditional_has_root_hash,
-    first_known_account_violation,
+    KnownAccountViolation, MaybeConditionalTransaction, first_known_account_violation,
 };
 use reth_rpc_eth_api::L2EthApiExtServer;
 use reth_rpc_eth_types::utils::recover_raw_transaction;
@@ -140,19 +139,11 @@ where
             return Err(TxConditionalErr::InvalidCondition.into());
         }
 
-        // Reject `knownAccounts` storage-root (`RootHash`) predicates at admission.
-        // The payload builder runs against a bare revm `Database` with no storage
-        // trie, so it cannot compute a pending storage root and can never honor a
-        // RootHash predicate at inclusion time (it passes `read_root => None`, which
-        // skips them in `first_known_account_violation`). Rather than accept a mode
-        // the builder cannot enforce, refuse it here before it reaches the pool or is
-        // forwarded to the sequencer (TEAO1-167 follow-up). Slots predicates are
-        // unaffected and remain re-checked at inclusion.
-        if conditional_has_root_hash(&condition) {
-            return Err(TxConditionalErr::RootHashUnsupported.into());
-        }
-
-        // Validate Account
+        // Validate Account. `RootHash` predicates are supported: they are checked
+        // here against `Latest`, re-checked on each new head by the eviction task,
+        // and — crucially — re-checked against the pending build state at inclusion
+        // time by the payload builder, which recomputes the watched account's storage
+        // root over the block being built (TEAO1-206).
         self.validate_known_accounts(&condition).await?;
 
         if let Some(sequencer) = self.sequencer_client() {

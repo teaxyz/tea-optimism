@@ -5,8 +5,9 @@ use crate::{
 };
 use alloy_consensus::{BlockHeader, Transaction, Typed2718, conditional::BlockConditionalAttributes};
 use alloy_evm::Evm as AlloyEvm;
-use alloy_primitives::{B256, U256};
+use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_debug::ExecutionWitness;
+use alloy_rpc_types_eth::erc4337::{AccountStorage, TransactionConditional};
 use alloy_rpc_types_engine::PayloadId;
 use reth_basic_payload_builder::*;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
@@ -39,12 +40,106 @@ use reth_revm::{
 };
 use reth_storage_api::{StateProvider, StateProviderFactory, errors::ProviderError};
 use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, TransactionPool};
+use reth_trie_common::HashedStorage;
 use revm::context::{Block, BlockEnv};
 // Anonymous import: brings revm's `Database::storage` into method scope for the
 // TEAO1-167 conditional re-check without shadowing the `Database` bound name.
 use revm::Database as _;
-use std::{marker::PhantomData, sync::Arc};
+use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 use tracing::{debug, trace, warn};
+
+/// Builds the [`HashedStorage`] overlay for `address` from the executor's pending
+/// in-block state (TEAO1-206).
+///
+/// During block building, every storage slot an account has read or written in
+/// this block lives in the revm [`State`] cache (it is block-cumulative). Feeding
+/// those slots — at their *current* in-block values — as an overlay to
+/// [`StorageRootProvider::storage_root`] recomputes the account's storage root as
+/// it stands at the point the next transaction would execute, so a watched root
+/// that drifted *inside* this block (e.g. the `GasPriceOracle` slot refreshed by
+/// the head's L1-attributes deposit) is reflected. Slots that were only read are
+/// at their committed value and contribute nothing to the trie; only genuine
+/// writes move the root. An account untouched this block has no cache entry and
+/// yields an empty overlay, so the provider returns its committed root.
+fn account_pending_overlay<DB>(state: &State<DB>, address: Address) -> HashedStorage {
+    match state.cache.accounts.get(&address) {
+        // Loaded with live storage: overlay its current in-block slot values.
+        Some(acc) => match &acc.account {
+            Some(plain) => HashedStorage::from_plain_storage(acc.status, plain.storage.iter()),
+            // Loaded but empty/self-destructed in-block: the storage trie is wiped.
+            None => HashedStorage::from_iter(true, std::iter::empty()),
+        },
+        // Untouched this block: no overlay → provider returns the committed root.
+        None => HashedStorage::default(),
+    }
+}
+
+/// Computes an account's storage root against the *pending* build state — the
+/// parent storage trie (from `provider`) overlaid with this block's in-block
+/// writes (from the executor's [`State`] cache).
+///
+/// Implemented for the OP block executor's EVM database (`&mut State<DB>`) so the
+/// payload builder can honor `AccountStorage::RootHash` conditionals at the actual
+/// inclusion-time decision point (TEAO1-206), rather than punting them to RPC
+/// admission / head eviction (both of which run against committed state and miss
+/// same-block root drift).
+trait PendingStorageRoot {
+    /// Storage root of `address` over `provider`'s state plus this block's pending
+    /// writes for that account.
+    fn pending_storage_root(
+        &self,
+        provider: &dyn StateProvider,
+        address: Address,
+    ) -> Result<B256, ProviderError>;
+}
+
+impl<DB> PendingStorageRoot for &mut State<DB> {
+    fn pending_storage_root(
+        &self,
+        provider: &dyn StateProvider,
+        address: Address,
+    ) -> Result<B256, ProviderError> {
+        provider.storage_root(address, account_pending_overlay(self, address))
+    }
+}
+
+/// Outcome of recomputing pending storage roots for a conditional's `RootHash`
+/// predicates at inclusion time (TEAO1-206).
+#[derive(Debug, PartialEq, Eq)]
+enum RootHashRecheck {
+    /// Every `RootHash`-watched account's pending storage root was recomputed.
+    Roots(HashMap<Address, B256>),
+    /// At least one watched account's storage root could not be recomputed.
+    /// Fail-closed: the transaction must be excluded rather than included under a
+    /// `RootHash` predicate we could not verify.
+    Unverifiable,
+}
+
+/// Recompute the pending storage root of every `RootHash`-watched account in
+/// `cond` via `compute`, returning them keyed by address.
+///
+/// `Slots` predicates are ignored here — they are checked by the slot reader. The
+/// policy is **fail-closed** (TEAO1-206): the first `compute` error returns
+/// [`RootHashRecheck::Unverifiable`] so the caller excludes the transaction
+/// instead of including it under an unverifiable predicate. (`Slots` keeps the
+/// established TEAO1-167 fail-open behavior, applied separately by the caller.)
+fn recompute_root_hash_roots<E>(
+    cond: &TransactionConditional,
+    mut compute: impl FnMut(Address) -> Result<B256, E>,
+) -> RootHashRecheck {
+    let mut roots = HashMap::new();
+    for (address, storage) in &cond.known_accounts {
+        if matches!(storage, AccountStorage::RootHash(_)) {
+            match compute(*address) {
+                Ok(root) => {
+                    roots.insert(*address, root);
+                }
+                Err(_) => return RootHashRecheck::Unverifiable,
+            }
+        }
+    }
+    RootHashRecheck::Roots(roots)
+}
 
 /// Optimism's payload builder
 #[derive(Debug)]
@@ -361,7 +456,13 @@ impl<Txs> OpBuilder<'_, Txs> {
         // 3. if mem pool transactions are requested we execute them
         if !ctx.attributes().no_tx_pool() {
             let best_txs = best(ctx.best_transaction_attributes(builder.evm_mut().block()));
-            if ctx.execute_best_transactions(&mut info, &mut builder, best_txs)?.is_some() {
+            // `&state_provider` lets the conditional re-check recompute pending storage
+            // roots for `RootHash` predicates (TEAO1-206); it is moved into `finish`
+            // below, after this borrow ends.
+            if ctx
+                .execute_best_transactions(&mut info, &mut builder, best_txs, &state_provider)?
+                .is_some()
+            {
                 return Ok(BuildOutcomeKind::Cancelled);
             }
 
@@ -676,10 +777,17 @@ where
         mut best_txs: impl PayloadTransactions<
             Transaction: PoolTransaction<Consensus = TxTy<Evm::Primitives>> + OpPooledTx,
         >,
+        // Parent state, used to recompute a watched account's storage root over the
+        // pending build state when a conditional carries an `AccountStorage::RootHash`
+        // predicate (TEAO1-206).
+        state_provider: &dyn StateProvider,
     ) -> Result<Option<()>, PayloadBuilderError>
     where
         Builder: BlockBuilder<Primitives = Evm::Primitives>,
-        <<Builder::Executor as BlockExecutor>::Evm as AlloyEvm>::DB: Database,
+        // `Database` for slot reads; `PendingStorageRoot` to recompute storage roots
+        // over the pending build state for `RootHash` predicates (TEAO1-206).
+        <<Builder::Executor as BlockExecutor>::Evm as AlloyEvm>::DB:
+            Database + PendingStorageRoot,
     {
         let mut block_gas_limit = builder.evm_mut().block().gas_limit();
         if let Some(gas_limit_config) = self.builder_config.gas_limit_config.gas_limit() {
@@ -763,26 +871,53 @@ where
                 }
             }
 
-            // TEAO1-167: re-validate the conditional's `knownAccounts` against the
-            // state this block actually executes on, immediately before inclusion.
-            // The head's L1-attributes deposit (executed above) refreshes the
-            // GasPriceOracle TEA/ETH ratio, so a tx conditioned on that slot must be
-            // re-checked here or it could execute under a different multiplier than it
-            // required. `Slots` are read from the builder's pending DB; `RootHash`
-            // predicates have no trie here and are enforced at admission + head
-            // eviction. Fail-open on a read error — never drop an includable tx.
+            // TEAO1-167 / TEAO1-206: re-validate the conditional's `knownAccounts`
+            // against the state this block actually executes on, immediately before
+            // inclusion. The head's L1-attributes deposit (executed above) — and any
+            // earlier tx in this block — can change a watched account inside the very
+            // block being built, so admission (`Latest`) and head eviction (committed)
+            // are both blind to same-block drift; the builder is the only inclusion-
+            // time decision point. `Slots` are read from the builder's pending DB;
+            // `RootHash` predicates are honored here by recomputing the account's
+            // storage root over the pending build state (parent trie + this block's
+            // writes) via the state provider.
+            //
+            // Read-error policy is split by predicate kind:
+            // - `RootHash` is **fail-closed** — this is the inclusion-time invariant
+            //   under audit (TEAO1-206), so if a watched account's storage root cannot
+            //   be recomputed we must NOT include the tx under an unverified predicate.
+            //   It is excluded and stays pooled for retry on the next block (no drop,
+            //   no admission rejection).
+            // - `Slots` stays **fail-open** — the established TEAO1-167 behavior; a
+            //   transient slot read never drops an otherwise-includable tx.
             if let Some(cond) = &conditional {
+                // Recompute pending storage roots for `RootHash`-watched accounts
+                // against the pending build state. This needs both the executor
+                // `State` (pending overlay) and the parent `state_provider`, so do it
+                // before the slot-reader closure borrows the DB. Fail-closed: if any
+                // watched root cannot be recomputed, exclude the tx (TEAO1-206).
+                let pending_roots = match recompute_root_hash_roots(cond, |address| {
+                    builder.evm_mut().db_mut().pending_storage_root(state_provider, address)
+                }) {
+                    RootHashRecheck::Roots(roots) => roots,
+                    RootHashRecheck::Unverifiable => {
+                        trace!(target: "payload_builder", ?tx, "excluding conditional tx whose RootHash predicate could not be re-verified (TEAO1-206)");
+                        best_txs.mark_invalid(tx.signer(), tx.nonce());
+                        continue;
+                    }
+                };
+
                 let db = builder.evm_mut().db_mut();
                 let violated = matches!(
                     first_known_account_violation(
                         cond,
                         |address, slot| db.storage(address, slot),
-                        |_address| Ok(None),
+                        |address| Ok(pending_roots.get(&address).copied()),
                     ),
                     Ok(Some(_))
                 );
                 if violated {
-                    trace!(target: "payload_builder", ?tx, "skipping conditional tx whose knownAccounts no longer hold (TEAO1-167)");
+                    trace!(target: "payload_builder", ?tx, "skipping conditional tx whose knownAccounts no longer hold (TEAO1-167/206)");
                     best_txs.mark_invalid(tx.signer(), tx.nonce());
                     continue;
                 }
@@ -824,5 +959,312 @@ where
         }
 
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod root_hash_overlay_tests {
+    //! Unit tests for [`account_pending_overlay`] — the load-bearing piece of the
+    //! TEAO1-206 fix. It extracts an account's *pending* in-block storage (from the
+    //! executor `State` cache) so the builder can recompute the watched storage root
+    //! over the block being built. Correctness here means the overlay the builder
+    //! hands to `StateProvider::storage_root` reflects same-block writes, so a
+    //! `RootHash` predicate is enforced at inclusion rather than skipped.
+    use super::*;
+    use alloy_primitives::keccak256;
+    use reth_optimism_txpool::conditional::KnownAccountViolation;
+    use reth_provider::{providers::LatestStateProviderRef, test_utils::create_test_provider_factory};
+    use reth_revm::db::{EmptyDB, states::CacheAccount, states::AccountStatus};
+    use reth_storage_api::StorageRootProvider;
+    use revm::primitives::HashMap as RevmMap;
+    use revm::state::AccountInfo;
+    use std::convert::Infallible;
+
+    fn empty_state() -> State<EmptyDB> {
+        State::builder().with_database(EmptyDB::default()).build()
+    }
+
+    fn plain_storage(slots: &[(U256, U256)]) -> RevmMap<U256, U256> {
+        let mut s = RevmMap::default();
+        for (k, v) in slots {
+            s.insert(*k, *v);
+        }
+        s
+    }
+
+    /// A `State` whose pending cache holds `addr` with `slots` (modelling in-block
+    /// writes the executor has accumulated for that account).
+    fn state_with_pending(addr: Address, slots: &[(U256, U256)]) -> State<EmptyDB> {
+        let mut state = empty_state();
+        state
+            .cache
+            .accounts
+            .insert(addr, CacheAccount::new_changed(AccountInfo::default(), plain_storage(slots)));
+        state
+    }
+
+    fn cond_root(addr: Address, root: B256) -> TransactionConditional {
+        let mut tc = TransactionConditional::default();
+        tc.known_accounts.insert(addr, AccountStorage::RootHash(root));
+        tc
+    }
+
+    /// The builder's inclusion decision for a conditional, given the storage root it
+    /// recomputed for the watched account — exactly the shape `execute_best_transactions`
+    /// feeds to `first_known_account_violation`.
+    fn builder_decision(
+        cond: &TransactionConditional,
+        recomputed_root: B256,
+    ) -> Option<KnownAccountViolation> {
+        first_known_account_violation(
+            cond,
+            |_, _| Ok::<_, Infallible>(U256::ZERO),
+            move |_| Ok::<_, Infallible>(Some(recomputed_root)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn overlay_reflects_pending_slot_writes() {
+        // An account changed inside the block (e.g. the GasPriceOracle ratio slot
+        // refreshed by the head's L1-attributes deposit) must surface in the overlay
+        // at its *new* value, so the recomputed storage root differs from the one the
+        // conditional was admitted against.
+        let addr = Address::with_last_byte(0x42);
+        let (slot, val) = (U256::from(1), U256::from(9));
+        let mut state = empty_state();
+        state
+            .cache
+            .accounts
+            .insert(addr, CacheAccount::new_changed(AccountInfo::default(), plain_storage(&[(slot, val)])));
+
+        let overlay = account_pending_overlay(&state, addr);
+        assert!(!overlay.wiped);
+        assert_eq!(overlay.storage.get(&keccak256(B256::from(slot))), Some(&val));
+    }
+
+    #[test]
+    fn overlay_is_empty_for_untouched_account() {
+        // No cache entry => no overlay => the provider returns the committed root,
+        // so an unchanged account's RootHash predicate still holds.
+        let overlay = account_pending_overlay(&empty_state(), Address::with_last_byte(0x07));
+        assert!(overlay.is_empty());
+    }
+
+    #[test]
+    fn overlay_is_wiped_for_destroyed_account() {
+        // A self-destructed account has an empty storage trie; the overlay must be
+        // wiped so the recomputed root is the empty-storage root.
+        let addr = Address::with_last_byte(0x09);
+        let mut state = empty_state();
+        state.cache.accounts.insert(addr, CacheAccount::new_destroyed());
+
+        let overlay = account_pending_overlay(&state, addr);
+        assert!(overlay.wiped);
+        assert!(overlay.storage.is_empty());
+    }
+
+    /// Full inclusion-time enforcement against a **real DB-backed state provider**
+    /// (TEAO1-206). This drives the entire fix chain end-to-end with real trie
+    /// hashing — `account_pending_overlay` (overlay from the executor `State` cache)
+    /// → `PendingStorageRoot::pending_storage_root` → `StorageRootProvider::storage_root`
+    /// (`StorageRoot::overlay_root` over MDBX) → `first_known_account_violation` — and
+    /// proves a `RootHash` conditional is included when the watched root holds and
+    /// **excluded** once that root drifts inside the block being built. A mock
+    /// provider can't show this: its `storage_root` is a stub, so only a real
+    /// provider exercises the value-sensitive trie computation the fix relies on.
+    #[test]
+    fn pending_root_includes_when_unchanged_and_excludes_on_same_block_drift() {
+        let factory = create_test_provider_factory();
+        let db = factory.provider().expect("test provider");
+        let provider = LatestStateProviderRef::new(&db);
+
+        let addr = Address::with_last_byte(0x42);
+        let slot = U256::from(1);
+        let v_admit = U256::from(7); // value the conditional was admitted against
+        let v_drift = U256::from(9); // value after a same-block write (e.g. oracle flip)
+
+        // The storage root the submitter pinned via `RootHash`, captured at admission
+        // (account storage = {slot: v_admit}). Computed through the real provider so
+        // the trie hashing matches what the builder will recompute.
+        let expected_root = provider
+            .storage_root(addr, HashedStorage::from_plain_storage(AccountStatus::Loaded, [(&slot, &v_admit)].into_iter()))
+            .expect("storage root");
+        let cond = cond_root(addr, expected_root);
+
+        // No same-block drift: the executor's pending cache still holds v_admit, so
+        // the builder recomputes `expected_root` and the conditional is INCLUDED.
+        let mut state_ok = state_with_pending(addr, &[(slot, v_admit)]);
+        let root_ok = (&mut state_ok).pending_storage_root(&provider, addr).expect("pending root");
+        assert_eq!(root_ok, expected_root, "unchanged account must recompute the admitted root");
+        assert_eq!(builder_decision(&cond, root_ok), None, "matching root must be includable");
+
+        // Same-block drift: an earlier tx wrote v_drift to the watched slot. The
+        // builder recomputes a DIFFERENT root and EXCLUDES the conditional — the exact
+        // behavior the finding's `read_root => None` builder leg failed to produce.
+        let mut state_drift = state_with_pending(addr, &[(slot, v_drift)]);
+        let root_drift =
+            (&mut state_drift).pending_storage_root(&provider, addr).expect("pending root");
+        assert_ne!(root_drift, expected_root, "a same-block write must move the storage root");
+        assert_eq!(
+            builder_decision(&cond, root_drift),
+            Some(KnownAccountViolation::Root { address: addr }),
+            "drifted root must be excluded at inclusion time"
+        );
+    }
+
+    /// Merge-vs-replace fidelity against a **non-empty committed trie** (TEAO1-206).
+    /// The whole fix rests on `overlay_root` being an OVERLAY (parent trie + this
+    /// block's writes), not a REPLACE: an in-block write to one slot must leave the
+    /// account's other committed slots in the recomputed root. The other DB-backed
+    /// test overlays onto an empty parent and can't show this. Here the parent commits
+    /// `{s1:a, s2:b}`; only `s1` is rewritten in-block (s2 is never touched, so it is
+    /// absent from the executor cache / overlay), and we assert the recomputed root
+    /// still contains `s2:b`.
+    #[test]
+    fn pending_root_retains_untouched_committed_slots_through_overlay() {
+        use reth_db_api::{tables, transaction::{DbTx, DbTxMut}};
+        use reth_primitives_traits::StorageEntry;
+
+        let factory = create_test_provider_factory();
+        let addr = Address::with_last_byte(0x55);
+        let s1 = U256::from(1);
+        let s2 = U256::from(2);
+        let a = U256::from(11); // committed s1
+        let b = U256::from(22); // committed s2 — never written in-block
+        let a_drift = U256::from(99); // s1 rewritten inside the block
+
+        // Commit parent storage {s1: a, s2: b} into the hashed trie.
+        {
+            let tx = factory.provider_rw().expect("rw").into_tx();
+            let ha = keccak256(addr);
+            tx.put::<tables::HashedStorages>(
+                ha,
+                StorageEntry { key: keccak256(B256::from(s1)), value: a },
+            )
+            .expect("put s1");
+            tx.put::<tables::HashedStorages>(
+                ha,
+                StorageEntry { key: keccak256(B256::from(s2)), value: b },
+            )
+            .expect("put s2");
+            tx.commit().expect("commit");
+        }
+        let db = factory.provider().expect("provider");
+        let provider = LatestStateProviderRef::new(&db);
+
+        // Root the conditional was admitted against (empty overlay → committed root).
+        let committed_root = provider.storage_root(addr, HashedStorage::default()).expect("root");
+        let cond = cond_root(addr, committed_root);
+
+        // In-block rewrite of s1 only; s2 is untouched and absent from the cache.
+        let mut state = state_with_pending(addr, &[(s1, a_drift)]);
+        let pending = (&mut state).pending_storage_root(&provider, addr).expect("pending");
+
+        // It MUST equal a merge {s1:a_drift, s2:b} — s2:b retained from committed...
+        let merged_ref = provider
+            .storage_root(
+                addr,
+                HashedStorage::from_plain_storage(
+                    AccountStatus::Loaded,
+                    [(&s1, &a_drift), (&s2, &b)].into_iter(),
+                ),
+            )
+            .expect("merged ref");
+        assert_eq!(pending, merged_ref, "overlay must retain the untouched committed slot s2");
+
+        // ...and must NOT equal a replace {s1:a_drift} alone (computed on a fresh,
+        // storage-less account), proving s2 did not get dropped.
+        let fresh = Address::with_last_byte(0x56);
+        let replace_ref = provider
+            .storage_root(
+                fresh,
+                HashedStorage::from_plain_storage(AccountStatus::Loaded, [(&s1, &a_drift)].into_iter()),
+            )
+            .expect("replace ref");
+        assert_ne!(pending, replace_ref, "overlay must not drop the untouched committed slot");
+
+        // Drift is detected and the conditional excluded.
+        assert_ne!(pending, committed_root, "rewriting s1 must move the storage root");
+        assert_eq!(
+            builder_decision(&cond, pending),
+            Some(KnownAccountViolation::Root { address: addr }),
+        );
+
+        // Control: re-writing s1 with its SAME committed value reproduces the committed
+        // root (merge keeps s2:b and the unchanged s1:a) → conditional included.
+        let mut state_same = state_with_pending(addr, &[(s1, a)]);
+        let pending_same = (&mut state_same).pending_storage_root(&provider, addr).expect("same");
+        assert_eq!(pending_same, committed_root, "unchanged s1 + retained s2 == committed root");
+        assert_eq!(builder_decision(&cond, pending_same), None);
+    }
+
+    fn cond_slots(addr: Address, slot: U256, expected: B256) -> TransactionConditional {
+        let mut slots = alloy_primitives::map::HashMap::default();
+        slots.insert(slot, expected);
+        let mut tc = TransactionConditional::default();
+        tc.known_accounts.insert(addr, AccountStorage::Slots(slots));
+        tc
+    }
+
+    // ── Fail-closed decision (TEAO1-206), unit-tested via the extracted
+    //    `recompute_root_hash_roots` so the read-error branch is covered without a
+    //    bespoke erroring `StateProvider`. ────────────────────────────────────────
+
+    #[test]
+    fn recompute_excludes_when_a_root_is_unverifiable() {
+        // Fail-closed: a compute (storage_root) error for a RootHash-watched account
+        // must yield `Unverifiable`, which the builder turns into `mark_invalid`.
+        let a = Address::with_last_byte(1);
+        let cond = cond_root(a, B256::with_last_byte(42));
+        assert_eq!(
+            recompute_root_hash_roots(&cond, |_| Err::<B256, ()>(())),
+            RootHashRecheck::Unverifiable,
+        );
+    }
+
+    #[test]
+    fn recompute_collects_roots_when_all_ok() {
+        let a = Address::with_last_byte(1);
+        let cond = cond_root(a, B256::with_last_byte(42));
+        let root = B256::with_last_byte(7);
+        match recompute_root_hash_roots(&cond, |_| Ok::<B256, ()>(root)) {
+            RootHashRecheck::Roots(roots) => {
+                assert_eq!(roots.len(), 1);
+                assert_eq!(roots.get(&a), Some(&root));
+            }
+            RootHashRecheck::Unverifiable => panic!("expected Roots"),
+        }
+    }
+
+    #[test]
+    fn recompute_ignores_slots_predicates() {
+        // `Slots` predicates are handled by the slot reader; the root recompute must
+        // not call `compute` for them and must not fail-close on them.
+        let a = Address::with_last_byte(1);
+        let cond = cond_slots(a, U256::from(1), B256::with_last_byte(7));
+        let mut called = false;
+        let res = recompute_root_hash_roots(&cond, |_| {
+            called = true;
+            Ok::<B256, ()>(B256::ZERO)
+        });
+        assert!(!called, "compute must not run for Slots predicates");
+        assert_eq!(res, RootHashRecheck::Roots(HashMap::new()));
+    }
+
+    #[test]
+    fn recompute_fail_closes_on_first_root_error_even_with_a_good_one() {
+        // A mixed conditional: one RootHash resolves, another errors. Fail-closed
+        // wins — the whole tx is excluded, never partially trusted.
+        let good = Address::with_last_byte(1);
+        let bad = Address::with_last_byte(2);
+        let mut cond = cond_root(good, B256::with_last_byte(1));
+        cond.known_accounts.insert(bad, AccountStorage::RootHash(B256::with_last_byte(2)));
+        assert_eq!(
+            recompute_root_hash_roots(&cond, |address| {
+                if address == bad { Err::<B256, ()>(()) } else { Ok(B256::with_last_byte(9)) }
+            }),
+            RootHashRecheck::Unverifiable,
+        );
     }
 }
