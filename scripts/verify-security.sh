@@ -89,7 +89,11 @@ fi
 # Stage 3 : Contracts (Tea oracle / TeaWAP / genesis suites)
 # ---------------------------------------------------------------------------
 CB="packages/contracts-bedrock"
-if [ -d "$CB" ] && command -v forge >/dev/null 2>&1; then
+if [ -d "$CB" ] && ! [ -f "$CB/lib/forge-std/src/Vm.sol" ]; then
+  echo; echo "## [3/3] contracts SKIPPED -- forge submodules not initialized"
+  echo "   (run 'git submodule update --init --recursive' to enable; not a branch defect)"
+  record "contract tests (no submodules)" "SKIP"
+elif [ -d "$CB" ] && command -v forge >/dev/null 2>&1; then
   echo; echo "## [3/3] forge test --match-contract '(GasPriceOracle|TeaWAP|L2Genesis)'"
   ( cd "$CB" && forge test --match-contract '(GasPriceOracle|TeaWAP|L2Genesis)' ) \
     > "$LOGD/forge.log" 2>&1; rc=$?
