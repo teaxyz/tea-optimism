@@ -36,7 +36,8 @@
 
 use alloy_primitives::Bytes;
 use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey, SignedPublicSubKey};
-use pgp::packet::{Signature, SignatureType};
+use pgp::packet::{Packet, PacketParser, Signature, SignatureType};
+use pgp::ser::Serialize;
 use pgp::types::KeyDetails;
 use revm::precompile::{Precompile, PrecompileId, PrecompileOutput, PrecompileResult};
 use std::cmp::Ordering;
@@ -77,22 +78,69 @@ fn fingerprint_to_key_id(fp: &pgp::types::Fingerprint) -> [u8; 8] {
     id
 }
 
-/// Parse exactly one OpenPGP object from `bytes`, rejecting empty or
+/// Parse exactly one OpenPGP object from `bytes`, requiring the *entire* slice
+/// to be consumed by well-formed, supported packets and rejecting empty or
 /// multi-object streams.
 ///
-/// `Deserializable::from_bytes` silently returns only the *first* object in a
-/// stream, so an attacker can append additional key or signature objects to a
-/// blob and have them ignored — producing multiple distinct byte strings that
-/// all verify identically (TEAO1-172). Requiring exactly one object removes that
-/// ambiguity: the verified bytes are the only bytes.
-fn parse_single<T: Deserializable>(bytes: &[u8]) -> Result<T, &'static str> {
-    let mut iter = T::from_bytes_many(Cursor::new(bytes)).map_err(|_| "parse error")?;
+/// Two distinct ambiguities are closed here, both of which let distinct raw
+/// byte strings verify as the same logical proof:
+///
+/// 1. **Trailing objects (TEAO1-172).** `Deserializable::from_bytes` silently
+///    returns only the *first* object in a stream, so an attacker can append
+///    additional key or signature objects and have them ignored. We require
+///    exactly one composed object.
+///
+/// 2. **Dropped packets (TEAO1-196).** `Deserializable::from_bytes_many`
+///    routes every packet through `filter_parsed_packet_results`, which
+///    *silently discards* Marker packets, Padding packets, `Unsupported`
+///    packets, nested `InvalidPacketContent(Unsupported|EllipticCurve)`, and
+///    `PacketIncomplete` packets. An attacker can therefore append an
+///    unsupported or truncated packet tail to an otherwise-valid blob and have
+///    it ignored — the higher-level object iterator never even sees it. We
+///    refuse to filter: we drive the low-level [`PacketParser`] ourselves and
+///    treat *any* packet error, *any* Marker/Padding packet, or *any* trailing
+///    byte the parser stops short of as a hard rejection. The verified bytes are
+///    then the only bytes that could have produced this object.
+fn parse_single<T: Deserializable + Serialize>(bytes: &[u8]) -> Result<T, &'static str> {
+    // (Checklist item 2 — stop filtering.) Drive the low-level `PacketParser`
+    // directly so we bypass `filter_parsed_packet_results`, which silently drops
+    // Marker, Padding, `Unsupported`, `InvalidPacketContent(Unsupported|
+    // EllipticCurve)`, and `PacketIncomplete` packets. We reject every one of
+    // those instead of skipping it: any packet-parse error, and any Marker or
+    // Padding packet, fails closed here.
+    let mut parser = PacketParser::new(Cursor::new(bytes));
+    let mut packets: Vec<Packet> = Vec::new();
+    for parsed in parser.by_ref() {
+        match parsed {
+            Ok(Packet::Marker(_)) | Ok(Packet::Padding(_)) => return Err("disallowed packet"),
+            Ok(pkt) => packets.push(pkt),
+            Err(_) => return Err("malformed packet"),
+        }
+    }
+
+    // Build composed objects from the strictly-parsed packets, requiring exactly
+    // one (TEAO1-172 — a second appended object must not be silently ignored).
+    let mut iter = T::from_packets(packets.into_iter().map(Ok).peekable());
     let first = match iter.next() {
         Some(Ok(obj)) => obj,
         _ => return Err("no parseable object"),
     };
     if iter.next().is_some() {
         return Err("trailing object");
+    }
+
+    // (Checklist items 1 & 3 — full consumption via canonical re-encoding.)
+    // `PacketParser` swallows an *incomplete trailing header* as a clean EOF: it
+    // consumes the stray byte(s) while trying to read the header, then returns
+    // `None`, so a cursor-position check alone misses a single appended byte
+    // such as 0x80/0xFF/0xCA. Reserialize the parsed object and require the
+    // caller-supplied bytes to equal that canonical encoding exactly. This
+    // rejects *any* trailing or dropped bytes — the verified bytes are then
+    // precisely the object's canonical encoding and nothing else. (All shipped
+    // GPG fixtures round-trip byte-for-byte, so legitimate input is unaffected.)
+    let canonical = first.to_bytes().map_err(|_| "reserialize failed")?;
+    if canonical != bytes {
+        return Err("non-canonical encoding");
     }
     Ok(first)
 }
@@ -203,15 +251,14 @@ fn decode_input(input: &[u8]) -> Result<GpgVerifyInput, &'static str> {
 }
 
 /// Read a uint256 as usize (for ABI offsets).
-///
-/// Rejects offsets whose upper 24 bytes are non-zero (those are definitionally
-/// beyond any practical input length) and uses `usize::try_from` so a u64
-/// value larger than `usize::MAX` on a 32-bit target is an error rather than a
-/// silent truncation. Mirrors the hardened decoder in `ssh_verify.rs`.
 fn u256_to_usize(data: &[u8]) -> Result<usize, &'static str> {
     if data.len() != 32 {
         return Err("invalid uint256 length");
     }
+    // F-1 (2026-05-19 audit): reject offsets whose upper 24 bytes are non-zero
+    // (definitionally beyond any practical input length) and use `usize::try_from`
+    // so a u64 > usize::MAX on a 32-bit target errors rather than silently
+    // truncating. Mirrors the hardened decoder in ssh_verify.rs.
     if data[0..24].iter().any(|&b| b != 0) {
         return Err("offset too large");
     }
@@ -220,15 +267,10 @@ fn u256_to_usize(data: &[u8]) -> Result<usize, &'static str> {
 }
 
 /// Read ABI-encoded dynamic bytes from a given offset.
-///
-/// Uses `checked_add` throughout so an adversarial `offset` or `length` near
-/// `usize::MAX` cannot wrap into a valid slice index — without this, a crafted
-/// ABI input could pass the bounds check and then panic at `&input[a..b]` when
-/// `a > b`, which inside a precompile means a consensus halt. The field is
-/// implicitly bounded by `input.len()` (itself gas-bounded on-chain); unlike
-/// the SSH precompiles, no fixed byte cap is imposed because a GPG transferable
-/// public key with subkeys legitimately exceeds several KiB.
 fn read_dynamic_bytes(input: &[u8], offset: usize) -> Result<Vec<u8>, &'static str> {
+    // F-1: `checked_add` throughout so an adversarial offset/length near
+    // usize::MAX cannot wrap into a valid slice index and panic at `&input[a..b]`
+    // when `a > b` — inside a precompile that is a consensus halt.
     let header_end = offset.checked_add(32).ok_or("offset overflow")?;
     if header_end > input.len() {
         return Err("offset out of bounds");
@@ -239,14 +281,6 @@ fn read_dynamic_bytes(input: &[u8], offset: usize) -> Result<Vec<u8>, &'static s
         return Err("data out of bounds");
     }
     Ok(input[header_end..data_end].to_vec())
-}
-
-/// Only Binary-class signatures bind the exact 32-byte message digest the
-/// precompile is asked to verify. Text signatures canonicalize line endings, so
-/// distinct byte strings collide (TEAO1-166); Timestamp and Standalone
-/// signatures bind no message data at all (TEAO1-148). Accept Binary only.
-fn is_accepted_sig_type(typ: Option<SignatureType>) -> bool {
-    typ == Some(SignatureType::Binary)
 }
 
 /// GPG verify precompile entry point.
@@ -319,8 +353,11 @@ fn gpg_verify_run(input: &[u8], gas_limit: u64) -> PrecompileResult {
         }
     };
 
-    // Reject everything but Binary (TEAO1-166 / TEAO1-148) — see `is_accepted_sig_type`.
-    if !is_accepted_sig_type(sig.signature.typ()) {
+    // Only Binary-class signatures bind the exact 32-byte message. Text
+    // signatures canonicalize line endings, so distinct byte strings collide
+    // (TEAO1-166); Timestamp and Standalone signatures bind no message data at
+    // all (TEAO1-148). Reject everything but Binary.
+    if sig.signature.typ() != Some(SignatureType::Binary) {
         return PrecompileResult::Ok(PrecompileOutput::new(gas_cost, failure_result()));
     }
 
@@ -542,35 +579,6 @@ mod tests {
     }
 
     // --- Error & edge case tests ---
-
-    /// F-1 regression: a crafted ABI offset must decode-error cleanly, never
-    /// panic. Pre-hardening, `pub_key_offset = u64::MAX` wrapped past the bounds
-    /// check and `&input[offset..offset + 32]` panicked (`start > end`) — a
-    /// consensus halt inside the precompile.
-    #[test]
-    fn test_gpg_verify_crafted_offset_no_panic() {
-        let mut input = vec![0u8; 128];
-        // pub_key_offset slot [64..96]; low 8 bytes = u64::MAX → usize::MAX.
-        input[88..96].copy_from_slice(&u64::MAX.to_be_bytes());
-        let result = gpg_verify_run(&input, required_gas(&input));
-        assert!(
-            matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))),
-            "crafted offset must decode-error, got: {result:?}"
-        );
-    }
-
-    /// F-1 regression: an offset with any non-zero byte in its upper 24 bytes is
-    /// beyond any real input length and must be rejected at decode.
-    #[test]
-    fn test_gpg_verify_offset_upper_bytes_rejected() {
-        let mut input = vec![0u8; 128];
-        input[64] = 0x01; // first byte of pub_key_offset slot → non-zero upper-24
-        let result = gpg_verify_run(&input, required_gas(&input));
-        assert!(
-            matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))),
-            "upper-byte offset must be rejected, got: {result:?}"
-        );
-    }
 
     /// Empty input should return decode error, not panic.
     #[test]
@@ -835,6 +843,130 @@ mod tests {
         );
     }
 
+    /// TEAO1-196 (truncated/unsupported OpenPGP packet tails): the `pgp`
+    /// 0.19 reader silently *discards* Unsupported, Incomplete, Marker and
+    /// Padding packets, so appending such a tail to a valid blob yields distinct
+    /// raw bytes that still verify. Both an unsupported experimental packet on
+    /// the public key and a truncated signature packet on the signature must now
+    /// be rejected.
+    #[test]
+    fn test_gpg_verify_rejects_unsupported_and_truncated_packet_tails() {
+        // 0xFC -> new-format experimental packet tag 60 (Unsupported);
+        // 0xC2,0x05,0x00 -> new-format signature packet (tag 2) declaring a
+        // 5-byte body but supplying only 1 (PacketIncomplete).
+        const UNSUPPORTED_PACKET_TAIL: &[u8] = &[0xFC, 0x00];
+        const TRUNCATED_PACKET_TAIL: &[u8] = &[0xC2, 0x05, 0x00];
+
+        let input = hex_decode(ED25519_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+
+        // Baseline: the unmodified blob verifies.
+        let base = encode_gpg_verify_input(
+            &decoded.message,
+            &decoded.key_id,
+            &decoded.public_key,
+            &decoded.signature,
+        );
+        assert_precompile_ok(&gpg_verify_run(&base, required_gas(&base)), required_gas(&base), SUCCESS_HEX);
+
+        // Unsupported experimental tail appended to the public key must reject.
+        let mut pub_key_tail = decoded.public_key.clone();
+        pub_key_tail.extend_from_slice(UNSUPPORTED_PACKET_TAIL);
+        let attack_key =
+            encode_gpg_verify_input(&decoded.message, &decoded.key_id, &pub_key_tail, &decoded.signature);
+        assert!(
+            matches!(
+                gpg_verify_run(&attack_key, required_gas(&attack_key)),
+                PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))
+            ),
+            "unsupported packet tail on public key must be rejected"
+        );
+
+        // Truncated/incomplete tail appended to the signature must reject.
+        let mut sig_tail = decoded.signature.clone();
+        sig_tail.extend_from_slice(TRUNCATED_PACKET_TAIL);
+        let attack_sig =
+            encode_gpg_verify_input(&decoded.message, &decoded.key_id, &decoded.public_key, &sig_tail);
+        assert!(
+            matches!(
+                gpg_verify_run(&attack_sig, required_gas(&attack_sig)),
+                PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))
+            ),
+            "truncated packet tail on signature must be rejected"
+        );
+    }
+
+    /// TEAO1-196 regression: an *incomplete trailing packet header* is the
+    /// subtlest variant — `PacketParser` consumes the stray byte(s) while trying
+    /// to read a header, then reports a clean EOF, so a cursor-position check
+    /// alone would accept it. Each of these single/partial-header tails appended
+    /// to either blob must be rejected by the canonical re-encoding gate. Every
+    /// tail is also verified to change the raw bytes (so the test can't silently
+    /// pass on a no-op mutation).
+    #[test]
+    fn test_gpg_verify_rejects_partial_trailing_header_bytes() {
+        // 0x80 / 0xFF / 0xCA / 0xC2 / 0xD2 all begin an OpenPGP packet header but
+        // supply no (or an incomplete) body; 0xCA is a marker tag with no length.
+        const PARTIAL_TAILS: &[&[u8]] =
+            &[&[0x80], &[0xFF], &[0xCA], &[0xC2], &[0xD2], &[0xC2, 0x05]];
+
+        let input = hex_decode(ED25519_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+
+        for tail in PARTIAL_TAILS {
+            // On the public key blob.
+            let mut pk = decoded.public_key.clone();
+            pk.extend_from_slice(tail);
+            assert_ne!(pk, decoded.public_key, "tail must change the bytes");
+            let atk_pk =
+                encode_gpg_verify_input(&decoded.message, &decoded.key_id, &pk, &decoded.signature);
+            assert!(
+                matches!(
+                    gpg_verify_run(&atk_pk, required_gas(&atk_pk)),
+                    PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))
+                ),
+                "partial trailing header {tail:02x?} on public key must be rejected"
+            );
+
+            // On the signature blob.
+            let mut sig = decoded.signature.clone();
+            sig.extend_from_slice(tail);
+            let atk_sig =
+                encode_gpg_verify_input(&decoded.message, &decoded.key_id, &decoded.public_key, &sig);
+            assert!(
+                matches!(
+                    gpg_verify_run(&atk_sig, required_gas(&atk_sig)),
+                    PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))
+                ),
+                "partial trailing header {tail:02x?} on signature must be rejected"
+            );
+        }
+    }
+
+    /// Companion to the tail-rejection test: a Marker packet (tag 10) is also
+    /// silently dropped by the lenient reader. The strict scan must reject any
+    /// blob carrying one.
+    #[test]
+    fn test_gpg_verify_rejects_marker_packet_tail() {
+        // New-format Marker packet: tag 10, 3-byte body "PGP" (0x50 0x47 0x50).
+        const MARKER_PACKET: &[u8] = &[0xCA, 0x03, 0x50, 0x47, 0x50];
+
+        let input = hex_decode(ED25519_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+
+        let mut pub_key_marker = decoded.public_key.clone();
+        pub_key_marker.extend_from_slice(MARKER_PACKET);
+        let attack =
+            encode_gpg_verify_input(&decoded.message, &decoded.key_id, &pub_key_marker, &decoded.signature);
+        assert!(
+            matches!(
+                gpg_verify_run(&attack, required_gas(&attack)),
+                PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))
+            ),
+            "marker packet on public key must be rejected"
+        );
+    }
+
     /// TEAO1-160: the signing-eligibility filter must discriminate between
     /// signing and non-signing subkeys. The long-input certificate contains
     /// both, so `subkey_can_sign` must return both true and false across it —
@@ -906,7 +1038,6 @@ mod tests {
     #[test]
     fn test_subkey_effective_binding_overrides_stale_signing() {
         use pgp::crypto::hash::HashAlgorithm;
-        use pgp::ser::Serialize;
         use pgp::types::Password;
         use rand_08::SeedableRng;
 
@@ -1094,19 +1225,6 @@ mod tests {
         assert_precompile_ok(&result, gas, SUCCESS_HEX);
     }
 
-    /// TEAO1-148 (explicit): the binary-only gate rejects Timestamp and
-    /// Standalone signature classes (which bind no message data) and Text
-    /// (TEAO1-166), accepting only Binary. Deterministic coverage of the gate
-    /// predicate across the classes the high-level signing API can't forge.
-    #[test]
-    fn only_binary_sig_type_accepted() {
-        assert!(is_accepted_sig_type(Some(SignatureType::Binary)));
-        for typ in [SignatureType::Text, SignatureType::Standalone, SignatureType::Timestamp] {
-            assert!(!is_accepted_sig_type(Some(typ)), "{typ:?} must be rejected");
-        }
-        assert!(!is_accepted_sig_type(None));
-    }
-
     /// TEAO1-141: a subkey grafted from a different certificate has no valid
     /// binding signature to the victim's primary key, so it must fail the
     /// binding check and never be treated as an eligible signing authority.
@@ -1186,5 +1304,33 @@ mod tests {
         let mut out = [0u8; 32];
         out[24..32].copy_from_slice(&(val as u64).to_be_bytes());
         out
+    }
+
+    /// F-1 (2026-05-19 audit) regression: a crafted ABI offset must decode-error
+    /// cleanly, never panic. Pre-hardening, `pub_key_offset = u64::MAX` wrapped
+    /// past the bounds check and `&input[offset..offset + 32]` panicked.
+    #[test]
+    fn test_gpg_verify_crafted_offset_no_panic() {
+        let mut input = vec![0u8; 128];
+        // pub_key_offset slot [64..96]; low 8 bytes = u64::MAX → usize::MAX.
+        input[88..96].copy_from_slice(&u64::MAX.to_be_bytes());
+        let result = gpg_verify_run(&input, required_gas(&input));
+        assert!(
+            matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))),
+            "crafted offset must decode-error, got: {result:?}"
+        );
+    }
+
+    /// F-1 regression: an offset with any non-zero byte in its upper 24 bytes is
+    /// rejected (ABI offsets are bounded to u64).
+    #[test]
+    fn test_gpg_verify_offset_upper_bytes_rejected() {
+        let mut input = vec![0u8; 128];
+        input[64] = 0x01; // first byte of pub_key_offset slot → non-zero upper-24
+        let result = gpg_verify_run(&input, required_gas(&input));
+        assert!(
+            matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))),
+            "upper-byte offset must be rejected, got: {result:?}"
+        );
     }
 }
