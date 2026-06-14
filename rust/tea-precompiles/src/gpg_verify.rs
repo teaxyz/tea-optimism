@@ -34,7 +34,7 @@
 //! existing callers may already trust — a policy change of that magnitude
 //! belongs at the policy layer, not buried in a verification precompile.
 
-use alloy_primitives::{Address, Bytes, address};
+use alloy_primitives::Bytes;
 use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey, SignedPublicSubKey};
 use pgp::packet::{Packet, PacketParser, Signature, SignatureType};
 use pgp::ser::Serialize;
@@ -43,30 +43,17 @@ use revm::precompile::{Precompile, PrecompileId, PrecompileOutput, PrecompileRes
 use std::cmp::Ordering;
 use std::io::Cursor;
 
-/// GPG verify precompile address.
-pub const GPG_VERIFY_ADDRESS: Address = address!("0x0000000000000000000000000000000000000696");
-
-/// Base gas cost for GPG verification.
-pub const GPG_VERIFY_BASE_GAS: u64 = 23_500;
-
-/// Per-byte gas cost above the kink point.
-pub const GPG_VERIFY_GAS_PER_BYTE: u64 = 16;
-
-/// Input length kink point — below this, only base gas is charged.
-pub const GPG_VERIFY_INPUT_LENGTH_KINK: usize = 3264;
+/// Address + gas schedule live in the no_std [`crate::gas`] module so the FPVM
+/// can charge identical gas without linking this crate's crypto. Re-exported
+/// here so internal call sites and the public API are unchanged.
+pub use crate::gas::{
+    GPG_VERIFY_ADDRESS, GPG_VERIFY_BASE_GAS, GPG_VERIFY_GAS_PER_BYTE,
+    GPG_VERIFY_INPUT_LENGTH_KINK, gpg_required_gas as required_gas,
+};
 
 /// Returns the GPG verify precompile for registration.
 pub fn precompile() -> Precompile {
     Precompile::new(PrecompileId::custom("gpg_verify"), GPG_VERIFY_ADDRESS, gpg_verify_run)
-}
-
-/// Calculates the gas required for GPG verification.
-pub fn required_gas(input: &[u8]) -> u64 {
-    if input.len() <= GPG_VERIFY_INPUT_LENGTH_KINK {
-        return GPG_VERIFY_BASE_GAS;
-    }
-    let additional_bytes = input.len() - GPG_VERIFY_INPUT_LENGTH_KINK;
-    GPG_VERIFY_BASE_GAS + GPG_VERIFY_GAS_PER_BYTE * additional_bytes as u64
 }
 
 /// 32-byte result indicating success (1).
@@ -268,22 +255,32 @@ fn u256_to_usize(data: &[u8]) -> Result<usize, &'static str> {
     if data.len() != 32 {
         return Err("invalid uint256 length");
     }
-    // Only use the last 8 bytes (offsets shouldn't be > u64)
+    // F-1 (2026-05-19 audit): reject offsets whose upper 24 bytes are non-zero
+    // (definitionally beyond any practical input length) and use `usize::try_from`
+    // so a u64 > usize::MAX on a 32-bit target errors rather than silently
+    // truncating. Mirrors the hardened decoder in ssh_verify.rs.
+    if data[0..24].iter().any(|&b| b != 0) {
+        return Err("offset too large");
+    }
     let val = u64::from_be_bytes(data[24..32].try_into().map_err(|_| "conversion error")?);
-    Ok(val as usize)
+    usize::try_from(val).map_err(|_| "offset exceeds usize::MAX")
 }
 
 /// Read ABI-encoded dynamic bytes from a given offset.
 fn read_dynamic_bytes(input: &[u8], offset: usize) -> Result<Vec<u8>, &'static str> {
-    if offset + 32 > input.len() {
+    // F-1: `checked_add` throughout so an adversarial offset/length near
+    // usize::MAX cannot wrap into a valid slice index and panic at `&input[a..b]`
+    // when `a > b` — inside a precompile that is a consensus halt.
+    let header_end = offset.checked_add(32).ok_or("offset overflow")?;
+    if header_end > input.len() {
         return Err("offset out of bounds");
     }
-    let length = u256_to_usize(&input[offset..offset + 32])?;
-    let data_start = offset + 32;
-    if data_start + length > input.len() {
+    let length = u256_to_usize(&input[offset..header_end])?;
+    let data_end = header_end.checked_add(length).ok_or("length overflow")?;
+    if data_end > input.len() {
         return Err("data out of bounds");
     }
-    Ok(input[data_start..data_start + length].to_vec())
+    Ok(input[header_end..data_end].to_vec())
 }
 
 /// GPG verify precompile entry point.
@@ -423,7 +420,7 @@ mod tests {
     #[test]
     fn test_gas_calculation_base() {
         assert_eq!(required_gas(&vec![0u8; GPG_VERIFY_INPUT_LENGTH_KINK]), GPG_VERIFY_BASE_GAS);
-        assert_eq!(required_gas(&vec![0u8; 100]), GPG_VERIFY_BASE_GAS);
+        assert_eq!(required_gas(&[0u8; 100]), GPG_VERIFY_BASE_GAS);
     }
 
     #[test]
@@ -1282,7 +1279,7 @@ mod tests {
         buf.extend_from_slice(&u256_bytes(128));
 
         // [96..128] offset to signature (128 + 32 + padded_len(publicKey))
-        let pub_key_padded_len = (public_key.len() + 31) / 32 * 32;
+        let pub_key_padded_len = public_key.len().div_ceil(32) * 32;
         let sig_offset = 128 + 32 + pub_key_padded_len;
         buf.extend_from_slice(&u256_bytes(sig_offset));
 
@@ -1295,7 +1292,7 @@ mod tests {
         // signature: length + data (padded to 32 bytes)
         buf.extend_from_slice(&u256_bytes(signature.len()));
         buf.extend_from_slice(signature);
-        let sig_padded_len = (signature.len() + 31) / 32 * 32;
+        let sig_padded_len = signature.len().div_ceil(32) * 32;
         let sig_padding = sig_padded_len - signature.len();
         buf.extend_from_slice(&vec![0u8; sig_padding]);
 
@@ -1307,5 +1304,33 @@ mod tests {
         let mut out = [0u8; 32];
         out[24..32].copy_from_slice(&(val as u64).to_be_bytes());
         out
+    }
+
+    /// F-1 (2026-05-19 audit) regression: a crafted ABI offset must decode-error
+    /// cleanly, never panic. Pre-hardening, `pub_key_offset = u64::MAX` wrapped
+    /// past the bounds check and `&input[offset..offset + 32]` panicked.
+    #[test]
+    fn test_gpg_verify_crafted_offset_no_panic() {
+        let mut input = vec![0u8; 128];
+        // pub_key_offset slot [64..96]; low 8 bytes = u64::MAX → usize::MAX.
+        input[88..96].copy_from_slice(&u64::MAX.to_be_bytes());
+        let result = gpg_verify_run(&input, required_gas(&input));
+        assert!(
+            matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))),
+            "crafted offset must decode-error, got: {result:?}"
+        );
+    }
+
+    /// F-1 regression: an offset with any non-zero byte in its upper 24 bytes is
+    /// rejected (ABI offsets are bounded to u64).
+    #[test]
+    fn test_gpg_verify_offset_upper_bytes_rejected() {
+        let mut input = vec![0u8; 128];
+        input[64] = 0x01; // first byte of pub_key_offset slot → non-zero upper-24
+        let result = gpg_verify_run(&input, required_gas(&input));
+        assert!(
+            matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))),
+            "upper-byte offset must be rejected, got: {result:?}"
+        );
     }
 }

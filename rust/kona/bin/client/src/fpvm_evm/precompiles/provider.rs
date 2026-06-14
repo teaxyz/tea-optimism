@@ -3,6 +3,7 @@
 use crate::fpvm_evm::precompiles::{
     ecrecover::ECRECOVER_ADDR, kzg_point_eval::KZG_POINT_EVAL_ADDR,
 };
+use tea_precompiles::gas::{GPG_VERIFY_ADDRESS, SSH_VERIFY_ADDRESS, SSHSIG_VERIFY_ADDRESS};
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use alloy_primitives::{Address, Bytes};
 use kona_preimage::{HintWriterClient, PreimageOracleClient};
@@ -150,14 +151,28 @@ where
 
     #[inline]
     fn warm_addresses(&self) -> Box<impl Iterator<Item = Address>> {
-        self.inner.warm_addresses()
+        // The Tea precompiles are not in the inner OP precompile set, but the EL
+        // warm-loads them (they're in TeaEvmFactory's set), so include them here
+        // to keep EIP-2929 access cost identical between the EL and the proof.
+        Box::new(self.inner.warm_addresses().chain(TEA_PRECOMPILE_ADDRESSES))
     }
 
     #[inline]
     fn contains(&self, address: &Address) -> bool {
-        self.inner.contains(address)
+        self.inner.contains(address) || TEA_PRECOMPILE_ADDRESSES.contains(address)
     }
 }
+
+/// Tea's custom verification precompiles (`0x0696`-`0x0698`).
+///
+/// `tea-reth`'s `TeaEvmFactory` registers these on the EL for *every* spec, so
+/// the FPVM must too — both as accelerated precompiles (so calls execute) and in
+/// [`OpFpvmPrecompiles::contains`] / [`OpFpvmPrecompiles::warm_addresses`] (so
+/// EIP-2929 access cost matches: these addresses are warm-loaded on the EL
+/// because they're in its precompile set, but they are *not* in the FPVM's inner
+/// OP precompile set). Missing either would diverge the EL from the proof.
+const TEA_PRECOMPILE_ADDRESSES: [Address; 3] =
+    [GPG_VERIFY_ADDRESS, SSH_VERIFY_ADDRESS, SSHSIG_VERIFY_ADDRESS];
 
 /// A precompile function that can be accelerated by the FPVM.
 type AcceleratedPrecompileFn<H, O> = fn(&[u8], u64, &H, &O) -> PrecompileResult;
@@ -188,6 +203,16 @@ where
         AcceleratedPrecompile::new(
             bn254::pair::ADDRESS,
             super::bn128_pair::fpvm_bn128_pair::<H, O>,
+        ),
+        // Tea custom verification precompiles (0x0696-0x0698). Added to the
+        // bedrock base so they are present in every spec, mirroring tea-reth's
+        // TeaEvmFactory which registers them unconditionally. The crypto runs on
+        // the host; these stubs hint + read the result via the preimage oracle.
+        AcceleratedPrecompile::new(GPG_VERIFY_ADDRESS, super::gpg_verify::fpvm_gpg_verify::<H, O>),
+        AcceleratedPrecompile::new(SSH_VERIFY_ADDRESS, super::ssh_verify::fpvm_ssh_verify::<H, O>),
+        AcceleratedPrecompile::new(
+            SSHSIG_VERIFY_ADDRESS,
+            super::ssh_sig_verify::fpvm_ssh_sig_verify::<H, O>,
         ),
     ]
 }

@@ -1,0 +1,57 @@
+[package]
+name = "tea-precompiles"
+description = "Tea L2 verification precompiles (0x0696 GPG, 0x0697 SSH, 0x0698 SSHSIG). Shared by tea-reth (EL) and kona-host (FPVM accelerated-precompile host) so the EL and fault proof cannot drift."
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Always available (incl. no_std): the gas schedule + addresses the FPVM needs.
+alloy-primitives = { workspace = true, default-features = false }
+
+# `std` only: the crypto. The no_std FPVM client links this crate with
+# default-features = false and pulls in none of these.
+# revm precompile types (Precompile / PrecompileId / PrecompileOutput / PrecompileResult)
+revm = { workspace = true, optional = true }
+pgp = { version = "0.19", optional = true }
+ed25519-dalek = { version = "2", default-features = false, features = ["std"], optional = true }
+rsa = { version = "0.9", default-features = false, features = ["std"], optional = true }
+sha2 = { workspace = true, optional = true }
+signature = { version = "2", default-features = false, optional = true }
+# NIST-curve ECDSA for ecdsa-sha2-nistp{256,384,521} SSH keys (RFC 5656).
+# All three pull ecdsa 0.16 + signature 2.x — same versions rsa 0.9 / ed25519-dalek 2
+# already pull, so no version-pin conflicts. `std` is needed for the verifier
+# error type to implement std::error::Error (matches rsa's `std` feature gate).
+# `arithmetic` is what unlocks SEC1 point parsing + low-S `normalize_s`; on
+# p521 the synchronous `Signer::sign` impl is also gated behind `getrandom`
+# (used only by the test-harness keygen helpers, but needs to be in the
+# top-level `dependencies` block since `dev-dependencies` cannot enable
+# features on a non-dev dep).
+p256 = { version = "0.13", default-features = false, features = ["std", "ecdsa", "arithmetic"], optional = true }
+p384 = { version = "0.13", default-features = false, features = ["std", "ecdsa", "arithmetic"], optional = true }
+p521 = { version = "0.13", default-features = false, features = ["std", "ecdsa", "arithmetic", "getrandom"], optional = true }
+
+[features]
+default = ["std"]
+# Enables the actual signature-verification precompiles. Off => only `gas`
+# (the no_std slice the FPVM links). On => the full crypto for the EL + host.
+std = [
+    "alloy-primitives/std",
+    "dep:revm",
+    "dep:pgp",
+    "dep:ed25519-dalek",
+    "dep:rsa",
+    "dep:sha2",
+    "dep:signature",
+    "dep:p256",
+    "dep:p384",
+    "dep:p521",
+]
+
+[dev-dependencies]
+hex = "0.4.3"
+# rand 0.8 (matches rand_core 0.6 — what rsa 0.9 accepts as the CryptoRng
+# parameter for RsaPrivateKey::new). Used in tests to keygen + sign at runtime
+# so we can exercise verify_rsa with realistic RSA-4096 keys end-to-end.
+rand_08 = { workspace = true }
