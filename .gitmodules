@@ -41,3 +41,6 @@
 [submodule "rollup-boost"]
 	path = rollup-boost
 	url = https://github.com/flashbots/rollup-boost
+[submodule "packages/contracts-bedrock/lib/tea-cgt-bridge"]
+	path = packages/contracts-bedrock/lib/tea-cgt-bridge
+	url = https://github.com/teaxyz/tea-cgt-bridge
