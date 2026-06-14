@@ -3,7 +3,7 @@ use crate::{
     OpAttributes, OpPayloadBuilderAttributes, OpPayloadPrimitives, config::OpBuilderConfig,
     error::OpPayloadBuilderError, payload::OpBuiltPayload,
 };
-use alloy_consensus::{BlockHeader, Transaction, Typed2718};
+use alloy_consensus::{BlockHeader, Transaction, Typed2718, conditional::BlockConditionalAttributes};
 use alloy_evm::Evm as AlloyEvm;
 use alloy_primitives::{B256, U256};
 use alloy_rpc_types_debug::ExecutionWitness;
@@ -23,6 +23,7 @@ use reth_optimism_forks::OpHardforks;
 use reth_optimism_primitives::{L2_TO_L1_MESSAGE_PASSER_ADDRESS, transaction::OpTransaction};
 use reth_optimism_txpool::{
     OpPooledTx,
+    conditional::{MaybeConditionalTransaction, first_known_account_violation},
     estimated_da_size::DataAvailabilitySized,
     interop::{MaybeInteropTransaction, is_valid_interop},
 };
@@ -39,6 +40,9 @@ use reth_revm::{
 use reth_storage_api::{StateProvider, StateProviderFactory, errors::ProviderError};
 use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, TransactionPool};
 use revm::context::{Block, BlockEnv};
+// Anonymous import: brings revm's `Database::storage` into method scope for the
+// TEAO1-167 conditional re-check without shadowing the `Database` bound name.
+use revm::Database as _;
 use std::{marker::PhantomData, sync::Arc};
 use tracing::{debug, trace, warn};
 
@@ -689,6 +693,9 @@ where
 
         while let Some(tx) = best_txs.next(()) {
             let interop = tx.interop_deadline();
+            // Captured before `into_consensus()` drops the pooled wrapper; re-checked
+            // against the pending build state just before execution (TEAO1-167).
+            let conditional = tx.conditional().cloned();
             let tx_da_size = tx.estimated_da_size();
             let tx = tx.into_consensus();
 
@@ -733,6 +740,52 @@ where
             // check if the job was cancelled, if so we can exit early
             if self.cancel.is_cancelled() {
                 return Ok(Some(()));
+            }
+
+            // Re-check the conditional's block-attribute ceilings (`blockNumberMax`
+            // / `timestampMax`) against the candidate block being built, immediately
+            // before inclusion. The maintenance task only evicts expired conditionals
+            // on a post-commit `Commit` notification, so there is a window where the
+            // next block is built (e.g. at T+2) before any eviction fires for a tx
+            // whose `timestampMax`/`blockNumberMax` already expired (e.g. T+1). Use
+            // the values of the block BEING BUILT — not the parent head — which is the
+            // whole point of the finding. (Companion to the TEAO1-167 re-check below.)
+            if let Some(cond) = &conditional {
+                let block = builder.evm_mut().block();
+                let block_attr = BlockConditionalAttributes {
+                    number: block.number().saturating_to(),
+                    timestamp: block.timestamp().saturating_to(),
+                };
+                if cond.has_exceeded_block_attributes(&block_attr) {
+                    trace!(target: "payload_builder", ?tx, "skipping conditional tx whose blockNumberMax/timestampMax expired for the candidate block");
+                    best_txs.mark_invalid(tx.signer(), tx.nonce());
+                    continue;
+                }
+            }
+
+            // TEAO1-167: re-validate the conditional's `knownAccounts` against the
+            // state this block actually executes on, immediately before inclusion.
+            // The head's L1-attributes deposit (executed above) refreshes the
+            // GasPriceOracle TEA/ETH ratio, so a tx conditioned on that slot must be
+            // re-checked here or it could execute under a different multiplier than it
+            // required. `Slots` are read from the builder's pending DB; `RootHash`
+            // predicates have no trie here and are enforced at admission + head
+            // eviction. Fail-open on a read error — never drop an includable tx.
+            if let Some(cond) = &conditional {
+                let db = builder.evm_mut().db_mut();
+                let violated = matches!(
+                    first_known_account_violation(
+                        cond,
+                        |address, slot| db.storage(address, slot),
+                        |_address| Ok(None),
+                    ),
+                    Ok(Some(_))
+                );
+                if violated {
+                    trace!(target: "payload_builder", ?tx, "skipping conditional tx whose knownAccounts no longer hold (TEAO1-167)");
+                    best_txs.mark_invalid(tx.signer(), tx.nonce());
+                    continue;
+                }
             }
 
             let gas_used = match builder.execute_transaction(tx.clone()) {

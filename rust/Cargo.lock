@@ -5752,6 +5752,7 @@ dependencies = [
  "alloy-eips",
  "alloy-evm",
  "alloy-op-evm",
+ "alloy-op-hardforks",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-engine",
@@ -11844,6 +11845,7 @@ dependencies = [
  "futures",
  "futures-util",
  "humantime",
+ "jsonrpsee-types",
  "op-alloy-consensus",
  "op-alloy-network",
  "op-alloy-rpc-types-engine",
@@ -11879,6 +11881,7 @@ dependencies = [
  "reth-rpc",
  "reth-rpc-api",
  "reth-rpc-engine-api",
+ "reth-rpc-eth-api",
  "reth-rpc-eth-types",
  "reth-rpc-server-types",
  "reth-stages-types",
@@ -11890,6 +11893,7 @@ dependencies = [
  "revm",
  "serde",
  "serde_json",
+ "tea-l1-cost",
  "tokio",
  "tracing",
  "url",
@@ -11906,12 +11910,14 @@ dependencies = [
  "alloy-rlp",
  "alloy-rpc-types-debug",
  "alloy-rpc-types-engine",
+ "alloy-rpc-types-eth",
  "derive_more",
  "either",
  "op-alloy-consensus",
  "op-alloy-rpc-types-engine",
  "reth-basic-payload-builder",
  "reth-chainspec",
+ "reth-db-api",
  "reth-evm",
  "reth-execution-types",
  "reth-optimism-evm",
@@ -11924,9 +11930,11 @@ dependencies = [
  "reth-payload-util",
  "reth-payload-validator",
  "reth-primitives-traits",
+ "reth-provider",
  "reth-revm",
  "reth-storage-api",
  "reth-transaction-pool",
+ "reth-trie-common",
  "revm",
  "serde",
  "sha2",
@@ -12028,6 +12036,7 @@ dependencies = [
  "serde_json",
  "strum",
  "tea-l1-cost",
+ "tea-trace-ctx",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -14775,12 +14784,21 @@ dependencies = [
  "reth-optimism-chainspec",
  "reth-optimism-cli",
  "reth-optimism-forks",
+ "reth-optimism-node",
  "revm",
  "rsa",
  "sha2",
  "signature",
  "tea-l1-cost",
+ "tea-trace-ctx",
  "tracing",
+]
+
+[[package]]
+name = "tea-trace-ctx"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
 ]
 
 [[package]]

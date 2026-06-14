@@ -51,6 +51,11 @@ members = [
   # Tea L1 cost (no_std; shared between tea-reth and kona FPVM)
   "tea-l1-cost/",
 
+  # Tea trace context (std; per-thread parent-oracle handoff for trace/replay, TEAO1-178)
+  "tea-trace-ctx/",
+  # Tea precompiles (std; shared between tea-reth EL and kona-host FPVM accelerator)
+  "tea-precompiles/",
+
   # Alloy OP EVM
   "alloy-op-evm/",
 
@@ -285,6 +290,8 @@ kona-macros = { path = "kona/crates/utilities/macros", version = "0.1.2", defaul
 
 # ==================== TEA INTERNAL CRATES ====================
 tea-l1-cost = { path = "tea-l1-cost", version = "0.1.0", default-features = false }
+tea-trace-ctx = { path = "tea-trace-ctx", version = "0.1.0" }
+tea-precompiles = { path = "tea-precompiles", version = "0.1.0", default-features = false }
 
 # ==================== OP-RETH INTERNAL CRATES ====================
 op-reth = { path = "op-reth/bin/" }

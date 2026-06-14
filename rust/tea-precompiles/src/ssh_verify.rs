@@ -34,22 +34,18 @@
 //! [`crate::precompiles::ssh_common`] so this precompile and `0x0698` share a
 //! single audited implementation.
 
-use alloy_primitives::{Address, Bytes, address};
+use alloy_primitives::Bytes;
 use revm::precompile::{Precompile, PrecompileId, PrecompileOutput, PrecompileResult};
 
 use super::ssh_common::{read_ssh_string, verify_ssh_ecdsa, verify_ssh_ed25519, verify_ssh_rsa};
 
-/// SSH verify precompile address.
-pub const SSH_VERIFY_ADDRESS: Address = address!("0x0000000000000000000000000000000000000697");
-
-/// Base gas cost for SSH verification.
-pub const SSH_VERIFY_BASE_GAS: u64 = 23_500;
-
-/// Per-byte gas cost above the kink point.
-pub const SSH_VERIFY_GAS_PER_BYTE: u64 = 16;
-
-/// Input length kink point — below this, only base gas is charged.
-pub const SSH_VERIFY_INPUT_LENGTH_KINK: usize = 3264;
+/// Address + gas schedule live in the no_std [`crate::gas`] module so the FPVM
+/// can charge identical gas without linking this crate's crypto. Re-exported
+/// here so internal call sites and the public API are unchanged.
+pub use crate::gas::{
+    SSH_VERIFY_ADDRESS, SSH_VERIFY_BASE_GAS, SSH_VERIFY_GAS_PER_BYTE,
+    SSH_VERIFY_INPUT_LENGTH_KINK, ssh_required_gas as required_gas,
+};
 
 /// Maximum SSH wire-format public key blob size in bytes.
 ///
@@ -69,21 +65,6 @@ pub const MAX_SIGNATURE_BYTES: usize = 1024;
 /// Returns the SSH verify precompile for registration.
 pub fn precompile() -> Precompile {
     Precompile::new(PrecompileId::custom("ssh_verify"), SSH_VERIFY_ADDRESS, ssh_verify_run)
-}
-
-/// Calculates the gas required for SSH verification.
-///
-/// Uses saturating arithmetic so that an astronomically-large `input.len()`
-/// (which would only ever appear in a fuzz / property-test setting — real
-/// EVM calldata is bounded by quadratic memory expansion gas) cannot wrap
-/// the result and undercharge.
-pub fn required_gas(input: &[u8]) -> u64 {
-    if input.len() <= SSH_VERIFY_INPUT_LENGTH_KINK {
-        return SSH_VERIFY_BASE_GAS;
-    }
-    let additional_bytes = input.len() - SSH_VERIFY_INPUT_LENGTH_KINK;
-    SSH_VERIFY_BASE_GAS
-        .saturating_add(SSH_VERIFY_GAS_PER_BYTE.saturating_mul(additional_bytes as u64))
 }
 
 /// 32-byte result indicating success (1).
@@ -236,7 +217,7 @@ fn run_verification(public_key: &[u8], signature: &[u8], message: &[u8]) -> bool
         b"ecdsa-sha2-nistp256"
         | b"ecdsa-sha2-nistp384"
         | b"ecdsa-sha2-nistp521" => {
-            verify_ssh_ecdsa(public_key, key_offset, message, sig_algo, sig_blob)
+            verify_ssh_ecdsa(key_type, public_key, key_offset, message, sig_algo, sig_blob)
         }
         _ => false,
     }
@@ -280,7 +261,7 @@ mod tests {
     #[test]
     fn test_gas_calculation_base() {
         assert_eq!(required_gas(&vec![0u8; SSH_VERIFY_INPUT_LENGTH_KINK]), SSH_VERIFY_BASE_GAS);
-        assert_eq!(required_gas(&vec![0u8; 100]), SSH_VERIFY_BASE_GAS);
+        assert_eq!(required_gas(&[0u8; 100]), SSH_VERIFY_BASE_GAS);
         assert_eq!(required_gas(&[]), SSH_VERIFY_BASE_GAS);
     }
 
@@ -594,6 +575,41 @@ mod tests {
         assert_precompile_ok(&result, SSH_VERIFY_BASE_GAS, FAILURE_HEX);
     }
 
+    /// Encoding-malleability guard (sibling of the GPG truncated-tail finding):
+    /// the SSH wire-format parsers must consume the *entire* pubkey and signature
+    /// blobs, so appending any trailing byte to an otherwise-valid blob must flip
+    /// the result to failure. Unlike the `pgp` crate, `ssh_common` has no lenient
+    /// packet filter that could silently drop the tail; this test pins that.
+    #[test]
+    fn test_ssh_verify_rejects_trailing_bytes_on_blobs() {
+        let input = hex_decode(ED25519_INPUT);
+        let decoded = decode_input(&input).expect("decode ok");
+
+        // Baseline: the unmodified blobs verify.
+        let base = encode_ssh_verify_input(&decoded.message, &decoded.public_key, &decoded.signature);
+        assert_precompile_ok(&ssh_verify_run(&base, required_gas(&base)), required_gas(&base), SUCCESS_HEX);
+
+        // One trailing byte on the public key blob must be rejected.
+        let mut pk_tail = decoded.public_key.clone();
+        pk_tail.push(0x00);
+        let attack_pk = encode_ssh_verify_input(&decoded.message, &pk_tail, &decoded.signature);
+        assert_precompile_ok(
+            &ssh_verify_run(&attack_pk, required_gas(&attack_pk)),
+            required_gas(&attack_pk),
+            FAILURE_HEX,
+        );
+
+        // One trailing byte on the signature blob must be rejected.
+        let mut sig_tail = decoded.signature.clone();
+        sig_tail.push(0x00);
+        let attack_sig = encode_ssh_verify_input(&decoded.message, &decoded.public_key, &sig_tail);
+        assert_precompile_ok(
+            &ssh_verify_run(&attack_sig, required_gas(&attack_sig)),
+            required_gas(&attack_sig),
+            FAILURE_HEX,
+        );
+    }
+
     #[test]
     fn test_ssh_verify_unsupported_algo() {
         // Build an input with key type "ssh-dss" (unsupported)
@@ -762,7 +778,6 @@ mod tests {
         use rand_08::SeedableRng;
         use signature::Signer;
         use p256::ecdsa::{Signature, SigningKey};
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
         let signing_key = SigningKey::random(&mut rng);
@@ -788,7 +803,6 @@ mod tests {
         use rand_08::SeedableRng;
         use signature::Signer;
         use p384::ecdsa::{Signature, SigningKey};
-        use p384::elliptic_curve::sec1::ToEncodedPoint;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
         let signing_key = SigningKey::random(&mut rng);
@@ -814,7 +828,6 @@ mod tests {
         use rand_08::SeedableRng;
         use signature::Signer;
         use p521::ecdsa::{Signature, SigningKey, VerifyingKey};
-        use p521::elliptic_curve::sec1::ToEncodedPoint;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
         let signing_key = SigningKey::random(&mut rng);
@@ -840,7 +853,6 @@ mod tests {
         use rand_08::SeedableRng;
         use signature::Signer;
         use p256::ecdsa::{Signature, SigningKey};
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
         let signing_key = SigningKey::random(&mut rng);
@@ -881,7 +893,7 @@ mod tests {
         buf.extend_from_slice(&u256_bytes(96));
 
         // [64..96] offset to signature
-        let pub_key_padded_len = (public_key.len() + 31) / 32 * 32;
+        let pub_key_padded_len = public_key.len().div_ceil(32) * 32;
         let sig_offset = 96 + 32 + pub_key_padded_len;
         buf.extend_from_slice(&u256_bytes(sig_offset));
 
@@ -894,7 +906,7 @@ mod tests {
         // signature: length + data (padded to 32 bytes)
         buf.extend_from_slice(&u256_bytes(signature.len()));
         buf.extend_from_slice(signature);
-        let sig_padded_len = (signature.len() + 31) / 32 * 32;
+        let sig_padded_len = signature.len().div_ceil(32) * 32;
         let sig_padding = sig_padded_len - signature.len();
         buf.extend_from_slice(&vec![0u8; sig_padding]);
 

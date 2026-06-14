@@ -125,6 +125,13 @@ pub enum TxConditionalErr {
     /// Thrown when the conditional's storage root doesn't match the latest state's root.
     #[error("storage root mismatch")]
     StorageRootMismatch,
+    /// Thrown when the conditional carries a `knownAccounts` storage-root
+    /// (`AccountStorage::RootHash`) predicate, which the payload builder cannot
+    /// honor at inclusion time (it runs against a bare revm `Database` with no
+    /// storage trie). Rejected at admission rather than silently bypassing
+    /// inclusion-time enforcement (TEAO1-167 follow-up).
+    #[error("knownAccounts storage-root (RootHash) conditions are not supported")]
+    RootHashUnsupported,
 }
 
 impl TxConditionalErr {
