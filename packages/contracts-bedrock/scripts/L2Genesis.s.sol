@@ -252,7 +252,7 @@ contract L2Genesis is Script {
         setWETH(); // 6: WETH (not behind a proxy)
         setL2CrossDomainMessenger(_input.l1CrossDomainMessengerProxy); // 7
         // 8,9,A,B,C,D,E: legacy, not used in OP-Stack.
-        setGasPriceOracle(); // f
+        setGasPriceOracle(_input.useCustomGasToken); // f
         setL2StandardBridge(_input.l1StandardBridgeProxy); // 10
         setSequencerFeeVault(_input); // 11
         setOptimismMintableERC20Factory(); // 12
@@ -421,8 +421,19 @@ contract L2Genesis is Script {
     }
 
     /// @notice This predeploy is following the safety invariant #1.
-    function setGasPriceOracle() internal {
-        _setImplementationCode(Predeploys.GAS_PRICE_ORACLE);
+    /// @notice TEAO1-165: install Tea's cached-price `GasPriceOracle` only on custom-gas-token
+    ///         (CGT) chains. Standard (non-CGT) chains get the upstream `GasPriceOracleStandard`,
+    ///         whose L1 fee is denominated in ETH and needs no `updateGasTokenPriceRatio` / price
+    ///         slot — so the TEA price machinery never rides onto a chain whose plain `L1Block`
+    ///         never forwards the updater and leaves the cached slot permanently unwritable.
+    function setGasPriceOracle(bool _useCustomGasToken) internal {
+        if (_useCustomGasToken) {
+            _setImplementationCode(Predeploys.GAS_PRICE_ORACLE);
+        } else {
+            // Etch the standard OP oracle at the GasPriceOracle predeploy namespace.
+            address impl = Predeploys.predeployToCodeNamespace(Predeploys.GAS_PRICE_ORACLE);
+            vm.etch(impl, vm.getDeployedCode("GasPriceOracleStandard.sol:GasPriceOracleStandard"));
+        }
     }
 
     /// @notice This predeploy is following the safety invariant #1.

@@ -343,3 +343,33 @@ fn test_evm_factory_packed_slot_with_timestamp() {
     let expected_price = U256::from(999u64) * tea_reth::l1_cost::WAD;
     assert_eq!(numerator, expected_price, "should extract price ignoring timestamp");
 }
+
+/// TEAO1-132: on a non-Tea chain the factory must NOT install the TEA/ETH
+/// multiplier — even with a non-zero oracle slot seeded — so generic OP replay
+/// stays byte-identical to canonical Optimism. The multiplier must be `None`.
+#[test]
+fn test_multiplier_none_off_tea_chain() {
+    let mut db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
+    db.insert_account_storage(
+        tea_reth::l1_cost::GAS_PRICE_ORACLE_ADDR,
+        tea_reth::l1_cost::LATEST_PRICE_RATIO_SLOT_U256,
+        U256::from(999u64) * tea_reth::l1_cost::WAD,
+    )
+    .expect("insert storage");
+
+    // Ethereum mainnet (chain id 1) — not a Tea chain.
+    let env = EvmEnv {
+        cfg_env: CfgEnv::new()
+            .with_chain_id(1)
+            .with_spec_and_mainnet_gas_params(OpSpecId::FJORD),
+        ..Default::default()
+    };
+    let factory = tea_reth::evm::TeaEvmFactory;
+    let evm = factory.create_evm(db, env);
+
+    assert_eq!(
+        evm.ctx().chain.l1_cost_multiplier,
+        None,
+        "off-Tea chains must not receive the TEA multiplier (TEAO1-132)"
+    );
+}

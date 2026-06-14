@@ -1043,11 +1043,32 @@ where
             ctx.task_executor().spawn_critical_task(
                 "Op txpool conditional maintenance task",
                 reth_optimism_txpool::maintain::maintain_transaction_pool_conditional_future(
+                    ctx.provider().clone(),
                     transaction_pool.clone(),
                     chain_events,
                 ),
             );
             debug!(target: "reth::cli", "Spawned Op conditional txpool maintenance task");
+        }
+
+        // TEAO1-151: on Tea chains, evict pooled txs that can no longer pay the
+        // Tea-multiplier-scaled L1 data fee once a new head changes the fee state.
+        // reth's pool only re-buckets pooled txs by their static `cost` (which
+        // excludes the OP/Tea L1 add-on) on a new head — it never re-runs the
+        // validator — so without this a tx admitted while the TEA/ETH rate was low
+        // lingers in `pending` after the rate rises. Off-Tea this is not spawned,
+        // so generic OP behavior is unchanged.
+        if tea_l1_cost::is_tea(ctx.chain_spec().chain().id()) {
+            let chain_events = ctx.provider().canonical_state_stream();
+            ctx.task_executor().spawn_critical_task(
+                "Tea txpool L1-fee eviction task",
+                reth_optimism_txpool::maintain::maintain_transaction_pool_tea_l1_fee_eviction_future(
+                    ctx.provider().clone(),
+                    transaction_pool.clone(),
+                    chain_events,
+                ),
+            );
+            debug!(target: "reth::cli", "Spawned Tea txpool L1-fee eviction task");
         }
 
         Ok(transaction_pool)

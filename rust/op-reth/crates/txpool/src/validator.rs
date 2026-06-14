@@ -2,7 +2,7 @@ use crate::{InvalidCrossTx, OpPooledTx, supervisor::SupervisorClient};
 use alloy_consensus::{BlockHeader, Transaction};
 use op_revm::L1BlockInfo;
 use parking_lot::RwLock;
-use reth_chainspec::ChainSpecProvider;
+use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_evm::ConfigureEvm;
 use reth_optimism_evm::RethL1BlockInfo;
 use reth_optimism_forks::OpHardforks;
@@ -215,6 +215,25 @@ where
         self.apply_op_checks(outcome)
     }
 
+    /// Scale a raw L1 data fee by the chain's TEA/ETH multiplier read from the
+    /// GasPriceOracle price-ratio slot — the same `tea_l1_cost` math and `is_tea`
+    /// chain gate the EVM uses for `l1_cost_multiplier`. Off-Tea chains and any
+    /// state-read miss fall back to the unscaled cost, so the pool's affordability
+    /// check stays in lockstep with what the EL charges at inclusion.
+    /// TEAO1-175 / 186 / 151.
+    fn tea_scale_l1_cost(&self, raw_l1_cost: alloy_primitives::U256) -> alloy_primitives::U256 {
+        if !tea_l1_cost::is_tea(self.chain_spec().chain().id()) {
+            return raw_l1_cost;
+        }
+        let Ok(state) = self.client().latest() else { return raw_l1_cost };
+        let raw = state
+            .storage(tea_l1_cost::GAS_PRICE_ORACLE_ADDR, tea_l1_cost::LATEST_PRICE_RATIO_SLOT)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        scale_l1_cost_by_oracle(raw_l1_cost, raw)
+    }
+
     /// Performs the necessary opstack specific checks based on top of the regular eth outcome.
     fn apply_op_checks(
         &self,
@@ -249,6 +268,10 @@ where
                     return TransactionValidationOutcome::Error(*valid_tx.hash(), Box::new(err));
                 }
             };
+            // TEA: scale the raw L1 data fee by the GasPriceOracle TEA/ETH multiplier so the
+            // pool admits a tx only if it can pay what execution will charge at inclusion
+            // (same `tea_l1_cost` math + `is_tea` gate as the EVM). TEAO1-175 / 186 / 151.
+            let cost_addition = self.tea_scale_l1_cost(cost_addition);
             let cost = valid_tx.transaction().cost().saturating_add(cost_addition);
 
             // Checks for max cost
@@ -329,5 +352,59 @@ impl OpForkTracker {
     /// Returns `true` if Interop fork is activated.
     pub(crate) fn is_interop_activated(&self) -> bool {
         self.interop.load(Ordering::Relaxed)
+    }
+}
+
+/// Scale a raw L1 data fee by the TEA/ETH multiplier derived from a GasPriceOracle
+/// price-ratio slot value. Pure (no state/chain access) so the scaling is
+/// unit-testable; mirrors the EVM's `l1_cost_multiplier`, where
+/// [`tea_l1_cost::multiplier_from_oracle_value`] yields `(rate, WAD)` and the
+/// scaled cost is `raw * rate / WAD`.
+///
+/// Shared with the head-driven eviction task (`crate::maintain`) so admission and
+/// eviction scale the L1 cost by the exact same math (TEAO1-151).
+pub(crate) fn scale_l1_cost_by_oracle(
+    raw_l1_cost: alloy_primitives::U256,
+    oracle_slot: alloy_primitives::U256,
+) -> alloy_primitives::U256 {
+    let (rate, denom) = tea_l1_cost::multiplier_from_oracle_value(oracle_slot);
+    raw_l1_cost.saturating_mul(rate) / denom
+}
+
+#[cfg(test)]
+mod tea_tests {
+    use super::scale_l1_cost_by_oracle;
+    use alloy_primitives::U256;
+
+    /// A populated oracle ratio scales the L1 fee by exactly that ratio, matching
+    /// the EVM's `tx_l1_cost * rate / WAD` so the pool admits a tx only if it can
+    /// pay what execution charges (TEAO1-175 / 186 / 151).
+    #[test]
+    fn scales_l1_cost_by_oracle_ratio() {
+        // 3x ratio, raw L1 fee 1000 wei -> 3000 wei.
+        let ratio = U256::from(3u64) * tea_l1_cost::WAD;
+        assert_eq!(
+            scale_l1_cost_by_oracle(U256::from(1000u64), ratio),
+            U256::from(3000u64)
+        );
+    }
+
+    /// A 1x (WAD) ratio is a no-op.
+    #[test]
+    fn unit_ratio_is_noop() {
+        assert_eq!(
+            scale_l1_cost_by_oracle(U256::from(777u64), tea_l1_cost::WAD),
+            U256::from(777u64)
+        );
+    }
+
+    /// An unset (zero) oracle slot falls back to the backup TEA/ETH rate — the
+    /// same fallback the EVM uses, so the pool and execution agree.
+    #[test]
+    fn zero_oracle_uses_backup_rate() {
+        assert_eq!(
+            scale_l1_cost_by_oracle(U256::from(1u64), U256::ZERO),
+            U256::from(tea_l1_cost::BACKUP_TEA_PER_ETH)
+        );
     }
 }

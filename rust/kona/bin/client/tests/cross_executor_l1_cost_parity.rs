@@ -64,6 +64,14 @@ fn seeded_db(
         oracle_slot_value,
     )
     .expect("seed oracle storage");
+    // Custom-gas-token enabled: the TEAO1-165 gate requires the L1Block
+    // isCustomGasToken flag set for either factory to apply the multiplier.
+    db.insert_account_storage(
+        tea_l1_cost::L1_BLOCK_ATTRIBUTES_ADDR,
+        tea_l1_cost::IS_CUSTOM_GAS_TOKEN_SLOT_U256,
+        U256::from(1u64),
+    )
+    .expect("seed cgt flag");
     db
 }
 

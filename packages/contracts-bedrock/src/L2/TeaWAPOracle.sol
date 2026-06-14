@@ -28,14 +28,17 @@ contract TeaWAPOracle {
 
     /// @notice A backup TEA/ETH ratio, in the case that the oracle is not set
     ///         and the fallback price is not set.
+    /// @dev The native gas token is assumed to have 18 decimals (like ETH), so
+    ///      this WAD-scaled constant is the correct multiplier. Cantina TEAO1-138
+    ///      (off-by-10^(18-d) on non-18-decimal tokens) does not apply: Tea only
+    ///      supports 18-decimal gas tokens, and no on-chain decimals source exists
+    ///      to scale against. Must stay in lockstep with
+    ///      `tea_l1_cost::BACKUP_TEA_PER_ETH` (× WAD) on the Rust execution side.
     uint160 public constant BACKUP_TEA_WEI_PER_ETH = 1_500_000e18;
 
     /// @notice The maximum amount of time we will allow failed oracle calls before
     ///         setting the storage value to the fallback.
     uint256 public constant MAX_ORACLE_DOWNTIME = 5 minutes;
-
-    /// @notice One billion (1e9), used for oracle calls and other calculations.
-    uint256 constant GWEI = 1e9;
 
     /// @notice Emitted when the price is updated
     event NewPriceSet(uint160 price);
@@ -84,7 +87,15 @@ contract TeaWAPOracle {
     /// @notice Convert the inputted amount of ETH (18 decimals) to $TEA
     /// @dev amount (18 decimals) * teaPerETH (18 decimals) / 1e18 = teaAmount (18 decimals)
     function convertETHToTea(uint256 amount) external view returns (uint256) {
-        (, uint160 rate) = teaPerETH();
+        // Use the cached price (subject to the 5-minute grace window) — the same
+        // value execution and getL1Fee settle against — rather than the live
+        // teaPerETH(), which flips to the fallback the instant the oracle is
+        // unavailable and would quote a different rate than settlement during
+        // the grace window (TEAO1-185).
+        (, uint160 rate) = getLatestPrice();
+        // An unset cached slot falls back to the backup rate, mirroring the Tea
+        // execution helper's zero-slot fallback (tea_l1_cost::tea_per_wad_eth_or_backup).
+        if (rate == 0) rate = getFallbackPrice();
         return amount * rate / 1e18;
     }
 
@@ -134,13 +145,18 @@ contract TeaWAPOracle {
         uint256 wethReserves = wethT0 ? r0 : r1;
         if (wethReserves < minWethBalance) return (false, fallbackPrice);
 
-        // Call the oracle to get the time weighted price.
+        // Call the oracle for the time-weighted price of a FULL 1e18 of WETH.
         // https://github.com/velodrome-finance/contracts/blob/main/contracts/Pool.sol
         // quote(address tokenIn, uint256 amountIn, uint256 granularity)
+        //
+        // Velodrome's quote() returns integer raw output-token units, so sampling
+        // only 1 gwei of WETH and scaling back up by 1e9 floors away precision on
+        // low-decimal / low-price pools (TEAO1-189). Sampling the full 1e18 yields
+        // the 18-decimal price directly with no quantization and no rescale.
         (success, returndata) = oracle.staticcall(
             abi.encodeWithSignature(
                 "quote(address,uint256,uint256)",
-                weth, GWEI, twapObservations
+                weth, uint256(1e18), twapObservations
             )
         );
 
@@ -149,20 +165,11 @@ contract TeaWAPOracle {
 
         // Return the price, or the fallback price if the price is out of range.
         uint256 price = abi.decode(returndata, (uint256));
-        {
-            // If the price is zero, return the fallback price.
-            if (price == 0) return (false, fallbackPrice);
+        // If the price is zero, return the fallback price.
+        if (price == 0) return (false, fallbackPrice);
+        // If the price is greater than the max uint160, return the fallback price.
+        if (price > type(uint160).max) return (false, fallbackPrice);
 
-            // Price is in GWEI because that was the quote requested.
-            // Multiply by GWEI to convert to 18 decimals (making sure no overflow).
-            uint256 oldPrice = price;
-            unchecked { price = price * GWEI; }
-            if (price / GWEI != oldPrice) return (false, fallbackPrice);
-
-
-            // If the new price is greater than the max uint160, return the fallback price.
-            if (price > type(uint160).max) return (false, fallbackPrice);
-        }
         return (true, uint160(price));
     }
 

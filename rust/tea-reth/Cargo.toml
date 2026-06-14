@@ -17,6 +17,10 @@ reth-op = { workspace = true, features = ["node", "rpc"] }
 reth-optimism-cli.workspace = true
 reth-optimism-forks.workspace = true
 reth-optimism-chainspec.workspace = true
+# TEAO1-152: shared proofs-history launcher (gate + path + preflight init-check +
+# OpProofsExEx / eth_getProof / debug_* RPC install) lives here; tea-reth hands
+# it the TeaExecutorBuilder-configured node builder.
+reth-optimism-node.workspace = true
 
 # revm
 revm.workspace = true
@@ -31,6 +35,10 @@ op-alloy-network.workspace = true
 # tea (shared with kona FPVM — keeps L1-cost constants and exchange-rate
 # arithmetic in one place so EL and FPVM cannot drift)
 tea-l1-cost.workspace = true
+
+# tea (TEAO1-178): per-thread handoff so trace/replay charges the block-start
+# (parent-state) oracle multiplier instead of the post-replay slot value
+tea-trace-ctx.workspace = true
 
 # tea precompiles (GPG/SSH/SSHSIG verify at 0x0696-0x0698). Lives in its own
 # std crate so kona-host's fault-proof accelerator runs the exact same crypto

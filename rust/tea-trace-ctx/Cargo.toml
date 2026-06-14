@@ -1,0 +1,13 @@
+[package]
+name = "tea-trace-ctx"
+description = "TEAO1-178: per-thread handoff of the block-scoped (parent) GasPriceOracle ratio from the RPC trace/replay machinery to the Tea EVM factory."
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-primitives = { workspace = true, default-features = false }

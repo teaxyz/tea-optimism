@@ -50,6 +50,8 @@ pub use reth_optimism_storage::OpStorage;
 
 use op_revm as _;
 use revm as _;
-
-#[cfg(feature = "test-utils")]
+// `reth-db`/`reth-tasks` are pulled in (feature-forwarding + dev/test-utils);
+// reference them so the `unused_crate_dependencies` lint stays quiet in the
+// non-test build now that `proof_history` no longer imports them directly.
+use reth_db as _;
 use reth_tasks as _;

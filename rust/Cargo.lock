@@ -5780,7 +5780,6 @@ dependencies = [
  "sha2",
  "spin 0.10.0",
  "tea-l1-cost",
- "tea-precompiles",
  "tea-reth",
  "thiserror 2.0.18",
  "tokio",
@@ -6055,7 +6054,6 @@ dependencies = [
  "rocksdb",
  "serde",
  "serde_json",
- "tea-precompiles",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -11846,6 +11844,7 @@ dependencies = [
  "futures",
  "futures-util",
  "humantime",
+ "jsonrpsee-types",
  "op-alloy-consensus",
  "op-alloy-network",
  "op-alloy-rpc-types-engine",
@@ -11881,6 +11880,7 @@ dependencies = [
  "reth-rpc",
  "reth-rpc-api",
  "reth-rpc-engine-api",
+ "reth-rpc-eth-api",
  "reth-rpc-eth-types",
  "reth-rpc-server-types",
  "reth-stages-types",
@@ -11892,6 +11892,7 @@ dependencies = [
  "revm",
  "serde",
  "serde_json",
+ "tea-l1-cost",
  "tokio",
  "tracing",
  "url",
@@ -12027,6 +12028,8 @@ dependencies = [
  "serde",
  "serde_json",
  "strum",
+ "tea-l1-cost",
+ "tea-trace-ctx",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -12124,6 +12127,7 @@ dependencies = [
  "reth-storage-api",
  "reth-transaction-pool",
  "serde",
+ "tea-l1-cost",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -14750,24 +14754,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tea-precompiles"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "ed25519-dalek",
- "hex",
- "p256",
- "p384",
- "p521",
- "pgp",
- "rand 0.8.5",
- "revm",
- "rsa",
- "sha2",
- "signature",
-]
-
-[[package]]
 name = "tea-reth"
 version = "0.1.0"
 dependencies = [
@@ -14775,20 +14761,37 @@ dependencies = [
  "alloy-op-evm",
  "alloy-primitives",
  "clap",
+ "ed25519-dalek",
  "eyre",
  "hex",
  "op-alloy-network",
  "op-revm",
+ "p256",
+ "p384",
+ "p521",
+ "pgp",
+ "rand 0.8.5",
  "reth-cli-util",
  "reth-node-builder",
  "reth-op",
  "reth-optimism-chainspec",
  "reth-optimism-cli",
  "reth-optimism-forks",
+ "reth-optimism-node",
  "revm",
+ "rsa",
+ "sha2",
+ "signature",
  "tea-l1-cost",
- "tea-precompiles",
+ "tea-trace-ctx",
  "tracing",
+]
+
+[[package]]
+name = "tea-trace-ctx"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
 ]
 
 [[package]]
