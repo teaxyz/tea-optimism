@@ -22,6 +22,12 @@ use reth_op::{
     },
 };
 use reth_optimism_cli::{Cli, chainspec::OpChainSpecParser};
+// TEAO1-152: the proofs-history stack (gate + path resolution + preflight
+// init-check + ExEx/RPC install) lives in op-reth's `proof_history` module so
+// op-reth's default binary and tea-reth share one implementation. We pass it
+// our fully-configured node builder (TeaExecutorBuilder) and it preserves the
+// executor — see the function's contract.
+use reth_optimism_node::proof_history::launch_node_with_proof_history;
 use tea_reth::evm::TeaEvmFactory;
 use tracing::info;
 
@@ -69,19 +75,19 @@ fn main() {
 
     if let Err(err) =
         Cli::<OpChainSpecParser, RollupArgs>::parse().run(async move |builder, rollup_args| {
-            // TEAO1-152: reject the unsupported proofs-history flag fail-closed
-            // (see `ensure_proofs_history_unsupported`).
-            ensure_proofs_history_unsupported(rollup_args.proofs_history)?;
-
-            let node = OpNode::new(rollup_args);
+            let node = OpNode::new(rollup_args.clone());
 
             info!(target: "tea_reth", "Launching Tea node with custom precompiles");
 
-            let handle = builder
+            let node_builder = builder
                 .with_types::<OpNode>()
                 .with_components(
                     node.components()
-                        // Swap the default OpExecutorBuilder for Tea's custom one
+                        // Swap the default OpExecutorBuilder for Tea's custom one.
+                        // INVARIANT (TEAO1-152): TeaExecutorBuilder injects
+                        // TeaEvmFactory (GPG precompile 0x0696 + TEA L1 cost fn).
+                        // The shared proofs-history launcher preserves the
+                        // caller's executor, so this MUST remain TeaExecutorBuilder.
                         .executor(TeaExecutorBuilder),
                 )
                 .with_add_ons(
@@ -92,11 +98,15 @@ fn main() {
                             OpEngineApiBuilder<OpEngineValidatorBuilder>,
                             BasicEngineValidatorBuilder<OpEngineValidatorBuilder>,
                         >(),
-                )
-                .launch_with_debug_capabilities()
-                .await?;
+                );
 
-            handle.node_exit_future.await
+            // TEAO1-152: hand the fully-configured (TeaExecutorBuilder) node
+            // builder to op-reth's shared proofs-history launcher. It applies the
+            // install gate (proofs_history OR storage-path supplied), resolves the
+            // path, runs the preflight init-check, and installs the OpProofsExEx +
+            // eth_getProof/debug_* RPC overrides when requested — preserving our
+            // executor — then launches. When not requested it launches unchanged.
+            launch_node_with_proof_history(node_builder, &rollup_args).await
         })
     {
         eprintln!("Error: {err:?}");
@@ -104,33 +114,134 @@ fn main() {
     }
 }
 
-/// TEAO1-152: tea-reth does not wire op-reth's historical state-proof stack
-/// (`OpProofsExEx` / eth_getProof-history serving, which is unrelated to the
-/// kona fault proof). Reject the proofs-history flag explicitly rather than
-/// silently accepting and ignoring it. To enable the feature, install
-/// `OpProofsExEx` in the node launcher above instead of rejecting here.
-fn ensure_proofs_history_unsupported(proofs_history_enabled: bool) -> eyre::Result<()> {
-    if proofs_history_enabled {
-        eyre::bail!(
-            "--proofs-history is not supported by tea-reth: the historical \
-             state-proof (eth_getProof history) stack is not wired into this \
-             node. Remove the flag, or enable the OpProofsExEx stack if proof \
-             history is required."
-        );
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::ensure_proofs_history_unsupported;
+    // TEAO1-152: the install gate + path resolution now live in op-reth's shared
+    // `proof_history` module (so op-reth and tea-reth share one implementation);
+    // tea-reth still owns these tests to lock the behavior its node depends on.
+    use reth_optimism_node::proof_history::{
+        proofs_history_storage_path, should_install_proofs_history,
+    };
+    use clap::Parser;
+    use reth_op::node::args::RollupArgs;
 
-    /// TEAO1-152: the proofs-history flag must be rejected fail-closed, not
-    /// silently accepted (the stack is never installed, so accepting it would
-    /// mislead operators into thinking proof history is being served).
+    /// Tiny harness to parse just the flattened `RollupArgs` from a CLI line.
+    #[derive(Parser)]
+    struct T {
+        #[command(flatten)]
+        r: RollupArgs,
+    }
+
+    /// TEAO1-152: the install gate must fire for the storage-path sub-flag —
+    /// the exact bypass the finding flags. Upstream's `default_value_ifs` is
+    /// dead (it keys on the long-flag string, not the field-derived arg id), so
+    /// `--proofs-history.storage-path` alone leaves `proofs_history == false`;
+    /// without the storage-path OR in the gate this would silently NOT install
+    /// the proof-history stack. Assert the path parses and the gate fires.
     #[test]
-    fn proofs_history_flag_is_rejected() {
-        assert!(ensure_proofs_history_unsupported(true).is_err());
-        assert!(ensure_proofs_history_unsupported(false).is_ok());
+    fn proofs_history_subflag_enables_install_gate() {
+        let parsed = T::parse_from(["x", "--proofs-history.storage-path", "/tmp/ph"]);
+        // Documents the upstream clap quirk this fix works around: the bare
+        // boolean stays false even though a path was supplied.
+        assert!(!parsed.r.proofs_history);
+        assert_eq!(
+            parsed.r.proofs_history_storage_path.as_deref(),
+            Some(std::path::Path::new("/tmp/ph")),
+        );
+        // The gate must still fire so the stack is installed.
+        assert!(should_install_proofs_history(&parsed.r), "storage-path sub-flag must trigger the install gate");
+    }
+
+    /// The bare `--proofs-history` flag also fires the gate.
+    #[test]
+    fn proofs_history_bare_flag_enables_install_gate() {
+        let parsed = T::parse_from(["x", "--proofs-history"]);
+        assert!(parsed.r.proofs_history);
+        assert!(should_install_proofs_history(&parsed.r));
+    }
+
+    /// TEAO1-152 error case: a bare `--proofs-history` with NO storage path is
+    /// rejected with a clear error (the MDBX proof store needs an explicit path),
+    /// rather than panicking or silently installing nothing.
+    #[test]
+    fn proofs_history_without_storage_path_errors() {
+        let parsed = T::parse_from(["x", "--proofs-history"]);
+        // Gate fires (so `main` enters the install branch)...
+        assert!(should_install_proofs_history(&parsed.r));
+        // ...but path resolution fails closed with a descriptive error.
+        let err = proofs_history_storage_path(&parsed.r)
+            .expect_err("bare --proofs-history without a storage path must error");
+        assert!(
+            err.to_string().contains("--proofs-history.storage-path"),
+            "error must name the missing flag, got: {err}"
+        );
+    }
+
+    /// Success case: when a storage path is supplied, resolution returns it.
+    #[test]
+    fn proofs_history_with_storage_path_resolves() {
+        let parsed = T::parse_from(["x", "--proofs-history", "--proofs-history.storage-path", "/tmp/ph"]);
+        assert_eq!(
+            proofs_history_storage_path(&parsed.r).expect("path should resolve"),
+            std::path::PathBuf::from("/tmp/ph"),
+        );
+    }
+
+    /// With no proofs-history flags the gate stays closed: no ExEx / RPC
+    /// override install, node launches as a plain tea-reth node.
+    #[test]
+    fn no_proofs_history_flag_keeps_gate_closed() {
+        let parsed = T::parse_from(["x"]);
+        assert!(!parsed.r.proofs_history);
+        assert!(parsed.r.proofs_history_storage_path.is_none());
+        assert!(!should_install_proofs_history(&parsed.r), "no flags must leave the install gate closed");
+    }
+
+    /// TEAO1-152 (re-scan): each standalone proofs-history TUNING flag must FAIL
+    /// CLOSED at parse — `requires = proofs_history_storage_path` — instead of
+    /// being silently ignored (the install gate never fires for them, so a plain
+    /// launch would otherwise drop the accepted flag). This closes the remaining
+    /// accept-but-ignore surface beyond `--proofs-history` / `.storage-path`.
+    #[test]
+    fn standalone_tuning_flags_fail_closed_at_parse() {
+        for arg in [
+            "--proofs-history.window=7",
+            "--proofs-history.prune-interval=30s",
+            "--proofs-history.verification-interval=9",
+        ] {
+            let res = T::try_parse_from(["x", arg]);
+            assert!(res.is_err(), "`{arg}` alone must fail closed (requires storage-path)");
+            // The error must name the missing storage-path requirement.
+            let msg = res.err().unwrap().to_string();
+            assert!(
+                msg.contains("proofs-history.storage-path"),
+                "`{arg}` error must point at the missing storage path, got: {msg}"
+            );
+        }
+    }
+
+    /// A tuning flag accompanied by a storage path satisfies the requirement and
+    /// parses (and the tuning value is honored downstream).
+    #[test]
+    fn tuning_flag_with_storage_path_parses() {
+        let parsed = T::try_parse_from([
+            "x",
+            "--proofs-history.storage-path",
+            "/tmp/ph",
+            "--proofs-history.window",
+            "7",
+        ])
+        .expect("tuning flag with a storage path must parse");
+        assert_eq!(parsed.r.proofs_history_window, 7);
+        assert!(should_install_proofs_history(&parsed.r));
+    }
+
+    /// Defaulted tuning flags must NOT trigger `requires` — a plain launch with no
+    /// proofs-history flags parses normally (clap only enforces `requires` for
+    /// user-supplied args, not defaults; verified at runtime too).
+    #[test]
+    fn defaulted_tuning_flags_do_not_require_storage_path() {
+        let parsed = T::try_parse_from(["x"]).expect("plain launch must parse");
+        assert!(!should_install_proofs_history(&parsed.r));
     }
 }

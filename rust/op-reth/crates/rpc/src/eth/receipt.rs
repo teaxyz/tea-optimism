@@ -2,6 +2,7 @@
 
 use crate::{OpEthApi, OpEthApiError, eth::RpcNodeCore};
 use alloy_consensus::{BlockHeader, Receipt, ReceiptWithBloom, TxReceipt};
+use alloy_primitives::U256;
 use alloy_eips::eip2718::Encodable2718;
 use alloy_rpc_types_eth::{Log, TransactionReceipt};
 use op_alloy_consensus::{OpReceipt, OpTransaction};
@@ -18,8 +19,39 @@ use reth_rpc_eth_api::{
     transaction::{ConvertReceiptInput, ReceiptConverter},
 };
 use reth_rpc_eth_types::{EthApiError, receipt::build_receipt};
-use reth_storage_api::BlockReader;
+use reth_storage_api::{BlockReader, StateProvider, StateProviderFactory};
 use std::fmt::Debug;
+
+/// Outcome of reading the parent-block `GasPriceOracle` ratio for a receipt
+/// (TEAO1-6 / TEAO1-211).
+#[derive(Debug, PartialEq, Eq)]
+enum TeaReceiptFee {
+    /// The ratio was read; install this `l1_cost_multiplier` so the receipt's
+    /// `l1Fee` matches the TEA-scaled amount execution charged. A successfully-read
+    /// unset slot (`Ok(None)` -> `0`) yields the documented backup rate.
+    Multiplier((U256, U256)),
+    /// The parent oracle state was unreadable (e.g. a pruned node, where the historical
+    /// ratio is genuinely unrecoverable — it has no non-pruned copy: no event, not in
+    /// calldata). We must neither report the raw OP fee / backup rate (a wrong number,
+    /// TEAO1-6 / b64be295) nor fail the whole receipt RPC (TEAO1-211). The caller omits
+    /// `l1Fee` from this block's receipts instead.
+    OmitL1Fee,
+}
+
+/// Decide how to set a receipt's L1 fee from the parent oracle ratio read.
+///
+/// `Ok(_)` installs the multiplier (an unset slot is the backup rate, per
+/// [`tea_l1_cost::multiplier_from_oracle_value`]); `Err(_)` — the historical state is
+/// unreadable — degrades to [`TeaReceiptFee::OmitL1Fee`] rather than erroring or
+/// substituting a wrong fee.
+fn tea_receipt_fee<E>(oracle_read: Result<Option<U256>, E>) -> TeaReceiptFee {
+    match oracle_read {
+        Ok(raw) => TeaReceiptFee::Multiplier(tea_l1_cost::multiplier_from_oracle_value(
+            raw.unwrap_or_default(),
+        )),
+        Err(_) => TeaReceiptFee::OmitL1Fee,
+    }
+}
 
 impl<N, Rpc> LoadReceipt for OpEthApi<N, Rpc>
 where
@@ -44,8 +76,11 @@ impl<Provider> OpReceiptConverter<Provider> {
 impl<Provider, N> ReceiptConverter<N> for OpReceiptConverter<Provider>
 where
     N: NodePrimitives<SignedTx: OpTransaction, Receipt = OpReceipt>,
-    Provider:
-        BlockReader<Block = N::Block> + ChainSpecProvider<ChainSpec: OpHardforks> + Debug + 'static,
+    Provider: BlockReader<Block = N::Block>
+        + ChainSpecProvider<ChainSpec: OpHardforks>
+        + StateProviderFactory
+        + Debug
+        + 'static,
 {
     type RpcReceipt = OpTransactionReceipt;
     type Error = OpEthApiError;
@@ -85,6 +120,52 @@ where
             }
         };
 
+        // TEAO1-170/133/161: report the TEA-scaled L1 fee that was actually
+        // charged, not the raw OP fee. `l1_tx_data_fee` (via op-revm
+        // `calculate_tx_l1_cost`) multiplies the cost when `l1_cost_multiplier`
+        // is set, so we install the GasPriceOracle multiplier here. It is
+        // sampled from the *parent* block's post-state: the executor builds the
+        // block's EVM once over parent state and op-revm preserves that
+        // multiplier across the per-tx `L1BlockInfo` reloads, so every tx in
+        // this block was charged with the parent-state ratio. That block-boundary
+        // freeze is intentional, not a lag to fix: the multiplier is sourced from
+        // an AMM pool oracle whose spot price is flash-loan-manipulable within a
+        // block, so charging must read the pool's settled (parent-block) state,
+        // never an intermediate same-block value (Cantina TEAO1-147 — Won't-fix,
+        // by design). Reading that same state here keeps the receipt faithful to
+        // the deduction. Off-Tea chains leave the multiplier `None` -> raw OP fee,
+        // identical to upstream.
+        //
+        // TEAO1-6 / TEAO1-211: handle the oracle read without ever reporting a wrong
+        // fee AND without failing the receipt RPC. A failed slot read must NOT be
+        // collapsed to a zero ratio (the old `.ok().flatten().unwrap_or_default()`
+        // turned it into the backup rate) nor become the raw OP fee. But it must also
+        // NOT error the whole receipt: on a pruned node the historical parent state is
+        // gone and the ratio that charged the block is genuinely unrecoverable (it has
+        // no non-pruned copy — `_setLatestPrice` emits no event and the ratio isn't in
+        // calldata). So on an unreadable read we OMIT `l1Fee` (set it `None` after the
+        // receipts are built) rather than report a wrong number or fail the call.
+        // Archive nodes (which serve Tea RPC) read the slot successfully and install
+        // the exact multiplier execution charged; a successfully-read unset slot
+        // (`Ok(None)` -> 0) is the documented backup rate.
+        let mut omit_l1_fee = false;
+        if tea_l1_cost::is_tea(self.provider.chain_spec().chain().id()) {
+            if let Some(parent) = block.header().number().checked_sub(1) {
+                let oracle_read = self.provider.history_by_block_number(parent).and_then(|state| {
+                    state.storage(
+                        tea_l1_cost::GAS_PRICE_ORACLE_ADDR,
+                        tea_l1_cost::LATEST_PRICE_RATIO_SLOT,
+                    )
+                });
+                match tea_receipt_fee(oracle_read) {
+                    TeaReceiptFee::Multiplier(multiplier) => {
+                        l1_block_info.l1_cost_multiplier = Some(multiplier);
+                    }
+                    TeaReceiptFee::OmitL1Fee => omit_l1_fee = true,
+                }
+            }
+        }
+
         let mut receipts = Vec::with_capacity(inputs.len());
 
         for input in inputs {
@@ -97,6 +178,17 @@ where
                 OpReceiptBuilder::new(&self.provider.chain_spec(), input, &mut l1_block_info)?
                     .build(),
             );
+        }
+
+        // TEAO1-211: the parent oracle ratio was unreadable (pruned node), so the
+        // TEA-scaled `l1Fee` cannot be reproduced. The receipts were built without the
+        // multiplier (i.e. carry the raw OP fee), which would misreport the charged
+        // amount — omit `l1Fee` rather than expose a wrong value. The other L1 fields
+        // (gas price/used, from the block body) remain valid.
+        if omit_l1_fee {
+            for receipt in &mut receipts {
+                receipt.l1_block_info.l1_fee = None;
+            }
         }
 
         Ok(receipts)
@@ -341,6 +433,50 @@ impl OpReceiptBuilder {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    // ── TEAO1-6 / TEAO1-211: the receipt-side oracle-read decision ───────────────
+    // `tea_receipt_fee` is the decision the converter acts on: install the multiplier
+    // (so the receipt's l1Fee matches the deduction) or omit l1Fee. A read *error*
+    // must NOT be collapsed to a zero ratio (the old
+    // `.ok().flatten().unwrap_or_default()` did, silently yielding the backup-rate
+    // fee — TEAO1-6) and must NOT fail the whole RPC (TEAO1-211); it degrades to
+    // OmitL1Fee. A successfully-read unset slot stays the documented backup rate.
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ReadErr;
+
+    #[test]
+    fn tea_receipt_fee_omits_l1fee_on_read_error() {
+        // TEAO1-211: an unreadable historical oracle slot (e.g. pruned node) must omit
+        // l1Fee — NOT become the backup rate (TEAO1-6) and NOT error the receipt.
+        assert_eq!(tea_receipt_fee(Err(ReadErr)), TeaReceiptFee::OmitL1Fee);
+    }
+
+    #[test]
+    fn tea_receipt_fee_unset_slot_is_backup_rate_not_omit() {
+        // A successful read of an unset slot (None) or an explicit zero ratio is the
+        // documented backup rate — distinct from an unreadable read (which omits).
+        let backup = tea_l1_cost::multiplier_from_oracle_value(U256::ZERO);
+        assert_eq!(tea_receipt_fee::<ReadErr>(Ok(None)), TeaReceiptFee::Multiplier(backup));
+        assert_eq!(
+            tea_receipt_fee::<ReadErr>(Ok(Some(U256::ZERO))),
+            TeaReceiptFee::Multiplier(backup)
+        );
+        // The backup rate is the large multiplier, never a silent 1x pass-through.
+        assert_ne!(backup, (tea_l1_cost::WAD, tea_l1_cost::WAD));
+    }
+
+    #[test]
+    fn tea_receipt_fee_uses_the_oracle_ratio_when_set() {
+        // A set slot yields the price-derived multiplier execution charged with —
+        // the same source `multiplier_from_oracle_value` derives from.
+        let raw = U256::from(2u64) * tea_l1_cost::WAD;
+        assert_eq!(
+            tea_receipt_fee::<ReadErr>(Ok(Some(raw))),
+            TeaReceiptFee::Multiplier(tea_l1_cost::multiplier_from_oracle_value(raw)),
+        );
+    }
+
     use alloy_consensus::{Block, BlockBody, Eip658Value, TxEip7702, transaction::TransactionMeta};
     use alloy_op_hardforks::{
         OP_MAINNET_ISTHMUS_TIMESTAMP, OP_MAINNET_JOVIAN_TIMESTAMP, OpChainHardforks,
@@ -479,6 +615,58 @@ mod test {
             TX_META_TX_1_OP_MAINNET_BLOCK_124665056.l1_block_info.da_footprint_gas_scalar,
             "incorrect da footprint gas scalar"
         );
+    }
+
+    /// TEAO1-170/133/161: when the Tea receipt converter installs the
+    /// GasPriceOracle multiplier on the `L1BlockInfo`, the receipt's `l1Fee`
+    /// must scale by it — reporting the TEA-denominated fee the EL actually
+    /// deducted rather than the raw OP fee stock op-reth reports. The converter
+    /// reads that multiplier from parent-block state and sets it; this test
+    /// pins the scaling wiring it relies on.
+    #[test]
+    fn tea_multiplier_scales_receipt_l1_fee() {
+        let tx_1 =
+            OpTransactionSigned::decode_2718(&mut TX_1_OP_MAINNET_BLOCK_124665056.as_slice())
+                .unwrap();
+        let block: Block<OpTransactionSigned> = Block {
+            body: BlockBody {
+                transactions: vec![
+                    OpTransactionSigned::decode_2718(
+                        &mut TX_SET_L1_BLOCK_OP_MAINNET_BLOCK_124665056.as_slice(),
+                    )
+                    .unwrap(),
+                    tx_1.clone(),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut l1_block_info =
+            reth_optimism_evm::extract_l1_info(&block.body).expect("should extract l1 info");
+
+        // Raw OP fee (no multiplier) — what stock op-reth reports.
+        let raw = OpReceiptFieldsBuilder::new(BLOCK_124665056_TIMESTAMP, 124665056)
+            .l1_block_info(&*OP_MAINNET, &tx_1, &mut l1_block_info)
+            .expect("should parse revm l1 info")
+            .build()
+            .l1_block_info
+            .l1_fee
+            .expect("l1 fee present");
+        assert_eq!(raw, 24681034813, "raw OP l1 fee sanity check");
+
+        // With a 3x GasPriceOracle multiplier installed (as the Tea converter
+        // does from the oracle slot), the reported l1Fee must triple.
+        l1_block_info.clear_tx_l1_cost();
+        l1_block_info.l1_cost_multiplier =
+            Some((U256::from(3u64) * tea_l1_cost::WAD, tea_l1_cost::WAD));
+        let scaled = OpReceiptFieldsBuilder::new(BLOCK_124665056_TIMESTAMP, 124665056)
+            .l1_block_info(&*OP_MAINNET, &tx_1, &mut l1_block_info)
+            .expect("should parse revm l1 info")
+            .build()
+            .l1_block_info
+            .l1_fee
+            .expect("l1 fee present");
+        assert_eq!(scaled, raw * 3, "receipt l1Fee must scale by the TEA multiplier");
     }
 
     #[test]
