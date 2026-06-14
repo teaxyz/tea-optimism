@@ -34,7 +34,11 @@ build-op-reth:
 
 # Build tea-reth (vendors op-revm with Tea patches first)
 build-tea-reth: vendor-patch
-  cargo build --release --bin tea-reth
+  # `-p tea-reth` (not `--bin tea-reth`): tea-reth is a workspace member but is
+  # intentionally NOT in `default-members` (unlike op-reth/bin & the kona bins),
+  # so `cargo build --bin tea-reth` fails with "no bin target named tea-reth in
+  # default-run packages". Selecting the package builds its sole `tea-reth` bin.
+  cargo build --release -p tea-reth
 
 ######################### Tea Vendoring ############################
 
