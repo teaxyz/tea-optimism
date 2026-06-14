@@ -275,8 +275,7 @@ contract L2Genesis_Run_Test is L2Genesis_TestInit {
             gasPayingTokenSymbol: "",
             nativeAssetLiquidityAmount: type(uint248).max,
             liquidityControllerOwner: address(0x000000000000000000000000000000000000000d),
-            useL2CM: false
-
+            useL2CM: false,
             // TEA
             l1CGTBridge: address(0x7278C0d99Ba37cE53d6983CfC52a181EF891581F)
         });
@@ -417,6 +416,34 @@ contract L2Genesis_Run_Test is L2Genesis_TestInit {
         testFactories();
         testForks();
         testCGT();
+    }
+
+    /// @notice TEAO1-165: on a non-CGT (standard) genesis the deploy-time gate installs the
+    ///         upstream `GasPriceOracleStandard`, NOT Tea's cached-price `GasPriceOracle`. The
+    ///         standard oracle has no `updateGasTokenPriceRatio` / price slot, so the TEA price
+    ///         machinery — and its permanently-unwritable slot on a plain `L1Block` — never exists
+    ///         on a standard chain. The `+CGT` suffix on `version()` is the on-chain proof of which
+    ///         implementation is installed.
+    function test_run_nonCgt_installsStandardGasPriceOracle_TEAO1_165() external {
+        // `input` defaults to non-CGT.
+        genesis.run(input);
+        assertEq(
+            IGasPriceOracle(payable(Predeploys.GAS_PRICE_ORACLE)).version(),
+            "1.6.0",
+            "non-CGT genesis must install the standard GasPriceOracle (no TEA machinery)"
+        );
+    }
+
+    /// @notice TEAO1-165 (complement): a CGT genesis installs Tea's cached-price oracle, where the
+    ///         multiplier and `updateGasTokenPriceRatio` belong (L1BlockCGT forwards the updater).
+    function test_run_cgt_installsTeaGasPriceOracle_TEAO1_165() external {
+        _setInputCGTEnabled();
+        genesis.run(input);
+        assertEq(
+            IGasPriceOracle(payable(Predeploys.GAS_PRICE_ORACLE)).version(),
+            "1.6.0+CGT",
+            "CGT genesis must install the Tea cached-price GasPriceOracle"
+        );
     }
 
     /// @notice Tests that the run function reverts when CGT is enabled and sequencerFeeVault withdrawal network is L1.

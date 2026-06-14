@@ -47,6 +47,12 @@ alloy-evm = { workspace = true, features = ["op"] }
 # arithmetic, and backup-rate fallback in one place so FPVM cannot drift)
 tea-l1-cost.workspace = true
 
+# Tea precompiles — the FPVM links only the no_std `gas` slice (addresses + gas
+# schedule). The crypto is std-gated and runs on the host via the accelerated-
+# precompile path; default-features = false keeps the crypto out of the FPVM.
+# See TEAO1-174.
+tea-precompiles = { workspace = true }
+
 # General
 lru.workspace = true
 spin.workspace = true
@@ -60,6 +66,13 @@ thiserror.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 kona-preimage = { workspace = true, features = ["std"] }
+# std `block_on`: the accelerated-precompile test harness drives the mock host
+# and client on a multi_thread runtime and relies on `kona_proof::block_on`
+# using `block_in_place` + a real runtime. Without kona-proof's `std` feature
+# the no_std busy-wait `block_on` (no-op waker) compiles instead and the oracle
+# round-trip never makes progress -> the tests deadlock. Dev-dep only, so the
+# FPVM/no_std binary build is unaffected.
+kona-proof = { workspace = true, features = ["std"] }
 sha2.workspace = true
 # Cross-executor parity tests: prove that an EVM produced by tea-reth's
 # TeaEvmFactory (EL) and one produced by FpvmOpEvmFactory (FPVM) compute
@@ -67,6 +80,9 @@ sha2.workspace = true
 # tea-reth is publish=false within this workspace.
 tea-reth = { path = "../../../tea-reth" }
 tea-l1-cost.workspace = true
+# std crypto, so the accelerated-precompile parity tests can run the Tea
+# precompiles natively (mock host) and compare against the FPVM stub result.
+tea-precompiles = { workspace = true, features = ["std"] }
 alloy-primitives = { workspace = true, features = ["std"] }
 revm = { workspace = true, features = ["std"] }
 op-revm = { workspace = true, features = ["std"] }

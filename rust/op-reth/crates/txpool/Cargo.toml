@@ -40,6 +40,9 @@ reth-optimism-evm.workspace = true
 reth-optimism-forks.workspace = true
 reth-optimism-primitives.workspace = true
 
+# tea
+tea-l1-cost.workspace = true
+
 # metrics
 reth-metrics.workspace = true
 metrics.workspace = true

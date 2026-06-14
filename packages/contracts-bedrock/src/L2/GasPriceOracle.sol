@@ -70,7 +70,7 @@ contract GasPriceOracle is TeaWAPOracle, ISemver {
     /// @param _data Unsigned fully RLP-encoded transaction to get the L1 fee for.
     /// @return L1 fee that should be paid for the tx
     function getL1Fee(bytes memory _data) external view returns (uint256) {
-        (, uint160 latestPrice) = getLatestPrice();
+        uint160 latestPrice = _cachedPriceOrBackup();
         if (isFjord) {
             return latestPrice * _getL1FeeFjord(_data) / 1e18;
         } else if (isEcotone) {
@@ -93,8 +93,30 @@ contract GasPriceOracle is TeaWAPOracle, ISemver {
         // txSize / 255 + 16 is the practical fastlz upper-bound covers %99.99 txs.
         uint256 flzUpperBound = txSize + txSize / 255 + 16;
 
-        (, uint160 latestPrice) = getLatestPrice();
+        uint160 latestPrice = _cachedPriceOrBackup();
         return latestPrice * _fjordL1Cost(flzUpperBound) / 1e18;
+    }
+
+    /// @notice The L1-fee multiplier the fee helpers apply, as a 1e18-scaled ratio.
+    ///         The cached TEA/ETH price machinery only applies on custom-gas-token
+    ///         (CGT) deployments, where the L1 fee is denominated in the custom gas
+    ///         token. On a plain (non-CGT) chain the L1-attributes predeploy is the
+    ///         upstream `L1Block`, which never forwards `updateGasTokenPriceRatio`,
+    ///         so `CUSTOM_GAS_TOKEN_PRICE_SLOT` is never written and a TEA-denominated
+    ///         backup would be meaningless. Gate the whole machinery on the L1Block
+    ///         CGT flag (TEAO1-165): off-CGT, return the identity multiplier (1e18)
+    ///         so `getL1Fee` / `getL1FeeUpperBound` reduce to the standard OP fee,
+    ///         independent of the (unwritable) slot — matching the EL, which only
+    ///         applies the multiplier on Tea (CGT) chains. On CGT, use the cached
+    ///         price, falling back to the backup rate while the slot is unwritten
+    ///         (genesis bootstrap) or during oracle downtime.
+    function _cachedPriceOrBackup() internal view returns (uint160) {
+        if (!IL1Block(Predeploys.L1_BLOCK_ATTRIBUTES).isCustomGasToken()) {
+            return uint160(1e18);
+        }
+        (, uint160 latestPrice) = getLatestPrice();
+        if (latestPrice == 0) return getFallbackPrice();
+        return latestPrice;
     }
 
     /// @notice Pulls the latest price from the oracle and updates the ratio storage slot.

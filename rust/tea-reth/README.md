@@ -10,7 +10,7 @@ Tea is an Optimism L2 that uses a custom gas token (TEA). tea-reth extends the s
 
 1. **GPG signature verification precompile** at address `0x0696` — verifies ed25519 and RSA GPG signatures on-chain
 2. **TEA-denominated L1 cost function** — wraps the standard Fjord L1 cost with a TEA/ETH exchange rate read from the on-chain GasPriceOracle
-3. **Chain ID detection** — identifies Tea networks (mainnet `6122`, testnet1 `10218`, testnet2 `14314`, Nethermind testnet `3257160925`)
+3. **Chain ID detection** — identifies Tea networks (mainnet `6122`, testnet `10218`)
 
 All other behavior (consensus, networking, RPC, sync, etc.) is inherited from op-reth unchanged.
 

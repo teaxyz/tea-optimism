@@ -39,6 +39,21 @@ contract GasPriceOracle_Test is CommonTest {
     /// @dev Sets up the test suite.
     function setUp() public virtual override {
         super.setUp();
+
+        // TEAO1-165: the deploy-time gate installs the standalone GasPriceOracleStandard
+        // on the default (non-CGT) test harness. Re-etch the self-contained Tea CGT oracle
+        // at the impl namespace so these tests exercise the cached-price path.
+        vm.etch(
+            Predeploys.predeployToCodeNamespace(Predeploys.GAS_PRICE_ORACLE),
+            vm.getDeployedCode("GasPriceOracle.sol:GasPriceOracle")
+        );
+        // The two oracles are independent contracts with different slot-0 packing: genesis
+        // activated the forks on GasPriceOracleStandard (bytes 0..3), but the Tea oracle reads
+        // them at bytes 20..23 (its `owner` occupies bytes 0..19, per TEAO1-213). Shift the four
+        // fork-flag bytes into the Tea layout and leave `owner` zero (-> PROXY_ADMIN.owner()).
+        bytes32 s0 = vm.load(Predeploys.GAS_PRICE_ORACLE, bytes32(0));
+        vm.store(Predeploys.GAS_PRICE_ORACLE, bytes32(0), bytes32((uint256(s0) & 0xFFFFFFFF) << 160));
+
         depositor = l1Block.DEPOSITOR_ACCOUNT();
 
         // TEA. Set price 1 TEA = 1 ETH
@@ -187,6 +202,24 @@ contract GasPriceOracleEcotone_Test is GasPriceOracle_Test {
     function test_setEcotone_wrongCaller_reverts() external {
         vm.expectRevert("GasPriceOracle: only the depositor account can set isEcotone flag");
         gasPriceOracle.setEcotone();
+    }
+
+    /// @dev SECURITY REGRESSION GUARD — write access to the cached price slot.
+    ///      The cached TEA/ETH price (used to scale L1 fees) is only writable via
+    ///      updateGasTokenPriceRatio(), gated to the L1Block attributes predeploy
+    ///      (the system depositor path). A non-system caller MUST revert AND MUST
+    ///      NOT mutate the cached price slot. If this ever fails, the price slot has
+    ///      become attacker-writable — a critical fee-manipulation hole.
+    function test_updateGasTokenPriceRatio_wrongCaller_reverts() external {
+        (uint96 tsBefore, uint160 priceBefore) = gasPriceOracle.getLatestPrice();
+
+        vm.prank(makeAddr("attacker"));
+        vm.expectRevert("GasPriceOracle: only L1_BLOCK_ATTRIBUTES can update");
+        gasPriceOracle.updateGasTokenPriceRatio();
+
+        (uint96 tsAfter, uint160 priceAfter) = gasPriceOracle.getLatestPrice();
+        assertEq(tsAfter, tsBefore, "timestamp must be unchanged by a rejected caller");
+        assertEq(priceAfter, priceBefore, "cached price must be unchanged by a rejected caller");
     }
 
     /// @dev Tests that `gasPrice` is set correctly.
@@ -383,6 +416,46 @@ contract GasPriceOracleFjordActive_Test is GasPriceOracle_Test {
     function test_getOperatorFee_succeeds() external view {
         assertEq(gasPriceOracle.isIsthmus(), false);
         assertEq(gasPriceOracle.getOperatorFee(10), 0);
+    }
+
+    /// @dev TEAO1-165: the Tea cached-price multiplier is gated on the L1Block CGT
+    ///      flag. On a non-CGT deployment (plain `L1Block`, which never forwards
+    ///      `updateGasTokenPriceRatio`) the fee helpers ignore the unwritable cached
+    ///      slot entirely and quote the standard OP fee (identity multiplier), so
+    ///      they never quote zero and never apply a meaningless TEA-denominated
+    ///      backup. On a CGT deployment the machinery applies: an empty slot falls
+    ///      back to the backup rate (genesis bootstrap / oracle downtime), and a
+    ///      written cached price scales the fee.
+    function test_getL1Fee_165_gatedOnCustomGasToken() external {
+        GasPriceOracle gpo = GasPriceOracle(address(gasPriceOracle));
+        bytes memory data = hex"0000010203";
+        bytes32 priceSlot = gpo.CUSTOM_GAS_TOKEN_PRICE_SLOT();
+        bytes memory cgtCall = abi.encodeWithSignature("isCustomGasToken()");
+
+        // ── non-CGT: machinery gated off → standard OP fee, slot ignored. ──────
+        vm.mockCall(Predeploys.L1_BLOCK_ATTRIBUTES, cgtCall, abi.encode(false));
+        vm.store(address(gpo), priceSlot, bytes32(0)); // empty (never-written) slot
+        uint256 feeStd = gpo.getL1Fee(data);
+        uint256 upperStd = gpo.getL1FeeUpperBound(data.length);
+        assertGt(feeStd, 0, "non-CGT must quote the standard fee, never zero");
+        assertGt(upperStd, 0, "non-CGT upper must quote the standard fee, never zero");
+        // A wildly different cached price must NOT move the non-CGT quote.
+        vm.store(address(gpo), priceSlot, bytes32(uint256(5e18)));
+        assertEq(gpo.getL1Fee(data), feeStd, "non-CGT must ignore the cached slot");
+        assertEq(gpo.getL1FeeUpperBound(data.length), upperStd, "non-CGT upper ignores slot");
+
+        // ── CGT: machinery applies. Empty slot → backup rate (3x identity). ────
+        vm.mockCall(Predeploys.L1_BLOCK_ATTRIBUTES, cgtCall, abi.encode(true));
+        vm.prank(Ownable(Predeploys.PROXY_ADMIN).owner());
+        gpo.setFallbackPrice(3e18);
+        vm.store(address(gpo), priceSlot, bytes32(0));
+        assertEq(gpo.getL1Fee(data), feeStd * 3, "CGT empty slot uses the 3x backup rate");
+        assertEq(gpo.getL1FeeUpperBound(data.length), upperStd * 3, "CGT empty upper uses 3x backup");
+        // A written cached price overrides the backup and scales the fee.
+        vm.store(address(gpo), priceSlot, bytes32(uint256(7e18)));
+        assertEq(gpo.getL1Fee(data), feeStd * 7, "CGT uses the written cached price (7x)");
+
+        vm.clearMockedCalls();
     }
 }
 

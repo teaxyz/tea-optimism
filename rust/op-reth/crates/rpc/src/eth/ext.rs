@@ -3,10 +3,12 @@
 use crate::{OpEthApiError, SequencerClient, error::TxConditionalErr};
 use alloy_consensus::BlockHeader;
 use alloy_eips::BlockNumberOrTag;
-use alloy_primitives::{B256, Bytes, StorageKey, U256};
-use alloy_rpc_types_eth::erc4337::{AccountStorage, TransactionConditional};
+use alloy_primitives::{B256, Bytes, StorageKey};
+use alloy_rpc_types_eth::erc4337::TransactionConditional;
 use jsonrpsee_core::RpcResult;
-use reth_optimism_txpool::conditional::MaybeConditionalTransaction;
+use reth_optimism_txpool::conditional::{
+    KnownAccountViolation, MaybeConditionalTransaction, first_known_account_violation,
+};
 use reth_rpc_eth_api::L2EthApiExtServer;
 use reth_rpc_eth_types::utils::recover_raw_transaction;
 use reth_storage_api::{BlockReaderIdExt, StateProviderFactory};
@@ -74,33 +76,24 @@ where
             .state_by_block_number_or_tag(BlockNumberOrTag::Latest)
             .map_err(TxConditionalErr::internal)?;
 
-        for (address, storage) in &condition.known_accounts {
-            match storage {
-                AccountStorage::Slots(slots) => {
-                    for (slot, expected_value) in slots {
-                        let current = state
-                            .storage(*address, StorageKey::from(*slot))
-                            .map_err(TxConditionalErr::internal)?
-                            .unwrap_or_default();
+        // Shared with head-driven eviction and the payload builder's pre-execution
+        // re-check so admission and inclusion judge `knownAccounts` identically
+        // (TEAO1-167). A failed state read rejects the submission here (vs fail-open
+        // at eviction/build), preserving admission's strictness.
+        let violation = first_known_account_violation(
+            condition,
+            |address, slot| {
+                state.storage(address, StorageKey::from(slot)).map(|v| v.unwrap_or_default())
+            },
+            |address| state.storage_root(address, Default::default()).map(Some),
+        )
+        .map_err(TxConditionalErr::internal)?;
 
-                        if current != U256::from_be_bytes(**expected_value) {
-                            return Err(TxConditionalErr::StorageValueMismatch);
-                        }
-                    }
-                }
-                AccountStorage::RootHash(expected_root) => {
-                    let actual_root = state
-                        .storage_root(*address, Default::default())
-                        .map_err(TxConditionalErr::internal)?;
-
-                    if *expected_root != actual_root {
-                        return Err(TxConditionalErr::StorageRootMismatch);
-                    }
-                }
-            }
+        match violation {
+            Some(KnownAccountViolation::Slot { .. }) => Err(TxConditionalErr::StorageValueMismatch),
+            Some(KnownAccountViolation::Root { .. }) => Err(TxConditionalErr::StorageRootMismatch),
+            None => Ok(()),
         }
-
-        Ok(())
     }
 }
 
@@ -146,7 +139,11 @@ where
             return Err(TxConditionalErr::InvalidCondition.into());
         }
 
-        // Validate Account
+        // Validate Account. `RootHash` predicates are supported: they are checked
+        // here against `Latest`, re-checked on each new head by the eviction task,
+        // and — crucially — re-checked against the pending build state at inclusion
+        // time by the payload builder, which recomputes the watched account's storage
+        // root over the block being built (TEAO1-206).
         self.validate_known_accounts(&condition).await?;
 
         if let Some(sequencer) = self.sequencer_client() {

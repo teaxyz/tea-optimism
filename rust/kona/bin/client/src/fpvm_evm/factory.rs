@@ -27,7 +27,26 @@ use revm::{
 /// Returns `None` if the storage read fails (e.g. account does not exist).
 /// op-revm's patched L1-cost path treats `None` as multiplier=1, matching
 /// the EL behavior on chains without the Tea oracle.
-fn tea_l1_cost_multiplier<DB: Database>(db: &mut DB) -> Option<(U256, U256)> {
+///
+/// Off-Tea chains return `None` unconditionally (TEAO1-132): the multiplier and
+/// its 1,500,000× backup fallback must apply only on Tea chains, or generic OP
+/// replay in this FPVM would diverge from canonical Optimism. The `is_tea` gate
+/// is shared with the EL via `tea_l1_cost` so the two cannot drift.
+fn tea_l1_cost_multiplier<DB: Database>(db: &mut DB, chain_id: u64) -> Option<(U256, U256)> {
+    if !tea_l1_cost::is_tea(chain_id) {
+        return None;
+    }
+    // TEAO1-165: gate on L1Block.isCustomGasToken — the SAME flag the GasPriceOracle
+    // reads — so the FPVM applies the multiplier only on custom-gas-token chains,
+    // matching both the EL and the contract. On a non-CGT chain the price slot is
+    // never written and must NOT become the 1,500,000× backup; `None` (identity)
+    // keeps proof re-execution byte-identical to canonical, non-CGT execution.
+    let cgt = db
+        .storage(tea_l1_cost::L1_BLOCK_ATTRIBUTES_ADDR, tea_l1_cost::IS_CUSTOM_GAS_TOKEN_SLOT_U256)
+        .ok()?;
+    if !tea_l1_cost::cgt_enabled(cgt) {
+        return None;
+    }
     let raw = db
         .storage(tea_l1_cost::GAS_PRICE_ORACLE_ADDR, tea_l1_cost::LATEST_PRICE_RATIO_SLOT_U256)
         .ok()?;
@@ -107,8 +126,9 @@ where
         input: EvmEnv<OpSpecId>,
     ) -> Self::Evm<DB, NoOpInspector> {
         let spec_id = *input.spec_id();
+        let chain_id = input.cfg_env.chain_id;
         // Read multiplier before db is moved into the Context.
-        let multiplier = tea_l1_cost_multiplier(&mut db);
+        let multiplier = tea_l1_cost_multiplier(&mut db, chain_id);
         let mut ctx =
             Context::op().with_db(db).with_block(input.block_env).with_cfg(input.cfg_env);
         ctx.chain.l1_cost_multiplier = multiplier;
@@ -134,7 +154,8 @@ where
         inspector: I,
     ) -> Self::Evm<DB, I> {
         let spec_id = *input.spec_id();
-        let multiplier = tea_l1_cost_multiplier(&mut db);
+        let chain_id = input.cfg_env.chain_id;
+        let multiplier = tea_l1_cost_multiplier(&mut db, chain_id);
         let mut ctx =
             Context::op().with_db(db).with_block(input.block_env).with_cfg(input.cfg_env);
         ctx.chain.l1_cost_multiplier = multiplier;
@@ -201,6 +222,11 @@ mod tests {
                 && index == tea_l1_cost::LATEST_PRICE_RATIO_SLOT_U256
             {
                 Ok(self.slot_value)
+            } else if address == tea_l1_cost::L1_BLOCK_ATTRIBUTES_ADDR
+                && index == tea_l1_cost::IS_CUSTOM_GAS_TOKEN_SLOT_U256
+            {
+                // These tests model a Tea custom-gas-token chain (TEAO1-165 gate).
+                Ok(U256::from(1u64))
             } else {
                 Ok(U256::ZERO)
             }
@@ -216,7 +242,7 @@ mod tests {
     #[test]
     fn multiplier_backup_when_oracle_zero() {
         let mut db = OracleDb { slot_value: U256::ZERO };
-        let (rate, denom) = tea_l1_cost_multiplier(&mut db).expect("storage read succeeds");
+        let (rate, denom) = tea_l1_cost_multiplier(&mut db, tea_l1_cost::TEA_CHAIN_ID).expect("storage read succeeds");
         assert_eq!(rate, U256::from(tea_l1_cost::BACKUP_TEA_PER_ETH) * tea_l1_cost::WAD);
         assert_eq!(denom, tea_l1_cost::WAD);
     }
@@ -229,7 +255,7 @@ mod tests {
             "00000000000000006793192400000000000000000000003627e8f712373c0000"
         );
         let mut db = OracleDb { slot_value: U256::from_be_bytes(slot_bytes) };
-        let (rate, denom) = tea_l1_cost_multiplier(&mut db).expect("storage read succeeds");
+        let (rate, denom) = tea_l1_cost_multiplier(&mut db, tea_l1_cost::TEA_CHAIN_ID).expect("storage read succeeds");
         assert_eq!(rate, U256::from(999u64) * tea_l1_cost::WAD);
         assert_eq!(denom, tea_l1_cost::WAD);
     }
@@ -240,7 +266,7 @@ mod tests {
     #[test]
     fn multiplier_one_to_one() {
         let mut db = OracleDb { slot_value: tea_l1_cost::WAD };
-        let (rate, denom) = tea_l1_cost_multiplier(&mut db).expect("storage read succeeds");
+        let (rate, denom) = tea_l1_cost_multiplier(&mut db, tea_l1_cost::TEA_CHAIN_ID).expect("storage read succeeds");
         assert_eq!(rate, tea_l1_cost::WAD);
         assert_eq!(denom, tea_l1_cost::WAD);
     }
@@ -251,7 +277,7 @@ mod tests {
     fn multiplier_scales_cost_identically_to_el() {
         let oracle_rate = U256::from(42u64) * tea_l1_cost::WAD;
         let mut db = OracleDb { slot_value: oracle_rate };
-        let (rate, denom) = tea_l1_cost_multiplier(&mut db).expect("storage read succeeds");
+        let (rate, denom) = tea_l1_cost_multiplier(&mut db, tea_l1_cost::TEA_CHAIN_ID).expect("storage read succeeds");
         let fjord_cost = U256::from(3_203_000u64);
         // EL-side equivalent: tea_l1_cost::apply_tea_exchange_rate(fjord_cost, rate)
         let kona_scaled = fjord_cost * rate / denom;
@@ -318,7 +344,7 @@ mod tests {
     #[test]
     fn multiplier_is_none_on_storage_error() {
         let mut db = FailingStorageDb;
-        let multiplier = tea_l1_cost_multiplier(&mut db);
+        let multiplier = tea_l1_cost_multiplier(&mut db, tea_l1_cost::TEA_CHAIN_ID);
         assert!(
             multiplier.is_none(),
             "storage error must propagate as None, got: {multiplier:?}"
@@ -393,6 +419,39 @@ mod tests {
             evm.ctx().chain.l1_cost_multiplier,
             Some((expected, tea_l1_cost::WAD)),
             "empty DB must produce backup-rate multiplier"
+        );
+    }
+
+    /// TEAO1-132: on a non-Tea chain the FPVM factory must leave the multiplier
+    /// unset (`None`) even with a non-zero oracle slot, so generic OP fault-proof
+    /// replay stays byte-identical to canonical Optimism. This mirrors the EL
+    /// gate (both call `tea_l1_cost::is_tea`), keeping EL≡FPVM off Tea as well.
+    #[test]
+    fn create_evm_off_tea_leaves_multiplier_none() {
+        use revm::{context::CfgEnv, database::CacheDB, database_interface::EmptyDBTyped};
+
+        let mut db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
+        db.insert_account_storage(
+            tea_l1_cost::GAS_PRICE_ORACLE_ADDR,
+            tea_l1_cost::LATEST_PRICE_RATIO_SLOT_U256,
+            U256::from(999u64) * tea_l1_cost::WAD,
+        )
+        .expect("seed oracle storage");
+
+        // OP mainnet (chain id 10) — not a Tea chain.
+        let env = EvmEnv {
+            cfg_env: CfgEnv::new()
+                .with_chain_id(10)
+                .with_spec_and_mainnet_gas_params(OpSpecId::FJORD),
+            ..Default::default()
+        };
+        let factory = make_test_factory!();
+        let evm = <_ as EvmFactory>::create_evm(&factory, db, env);
+
+        assert_eq!(
+            evm.ctx().chain.l1_cost_multiplier,
+            None,
+            "off-Tea chains must not receive the TEA multiplier in the FPVM (TEAO1-132)"
         );
     }
 
