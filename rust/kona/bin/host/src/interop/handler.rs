@@ -7,7 +7,6 @@ use crate::{
 };
 use alloy_consensus::{Header, Sealed};
 use alloy_eips::{eip2718::Encodable2718, eip4844::FIELD_ELEMENTS_PER_BLOB};
-use alloy_op_evm::OpEvmFactory;
 use alloy_primitives::{Address, B256, Bytes, keccak256};
 use alloy_provider::Provider;
 use alloy_rlp::{Decodable, Encodable};
@@ -15,6 +14,7 @@ use alloy_rpc_types::Block;
 use anyhow::{Result, anyhow, ensure};
 use ark_ff::{BigInteger, PrimeField};
 use async_trait::async_trait;
+use kona_client::fpvm_evm::fpvm_op_evm_factory;
 use kona_derive::EthereumDataSource;
 use kona_driver::Driver;
 use kona_executor::TrieDBProvider;
@@ -487,10 +487,19 @@ impl HintHandler for InteropHintHandler {
                     let l1_head = cfg.l1_head;
 
                     async move {
+                        // TEAO1-143: build the oracle/hint clients up front and clone them into
+                        // the EVM factory below. The optimistic-block re-execution MUST use the
+                        // exact same Tea-aware factory as the interop client replay, so both go
+                        // through the shared `fpvm_op_evm_factory` selection point; otherwise the
+                        // host charges raw OP L1 fees (multiplier unset) while the client applies
+                        // the Tea oracle multiplier, and the execution-derived header the host
+                        // persists below diverges from what the client derives.
+                        let oracle_reader = OracleReader::new(preimage.client);
+                        let hint_writer = HintWriter::new(hint.client);
                         let oracle = Arc::new(CachingOracle::new(
                             1024,
-                            OracleReader::new(preimage.client),
-                            HintWriter::new(hint.client),
+                            oracle_reader.clone(),
+                            hint_writer.clone(),
                         ));
 
                         let mut l1_provider = OracleL1ChainProvider::new(l1_head, oracle.clone());
@@ -536,7 +545,7 @@ impl HintHandler for InteropHintHandler {
                             rollup_config.as_ref(),
                             l2_provider.clone(),
                             l2_provider,
-                            OpEvmFactory::default(),
+                            fpvm_op_evm_factory(hint_writer, oracle_reader),
                             None,
                         );
                         let mut driver = Driver::new(cursor, executor, pipeline);
@@ -559,13 +568,22 @@ impl HintHandler for InteropHintHandler {
                 let (_, client_result) = tokio::try_join!(server_task, client_task)?;
                 let (build_outcome, raw_transactions) = client_result?;
 
+                // TEAO1-143: the re-executed header must reproduce the disputed optimistic block
+                // hash exactly. If it does not, the witness we collected belongs to a different
+                // block than the one requested (e.g. a fee/multiplier mismatch shifted the
+                // post-state), so refuse to persist mismatched preimages under the requested hash.
+                let rebuilt_hash = build_outcome.header.hash();
+                ensure!(
+                    rebuilt_hash == disputed_block_hash,
+                    "Re-executed optimistic header hash {rebuilt_hash} does not match the requested disputed hash {disputed_block_hash}"
+                );
+
                 // Store optimistic block hash preimage.
                 let mut kv_lock = kv.write().await;
                 let mut rlp_buf = Vec::with_capacity(build_outcome.header.length());
                 build_outcome.header.encode(&mut rlp_buf);
                 kv_lock.set(
-                    PreimageKey::new(*build_outcome.header.hash(), PreimageKeyType::Keccak256)
-                        .into(),
+                    PreimageKey::new(*rebuilt_hash, PreimageKeyType::Keccak256).into(),
                     rlp_buf,
                 )?;
 
