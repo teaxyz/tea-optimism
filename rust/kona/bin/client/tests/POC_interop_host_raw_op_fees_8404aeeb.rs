@@ -82,6 +82,9 @@ fn seeded_state(oracle_slot_value: U256) -> State<InMemoryDB> {
             (ECOTONE_L1_FEE_SCALARS_SLOT, l1_fee_scalars),
             (ECOTONE_L1_BLOB_BASE_FEE_SLOT, L1_BLOB_BASE_FEE),
             (OPERATOR_FEE_SCALARS_SLOT, operator_fee_and_da_footprint_u256),
+            // TEAO1-165: mark this a CGT chain so the client factory's CGT gate
+            // admits the TEA multiplier (the L1Block predeploy holds the flag).
+            (tea_l1_cost::IS_CUSTOM_GAS_TOKEN_SLOT_U256, U256::from(1u64)),
         ]),
     );
 
