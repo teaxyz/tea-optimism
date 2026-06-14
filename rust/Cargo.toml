@@ -53,6 +53,8 @@ members = [
 
   # Tea trace context (std; per-thread parent-oracle handoff for trace/replay, TEAO1-178)
   "tea-trace-ctx/",
+  # Tea precompiles (std; shared between tea-reth EL and kona-host FPVM accelerator)
+  "tea-precompiles/",
 
   # Alloy OP EVM
   "alloy-op-evm/",
@@ -289,6 +291,7 @@ kona-macros = { path = "kona/crates/utilities/macros", version = "0.1.2", defaul
 # ==================== TEA INTERNAL CRATES ====================
 tea-l1-cost = { path = "tea-l1-cost", version = "0.1.0", default-features = false }
 tea-trace-ctx = { path = "tea-trace-ctx", version = "0.1.0" }
+tea-precompiles = { path = "tea-precompiles", version = "0.1.0", default-features = false }
 
 # ==================== OP-RETH INTERNAL CRATES ====================
 op-reth = { path = "op-reth/bin/" }
@@ -334,6 +337,7 @@ reth-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0",
 reth-consensus-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0", default-features = false }
 reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0", default-features = false }
 reth-db-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
+reth-db-models = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0", default-features = false }
 reth-db-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-downloaders = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-e2e-test-utils = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
