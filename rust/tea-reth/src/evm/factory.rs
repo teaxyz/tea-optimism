@@ -21,9 +21,9 @@ use revm::{
 use std::sync::OnceLock;
 
 use crate::l1_cost;
-use crate::precompiles::gpg_verify;
-use crate::precompiles::ssh_sig_verify;
-use crate::precompiles::ssh_verify;
+use tea_precompiles::gpg_verify;
+use tea_precompiles::ssh_sig_verify;
+use tea_precompiles::ssh_verify;
 
 /// Tea precompiles: standard OP precompiles plus Tea-specific ones.
 struct TeaPrecompiles;

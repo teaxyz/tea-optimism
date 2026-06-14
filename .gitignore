@@ -52,3 +52,5 @@ crytic-export
 
 # ignore local asdf config
 .tool-versions
+# Ignore .waaah agent-orchestration scratch (ralph progress notes etc.)
+.waaah/
