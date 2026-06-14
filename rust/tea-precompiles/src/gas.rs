@@ -30,8 +30,11 @@ pub fn gpg_required_gas(input: &[u8]) -> u64 {
         return GPG_VERIFY_BASE_GAS;
     }
     let additional_bytes = input.len() - GPG_VERIFY_INPUT_LENGTH_KINK;
-    GPG_VERIFY_BASE_GAS
-        .saturating_add(GPG_VERIFY_GAS_PER_BYTE.saturating_mul(additional_bytes as u64))
+    // F-4 (2026-05-19 audit): saturate rather than wrap on an adversarial length,
+    // matching the ssh/sshsig gas helpers. (Normal on-chain inputs are gas-bounded
+    // well below overflow; this is defense-in-depth and identical for every
+    // realistic input.)
+    GPG_VERIFY_BASE_GAS.saturating_add(GPG_VERIFY_GAS_PER_BYTE.saturating_mul(additional_bytes as u64))
 }
 
 // ---- 0x0697 — raw SSH signature verify ---------------------------------------

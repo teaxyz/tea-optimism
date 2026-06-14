@@ -393,6 +393,14 @@ mod tests {
             oracle_rate,
         )
         .expect("seed oracle storage");
+        // TEAO1-165: seed the L1Block isCustomGasToken flag so the CGT gate admits
+        // the multiplier — these tests model a Tea custom-gas-token chain.
+        db.insert_account_storage(
+            tea_l1_cost::L1_BLOCK_ATTRIBUTES_ADDR,
+            tea_l1_cost::IS_CUSTOM_GAS_TOKEN_SLOT_U256,
+            U256::from(1u64),
+        )
+        .expect("seed cgt flag");
 
         let factory = make_test_factory!();
         let evm = <_ as EvmFactory>::create_evm(&factory, db, make_test_env());
@@ -410,7 +418,15 @@ mod tests {
     fn create_evm_uses_backup_when_oracle_missing() {
         use revm::{database::CacheDB, database_interface::EmptyDBTyped};
 
-        let db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
+        let mut db = CacheDB::<EmptyDBTyped<core::convert::Infallible>>::default();
+        // TEAO1-165: CGT chain (gate admits scaling), but the oracle slot is
+        // unseeded → reads ZERO → backup-rate path.
+        db.insert_account_storage(
+            tea_l1_cost::L1_BLOCK_ATTRIBUTES_ADDR,
+            tea_l1_cost::IS_CUSTOM_GAS_TOKEN_SLOT_U256,
+            U256::from(1u64),
+        )
+        .expect("seed cgt flag");
         let factory = make_test_factory!();
         let evm = <_ as EvmFactory>::create_evm(&factory, db, make_test_env());
 
@@ -470,6 +486,14 @@ mod tests {
             oracle_rate,
         )
         .expect("seed oracle storage");
+        // TEAO1-165: seed the L1Block isCustomGasToken flag so the CGT gate admits
+        // the multiplier — these tests model a Tea custom-gas-token chain.
+        db.insert_account_storage(
+            tea_l1_cost::L1_BLOCK_ATTRIBUTES_ADDR,
+            tea_l1_cost::IS_CUSTOM_GAS_TOKEN_SLOT_U256,
+            U256::from(1u64),
+        )
+        .expect("seed cgt flag");
 
         let factory = make_test_factory!();
         let evm = factory.create_evm_with_inspector(db, make_test_env(), NoOpInspector {});
@@ -501,6 +525,14 @@ mod tests {
             packed,
         )
         .expect("seed oracle storage");
+        // TEAO1-165: seed the L1Block isCustomGasToken flag so the CGT gate admits
+        // the multiplier — these tests model a Tea custom-gas-token chain.
+        db.insert_account_storage(
+            tea_l1_cost::L1_BLOCK_ATTRIBUTES_ADDR,
+            tea_l1_cost::IS_CUSTOM_GAS_TOKEN_SLOT_U256,
+            U256::from(1u64),
+        )
+        .expect("seed cgt flag");
 
         let factory = make_test_factory!();
         let evm = <_ as EvmFactory>::create_evm(&factory, db, make_test_env());
