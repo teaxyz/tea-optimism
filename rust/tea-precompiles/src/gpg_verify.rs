@@ -34,38 +34,26 @@
 //! existing callers may already trust — a policy change of that magnitude
 //! belongs at the policy layer, not buried in a verification precompile.
 
-use alloy_primitives::{Address, Bytes, address};
+use alloy_primitives::Bytes;
 use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey, SignedPublicSubKey};
-use pgp::packet::{Packet, PacketParser, SignatureType};
+use pgp::packet::{Packet, PacketParser, Signature, SignatureType};
 use pgp::ser::Serialize;
 use pgp::types::KeyDetails;
 use revm::precompile::{Precompile, PrecompileId, PrecompileOutput, PrecompileResult};
+use std::cmp::Ordering;
 use std::io::Cursor;
 
-/// GPG verify precompile address.
-pub const GPG_VERIFY_ADDRESS: Address = address!("0x0000000000000000000000000000000000000696");
-
-/// Base gas cost for GPG verification.
-pub const GPG_VERIFY_BASE_GAS: u64 = 23_500;
-
-/// Per-byte gas cost above the kink point.
-pub const GPG_VERIFY_GAS_PER_BYTE: u64 = 16;
-
-/// Input length kink point — below this, only base gas is charged.
-pub const GPG_VERIFY_INPUT_LENGTH_KINK: usize = 3264;
+/// Address + gas schedule live in the no_std [`crate::gas`] module so the FPVM
+/// can charge identical gas without linking this crate's crypto. Re-exported
+/// here so internal call sites and the public API are unchanged.
+pub use crate::gas::{
+    GPG_VERIFY_ADDRESS, GPG_VERIFY_BASE_GAS, GPG_VERIFY_GAS_PER_BYTE,
+    GPG_VERIFY_INPUT_LENGTH_KINK, gpg_required_gas as required_gas,
+};
 
 /// Returns the GPG verify precompile for registration.
 pub fn precompile() -> Precompile {
     Precompile::new(PrecompileId::custom("gpg_verify"), GPG_VERIFY_ADDRESS, gpg_verify_run)
-}
-
-/// Calculates the gas required for GPG verification.
-pub fn required_gas(input: &[u8]) -> u64 {
-    if input.len() <= GPG_VERIFY_INPUT_LENGTH_KINK {
-        return GPG_VERIFY_BASE_GAS;
-    }
-    let additional_bytes = input.len() - GPG_VERIFY_INPUT_LENGTH_KINK;
-    GPG_VERIFY_BASE_GAS + GPG_VERIFY_GAS_PER_BYTE * additional_bytes as u64
 }
 
 /// 32-byte result indicating success (1).
@@ -157,13 +145,66 @@ fn parse_single<T: Deserializable + Serialize>(bytes: &[u8]) -> Result<T, &'stat
     Ok(first)
 }
 
-/// Whether a subkey advertises signing capability in any of its binding
-/// signatures. An encryption-only subkey must never be elevated into a signing
-/// authority (TEAO1-160). The binding signatures consulted here are the same
-/// ones validated by [`SignedPublicSubKey::verify_bindings`], so a forged flag
-/// cannot pass without also forging the primary's binding signature.
+/// Whether a subkey's **effective** self-signature authorizes signing.
+///
+/// A subkey's capability is governed by its single most recent self-signature
+/// — the latest valid `SubkeyBinding` or `SubkeyRevocation` packet — not by the
+/// union of every binding it has ever carried. The previous `any()` form
+/// unioned the `sign` flag across all retained bindings, so a stale
+/// signing-capable binding kept a subkey eligible even after a later valid
+/// non-signing re-binding or a revocation (TEAO1-193). We instead resolve the
+/// effective packet and honor only it: an encryption-only subkey (TEAO1-160), a
+/// re-bound non-signing subkey, or a revoked subkey is rejected.
+///
+/// The packets consulted here are the same `SubkeyBinding`/`SubkeyRevocation`
+/// self-signatures that [`SignedPublicSubKey::verify_bindings`] has already
+/// cryptographically validated against the primary key, so a forged flag or
+/// timestamp cannot pass without also forging the primary's signature.
 fn subkey_can_sign(sk: &SignedPublicSubKey) -> bool {
-    sk.signatures.iter().any(|sig| sig.key_flags().sign())
+    // Restrictiveness rank used only to break creation-time ties. Lower = more
+    // restrictive and therefore "wins" an equal-timestamp tie so we fail closed:
+    // a revocation beats a binding, and a non-signing binding beats a signing
+    // one. (`new()` retains only Binding/Revocation packets, so the catch-all is
+    // unreachable; it ranks as most-restrictive defensively.)
+    fn rank(sig: &Signature) -> u8 {
+        match (sig.typ(), sig.key_flags().sign()) {
+            (Some(SignatureType::SubkeyRevocation), _) => 0,
+            (Some(SignatureType::SubkeyBinding), false) => 1,
+            (Some(SignatureType::SubkeyBinding), true) => 2,
+            _ => 0,
+        }
+    }
+
+    // The effective self-signature is the one with the latest creation time.
+    // Packets lacking a creation-time subpacket are malformed self-signatures
+    // and cannot establish recency, so they are ignored for selection — a
+    // signing binding with no timestamp therefore fails closed rather than
+    // silently outranking a later non-signing binding.
+    let effective = sk
+        .signatures
+        .iter()
+        .filter(|sig| {
+            matches!(
+                sig.typ(),
+                Some(SignatureType::SubkeyBinding) | Some(SignatureType::SubkeyRevocation)
+            ) && sig.created().is_some()
+        })
+        .max_by(|a, b| {
+            // Both `created()` are `Some` (filtered above); `Timestamp` is a
+            // `u32` newtype so `partial_cmp` never returns `None`.
+            let by_time = a
+                .created()
+                .partial_cmp(&b.created())
+                .unwrap_or(Ordering::Equal);
+            // On equal creation time, treat the more restrictive packet (lower
+            // rank) as the greater one so `max_by` selects it.
+            by_time.then_with(|| rank(b).cmp(&rank(a)))
+        });
+
+    matches!(
+        effective.map(|sig| (sig.typ(), sig.key_flags().sign())),
+        Some((Some(SignatureType::SubkeyBinding), true))
+    )
 }
 
 /// Decoded GPG verify precompile input.
@@ -214,22 +255,32 @@ fn u256_to_usize(data: &[u8]) -> Result<usize, &'static str> {
     if data.len() != 32 {
         return Err("invalid uint256 length");
     }
-    // Only use the last 8 bytes (offsets shouldn't be > u64)
+    // F-1 (2026-05-19 audit): reject offsets whose upper 24 bytes are non-zero
+    // (definitionally beyond any practical input length) and use `usize::try_from`
+    // so a u64 > usize::MAX on a 32-bit target errors rather than silently
+    // truncating. Mirrors the hardened decoder in ssh_verify.rs.
+    if data[0..24].iter().any(|&b| b != 0) {
+        return Err("offset too large");
+    }
     let val = u64::from_be_bytes(data[24..32].try_into().map_err(|_| "conversion error")?);
-    Ok(val as usize)
+    usize::try_from(val).map_err(|_| "offset exceeds usize::MAX")
 }
 
 /// Read ABI-encoded dynamic bytes from a given offset.
 fn read_dynamic_bytes(input: &[u8], offset: usize) -> Result<Vec<u8>, &'static str> {
-    if offset + 32 > input.len() {
+    // F-1: `checked_add` throughout so an adversarial offset/length near
+    // usize::MAX cannot wrap into a valid slice index and panic at `&input[a..b]`
+    // when `a > b` — inside a precompile that is a consensus halt.
+    let header_end = offset.checked_add(32).ok_or("offset overflow")?;
+    if header_end > input.len() {
         return Err("offset out of bounds");
     }
-    let length = u256_to_usize(&input[offset..offset + 32])?;
-    let data_start = offset + 32;
-    if data_start + length > input.len() {
+    let length = u256_to_usize(&input[offset..header_end])?;
+    let data_end = header_end.checked_add(length).ok_or("length overflow")?;
+    if data_end > input.len() {
         return Err("data out of bounds");
     }
-    Ok(input[data_start..data_start + length].to_vec())
+    Ok(input[header_end..data_end].to_vec())
 }
 
 /// GPG verify precompile entry point.
@@ -369,7 +420,7 @@ mod tests {
     #[test]
     fn test_gas_calculation_base() {
         assert_eq!(required_gas(&vec![0u8; GPG_VERIFY_INPUT_LENGTH_KINK]), GPG_VERIFY_BASE_GAS);
-        assert_eq!(required_gas(&vec![0u8; 100]), GPG_VERIFY_BASE_GAS);
+        assert_eq!(required_gas(&[0u8; 100]), GPG_VERIFY_BASE_GAS);
     }
 
     #[test]
@@ -936,6 +987,165 @@ mod tests {
         );
     }
 
+    /// Build a valid self-signature of `typ` (`SubkeyBinding` or
+    /// `SubkeyRevocation`) for `ssk`'s first subkey, stamped at `created_secs`,
+    /// with empty `KeyFlags`. With no sign capability advertised, no embedded
+    /// primary-key-binding back-signature is required and `verify_bindings`
+    /// still accepts it. (`sign_subkey_binding` hashes the primary+subkey data
+    /// the same way for both types, so a revocation validates identically.)
+    fn subkey_self_sig_at(
+        ssk: &pgp::composed::SignedSecretKey,
+        typ: SignatureType,
+        created_secs: u32,
+    ) -> Signature {
+        use pgp::packet::{KeyFlags, SignatureConfig, Subpacket, SubpacketData};
+        use pgp::types::{KeyVersion, Password, Timestamp};
+        use rand_08::SeedableRng;
+
+        let mut rng = rand_08::rngs::StdRng::from_seed([0x55; 32]);
+        let mut config = SignatureConfig::from_key(&mut rng, &ssk.primary_key, typ)
+            .expect("self-sig config");
+        config.hashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::from_secs(
+                created_secs,
+            )))
+            .unwrap(),
+            Subpacket::regular(SubpacketData::KeyFlags(KeyFlags::default())).unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(ssk.primary_key.fingerprint()))
+                .unwrap(),
+        ];
+        if ssk.primary_key.version() <= KeyVersion::V4 {
+            config.unhashed_subpackets = vec![Subpacket::regular(SubpacketData::IssuerKeyId(
+                ssk.primary_key.legacy_key_id(),
+            ))
+            .unwrap()];
+        }
+        config
+            .sign_subkey_binding(
+                &ssk.primary_key,
+                ssk.primary_key.public_key(),
+                &Password::empty(),
+                ssk.secret_subkeys[0].key.public_key(),
+            )
+            .expect("sign subkey self-signature")
+    }
+
+    /// TEAO1-193: subkey eligibility must honor the **effective** (latest)
+    /// binding, not union `sign()` across every retained binding. A subkey that
+    /// carries a stale signing-capable binding alongside a later valid
+    /// non-signing re-binding must be ineligible; only when the signing binding
+    /// is itself the latest may the subkey verify.
+    #[test]
+    fn test_subkey_effective_binding_overrides_stale_signing() {
+        use pgp::crypto::hash::HashAlgorithm;
+        use pgp::types::Password;
+        use rand_08::SeedableRng;
+
+        // A key whose only subkey carries a genuine signing binding (with the
+        // embedded back-signature that `verify_bindings` requires).
+        let ssk = gen_ed25519(7, true);
+        let full_pub = ssk.to_public_key();
+        assert_eq!(full_pub.public_subkeys.len(), 1, "expected one signing subkey");
+        let subkey = full_pub.public_subkeys[0].clone();
+        let signing_binding = subkey.signatures[0].clone();
+        assert!(signing_binding.key_flags().sign(), "control: original binding advertises signing");
+        let signing_created = signing_binding.created().expect("binding has a creation time");
+
+        // The same subkey material signs the message we will verify.
+        let message = [0x42u8; 32];
+        let mut rng = rand_08::rngs::StdRng::from_seed([0x11; 32]);
+        let sig = DetachedSignature::sign_binary_data(
+            &mut rng,
+            &ssk.secret_subkeys[0].key,
+            &Password::empty(),
+            HashAlgorithm::Sha256,
+            &message[..],
+        )
+        .expect("subkey signs message");
+        let subkey_id = fingerprint_to_key_id(&subkey.fingerprint());
+        let sig_bytes = sig.to_bytes().expect("sig bytes");
+
+        // Run the precompile against a certificate carrying exactly `sub`.
+        let run = |sub: SignedPublicSubKey| -> Vec<u8> {
+            let pubkey = SignedPublicKey::new(
+                full_pub.primary_key.clone(),
+                full_pub.details.clone(),
+                vec![sub],
+            );
+            let input = encode_gpg_verify_input(
+                &message,
+                &subkey_id,
+                &pubkey.to_bytes().expect("pub bytes"),
+                &sig_bytes,
+            );
+            let gas = required_gas(&input);
+            gpg_verify_run(&input, gas).as_ref().expect("Ok result").bytes.to_vec()
+        };
+
+        // Effective binding is the LATER non-signing one — ineligible, even
+        // though a valid older signing binding is retained.
+        let later_non_signing =
+            subkey_self_sig_at(&ssk, SignatureType::SubkeyBinding, signing_created.as_secs() + 1);
+        assert!(!later_non_signing.key_flags().sign(), "control: later binding clears the sign flag");
+        let mixed = SignedPublicSubKey::new(
+            subkey.key.clone(),
+            vec![signing_binding.clone(), later_non_signing.clone()],
+        );
+        assert!(
+            mixed.verify_bindings(&full_pub.primary_key).is_ok(),
+            "control: both retained bindings are individually valid",
+        );
+        assert!(
+            run(mixed).iter().all(|&b| b == 0),
+            "a stale signing binding must not re-enable a re-bound non-signing subkey (TEAO1-193)",
+        );
+
+        // Only the later non-signing binding retained — also ineligible.
+        let current_only =
+            SignedPublicSubKey::new(subkey.key.clone(), vec![later_non_signing.clone()]);
+        assert!(
+            run(current_only).iter().all(|&b| b == 0),
+            "the effective non-signing binding is ineligible",
+        );
+
+        // A later REVOCATION is likewise the effective packet — the subkey is
+        // ineligible even with the older signing binding still retained.
+        let later_revocation =
+            subkey_self_sig_at(&ssk, SignatureType::SubkeyRevocation, signing_created.as_secs() + 2);
+        assert_eq!(
+            later_revocation.typ(),
+            Some(SignatureType::SubkeyRevocation),
+            "control: the revocation carries the revocation signature type",
+        );
+        let revoked = SignedPublicSubKey::new(
+            subkey.key.clone(),
+            vec![signing_binding.clone(), later_revocation],
+        );
+        assert!(
+            revoked.verify_bindings(&full_pub.primary_key).is_ok(),
+            "control: the revocation is a cryptographically valid self-signature",
+        );
+        assert!(
+            run(revoked).iter().all(|&b| b == 0),
+            "a later revocation must override an older signing binding (TEAO1-193)",
+        );
+
+        // Positive control: when the signing binding is the EFFECTIVE (latest)
+        // one, the subkey verifies — the fix honors recency, it is not a blanket
+        // rejection of multi-binding subkeys.
+        let earlier_non_signing =
+            subkey_self_sig_at(&ssk, SignatureType::SubkeyBinding, signing_created.as_secs() - 1);
+        let signing_latest = SignedPublicSubKey::new(
+            subkey.key.clone(),
+            vec![earlier_non_signing, signing_binding.clone()],
+        );
+        assert_eq!(
+            alloy_primitives::hex::encode(run(signing_latest)),
+            SUCCESS_HEX,
+            "a subkey whose effective (latest) binding advertises signing must verify",
+        );
+    }
+
     /// TEAO1-166 / TEAO1-148: only Binary-class signatures bind the exact 32-byte
     /// message. A Text-class detached signature over the same key/message must be
     /// rejected by the binary-only gate (the same gate rejects Timestamp and
@@ -1069,7 +1279,7 @@ mod tests {
         buf.extend_from_slice(&u256_bytes(128));
 
         // [96..128] offset to signature (128 + 32 + padded_len(publicKey))
-        let pub_key_padded_len = (public_key.len() + 31) / 32 * 32;
+        let pub_key_padded_len = public_key.len().div_ceil(32) * 32;
         let sig_offset = 128 + 32 + pub_key_padded_len;
         buf.extend_from_slice(&u256_bytes(sig_offset));
 
@@ -1082,7 +1292,7 @@ mod tests {
         // signature: length + data (padded to 32 bytes)
         buf.extend_from_slice(&u256_bytes(signature.len()));
         buf.extend_from_slice(signature);
-        let sig_padded_len = (signature.len() + 31) / 32 * 32;
+        let sig_padded_len = signature.len().div_ceil(32) * 32;
         let sig_padding = sig_padded_len - signature.len();
         buf.extend_from_slice(&vec![0u8; sig_padding]);
 
@@ -1094,5 +1304,33 @@ mod tests {
         let mut out = [0u8; 32];
         out[24..32].copy_from_slice(&(val as u64).to_be_bytes());
         out
+    }
+
+    /// F-1 (2026-05-19 audit) regression: a crafted ABI offset must decode-error
+    /// cleanly, never panic. Pre-hardening, `pub_key_offset = u64::MAX` wrapped
+    /// past the bounds check and `&input[offset..offset + 32]` panicked.
+    #[test]
+    fn test_gpg_verify_crafted_offset_no_panic() {
+        let mut input = vec![0u8; 128];
+        // pub_key_offset slot [64..96]; low 8 bytes = u64::MAX → usize::MAX.
+        input[88..96].copy_from_slice(&u64::MAX.to_be_bytes());
+        let result = gpg_verify_run(&input, required_gas(&input));
+        assert!(
+            matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))),
+            "crafted offset must decode-error, got: {result:?}"
+        );
+    }
+
+    /// F-1 regression: an offset with any non-zero byte in its upper 24 bytes is
+    /// rejected (ABI offsets are bounded to u64).
+    #[test]
+    fn test_gpg_verify_offset_upper_bytes_rejected() {
+        let mut input = vec![0u8; 128];
+        input[64] = 0x01; // first byte of pub_key_offset slot → non-zero upper-24
+        let result = gpg_verify_run(&input, required_gas(&input));
+        assert!(
+            matches!(result, PrecompileResult::Err(revm::precompile::PrecompileError::Other(_))),
+            "upper-byte offset must be rejected, got: {result:?}"
+        );
     }
 }

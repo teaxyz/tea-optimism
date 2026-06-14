@@ -66,29 +66,18 @@
 //! low-S-only (high-S form is rejected to prevent malleability — see
 //! `ssh_common::verify_ssh_ecdsa`).
 
-use alloy_primitives::{Address, Bytes, address};
+use alloy_primitives::Bytes;
 use revm::precompile::{Precompile, PrecompileId, PrecompileOutput, PrecompileResult};
 
 use super::ssh_common::{read_ssh_string, verify_ssh_ecdsa, verify_ssh_ed25519, verify_ssh_rsa};
 
-/// SSHSIG verify precompile address.
-pub const SSHSIG_VERIFY_ADDRESS: Address =
-    address!("0x0000000000000000000000000000000000000698");
-
-/// Base gas cost for SSHSIG verification.
-///
-/// Slightly above `0x0697`'s 23,500 to cover the additional SHA-512 over the
-/// payload plus the ~100-byte envelope reconstruction.
-pub const SSHSIG_VERIFY_BASE_GAS: u64 = 25_000;
-
-/// Per-byte gas cost above the kink point.
-///
-/// Mirrors `0x0697`. Covers the linear cost of SHA-512 (payload) and the
-/// inner SSH primitive's own hash pass over the envelope.
-pub const SSHSIG_VERIFY_GAS_PER_BYTE: u64 = 16;
-
-/// Input length kink point — below this, only base gas is charged.
-pub const SSHSIG_VERIFY_INPUT_LENGTH_KINK: usize = 3264;
+/// Address + gas schedule live in the no_std [`crate::gas`] module so the FPVM
+/// can charge identical gas without linking this crate's crypto. Re-exported
+/// here so internal call sites and the public API are unchanged.
+pub use crate::gas::{
+    SSHSIG_VERIFY_ADDRESS, SSHSIG_VERIFY_BASE_GAS, SSHSIG_VERIFY_GAS_PER_BYTE,
+    SSHSIG_VERIFY_INPUT_LENGTH_KINK, sshsig_required_gas as required_gas,
+};
 
 /// Maximum payload size in bytes (16 KiB).
 ///
@@ -123,18 +112,6 @@ pub fn precompile() -> Precompile {
         SSHSIG_VERIFY_ADDRESS,
         sshsig_verify_run,
     )
-}
-
-/// Calculates the gas required for SSHSIG verification.
-///
-/// Saturating arithmetic mirrors `ssh_verify::required_gas`.
-pub fn required_gas(input: &[u8]) -> u64 {
-    if input.len() <= SSHSIG_VERIFY_INPUT_LENGTH_KINK {
-        return SSHSIG_VERIFY_BASE_GAS;
-    }
-    let additional_bytes = input.len() - SSHSIG_VERIFY_INPUT_LENGTH_KINK;
-    SSHSIG_VERIFY_BASE_GAS
-        .saturating_add(SSHSIG_VERIFY_GAS_PER_BYTE.saturating_mul(additional_bytes as u64))
 }
 
 /// 32-byte result indicating success (1).
@@ -406,7 +383,7 @@ fn verify_with_envelope(
         b"ecdsa-sha2-nistp256"
         | b"ecdsa-sha2-nistp384"
         | b"ecdsa-sha2-nistp521" => {
-            verify_ssh_ecdsa(public_key, key_offset, envelope, sig_algo, sig_blob)
+            verify_ssh_ecdsa(key_type, public_key, key_offset, envelope, sig_algo, sig_blob)
         }
         _ => false,
     }
@@ -525,7 +502,7 @@ mod tests {
         public_key: &[u8],
         signature: &[u8],
     ) -> Vec<u8> {
-        let pad32 = |n: usize| (n + 31) / 32 * 32;
+        let pad32 = |n: usize| n.div_ceil(32) * 32;
         let payload_off = 128;
         let namespace_off = payload_off + 32 + pad32(payload.len());
         let pubkey_off = namespace_off + 32 + pad32(namespace.len());
@@ -627,7 +604,7 @@ mod tests {
 
     #[test]
     fn gas_below_kink_is_base() {
-        assert_eq!(required_gas(&vec![0u8; 100]), SSHSIG_VERIFY_BASE_GAS);
+        assert_eq!(required_gas(&[0u8; 100]), SSHSIG_VERIFY_BASE_GAS);
         assert_eq!(required_gas(&[]), SSHSIG_VERIFY_BASE_GAS);
         assert_eq!(
             required_gas(&vec![0u8; SSHSIG_VERIFY_INPUT_LENGTH_KINK]),
@@ -671,6 +648,39 @@ mod tests {
         };
         assert_eq!(&envelope[32..96], expected_hash.as_slice());
         assert_eq!(envelope.len(), 96);
+    }
+
+    /// Encoding-malleability guard (sibling of the GPG truncated-tail finding):
+    /// the SSHSIG wire-format parsers must consume the *entire* pubkey and
+    /// signature blobs. Appending any trailing byte to an otherwise-valid blob
+    /// must flip the result to failure — there is no lenient filter (as `pgp`
+    /// has) that could silently drop the tail. `verify_ssh_*` enforces full
+    /// consumption of the pubkey blob and `run_verification` enforces it on the
+    /// signature blob.
+    #[test]
+    fn rejects_trailing_bytes_on_blobs() {
+        let payload = b"hello sshsig precompile";
+        let namespace = b"file";
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ED25519_SEED);
+        let verifying_key = signing_key.verifying_key();
+        let envelope = build_sshsig_envelope(payload, namespace);
+        let sig = signing_key.sign(&envelope);
+
+        let pub_key_blob = build_ed25519_pubkey_blob(verifying_key.as_bytes());
+        let sig_blob = build_signature_blob(b"ssh-ed25519", &sig.to_bytes());
+
+        // Baseline: the unmodified blobs verify.
+        assert_precompile_ok(&run(&encode_input(payload, namespace, &pub_key_blob, &sig_blob)), SUCCESS_HEX);
+
+        // One trailing byte on the pubkey blob must be rejected.
+        let mut pk_tail = pub_key_blob.clone();
+        pk_tail.push(0x00);
+        assert_precompile_ok(&run(&encode_input(payload, namespace, &pk_tail, &sig_blob)), FAILURE_HEX);
+
+        // One trailing byte on the signature blob must be rejected.
+        let mut sig_tail = sig_blob.clone();
+        sig_tail.push(0x00);
+        assert_precompile_ok(&run(&encode_input(payload, namespace, &pub_key_blob, &sig_tail)), FAILURE_HEX);
     }
 
     // ─────────────────────── Real `ssh-keygen -Y sign` fixtures
@@ -788,7 +798,6 @@ mod tests {
         use rand_08::SeedableRng;
         use signature::Signer;
         use p256::ecdsa::{Signature, SigningKey};
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
         let signing_key = SigningKey::random(&mut rng);
@@ -810,7 +819,6 @@ mod tests {
         use rand_08::SeedableRng;
         use signature::Signer;
         use p384::ecdsa::{Signature, SigningKey};
-        use p384::elliptic_curve::sec1::ToEncodedPoint;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
         let signing_key = SigningKey::random(&mut rng);
@@ -832,7 +840,6 @@ mod tests {
         use rand_08::SeedableRng;
         use signature::Signer;
         use p521::ecdsa::{Signature, SigningKey, VerifyingKey};
-        use p521::elliptic_curve::sec1::ToEncodedPoint;
 
         let mut rng = rand_08::rngs::StdRng::from_seed([7u8; 32]);
         let signing_key = SigningKey::random(&mut rng);
@@ -1054,7 +1061,7 @@ mod tests {
         buf.extend_from_slice(&u256(128 + 32 + 64));
         buf.extend_from_slice(&u256(128 + 32 + 96));
         buf.extend_from_slice(&u256(MAX_PAYLOAD_BYTES + 1));
-        buf.extend_from_slice(&vec![0u8; 32]);
+        buf.extend_from_slice(&[0u8; 32]);
         assert_precompile_ok(&run(&buf), FAILURE_HEX);
     }
 
@@ -1073,7 +1080,7 @@ mod tests {
         // also rejected — but for the wrong reason. Post-strip, this exercises
         // the actual size cap.)
         let mut n_bytes: Vec<u8> = vec![0x00];
-        n_bytes.extend(std::iter::repeat(0xFFu8).take(513));
+        n_bytes.extend(std::iter::repeat_n(0xFFu8, 513));
         let pubkey = [
             ssh_string(b"ssh-rsa"),
             ssh_string(&[0x01, 0x00, 0x01]), // e = 65537
@@ -1090,13 +1097,13 @@ mod tests {
         // Forge a 1024-bit RSA pubkey (128-byte modulus) — below 2048-bit floor.
         let n_raw = {
             let mut v = vec![0xC0u8];
-            v.extend(std::iter::repeat(0xFFu8).take(127));
+            v.extend(std::iter::repeat_n(0xFFu8, 127));
             v
         };
         let mut pubkey = ssh_string(b"ssh-rsa");
         pubkey.extend_from_slice(&ssh_string(&[0x01, 0x00, 0x01]));
         pubkey.extend_from_slice(&ssh_mpint(&n_raw));
-        let sig = build_signature_blob(b"rsa-sha2-256", &vec![0xAAu8; 128]);
+        let sig = build_signature_blob(b"rsa-sha2-256", &[0xAAu8; 128]);
         let input = encode_input(b"payload", b"file", &pubkey, &sig);
         assert_precompile_ok(&run(&input), FAILURE_HEX);
     }
@@ -1115,7 +1122,7 @@ mod tests {
 
     #[test]
     fn truncated_offset_header_returns_failure() {
-        assert_precompile_ok(&run(&vec![0u8; 127]), FAILURE_HEX);
+        assert_precompile_ok(&run(&[0u8; 127]), FAILURE_HEX);
     }
 
     #[test]

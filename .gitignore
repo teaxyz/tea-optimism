@@ -2,6 +2,7 @@
 node_modules
 results
 temp
+.waaah
 coverage.json
 **/lcov.info
 **/lcov-upgrade.info
@@ -51,3 +52,5 @@ crytic-export
 
 # ignore local asdf config
 .tool-versions
+# Ignore .waaah agent-orchestration scratch (ralph progress notes etc.)
+.waaah/

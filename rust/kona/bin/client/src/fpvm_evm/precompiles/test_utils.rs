@@ -38,16 +38,33 @@ pub(crate) async fn test_accelerated_precompile(
 }
 
 /// Executes a precompile on [`revm`].
+///
+/// Tea's custom verification precompiles (`0x0696`-`0x0698`) aren't in revm's
+/// default set, so run them via the shared `tea-precompiles` crate — the exact
+/// same crypto kona-host runs. This is the "native EL" side both the mock host
+/// and the parity assertions compare against.
 pub(crate) fn execute_native_precompile<T: Into<Bytes>>(
     address: Address,
     input: T,
     gas: u64,
 ) -> PrecompileResult {
+    let input = input.into();
+
+    if address == tea_precompiles::gas::GPG_VERIFY_ADDRESS {
+        return tea_precompiles::gpg_verify::precompile().precompile()(&input, gas);
+    }
+    if address == tea_precompiles::gas::SSH_VERIFY_ADDRESS {
+        return tea_precompiles::ssh_verify::precompile().precompile()(&input, gas);
+    }
+    if address == tea_precompiles::gas::SSHSIG_VERIFY_ADDRESS {
+        return tea_precompiles::ssh_sig_verify::precompile().precompile()(&input, gas);
+    }
+
     let precompiles = revm::handler::EthPrecompiles::default();
     let Some(precompile) = precompiles.precompiles.get(&address) else {
         panic!("Precompile not found");
     };
-    precompile.execute(&input.into(), gas)
+    precompile.execute(&input, gas)
 }
 
 /// Starts a mock host thread that serves [`HintType::L1Precompile`] hints and preimages.
